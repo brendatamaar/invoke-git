@@ -9,7 +9,7 @@ Read the relevant doc before changing anything. If code and docs disagree, stop 
 | Doc | What it decides |
 | --- | --- |
 | `docs/PRD.md` | Scope, goals, non-goals, laws, performance budgets, decisions |
-| `docs/Plan.md` | Phases, the Phase 0 spike checklist, the v0.1 backlog in dependency order |
+| `docs/PLAN.md` | Phases, the Phase 0 spike checklist, the v0.1 backlog in dependency order |
 | `docs/spec/core-design.md` | Crates, `State` / `Event` / `Command`, repo-state detection, shell, undo, errors |
 | `docs/spec/diff-engine.md` | Diff algorithm, data model, word diff, line staging, highlighting |
 | `docs/spec/commit-graph.md` | Paging, lane assignment, rendering, edge cases |
@@ -37,6 +37,8 @@ Read the relevant doc before changing anything. If code and docs disagree, stop 
 
 ## Working style
 
+- You run on a headless Linux VPS. You cannot open windows or see the UI. Never build GPUI crates here and never claim a UI change works. For UI changes, make it compile-ready, list exactly what I should run and check on Windows, and wait for my result.
+- On the VPS, run fmt, clippy and tests only for non-UI crates (`--exclude ui --exclude app --exclude spike-diff --exclude spike-graph` for workspace clippy and tests). Scope formatting to the non-UI packages too.
 - Work in small steps that compile and pass tests. Run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test` before calling a task done.
 - One backlog task per change. Say which task number you are working on.
 - If a spec gap blocks you, write down the question and your proposed answer, then ask. Do not invent behaviour silently.

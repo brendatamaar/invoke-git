@@ -50,7 +50,7 @@ Four phases, each ending at a gate. v0.1 is the point where Invoke Git replaces 
 - Virtualized diff view of a 50k-line file with syntax highlighting
 - Scroll a 100k-commit graph rendered from a real repo
 - One pinned GPUI snapshot, wrapped in a thin component layer
-- *Gate:* 60 fps scroll in both on Windows, and the API feels workable. Fail → fall back to Tauri.
+- *Gate:* Diff and graph scroll at 60 fps on the reference Windows laptop and the API feels workable (protocol in PLAN.md). Two or more failed boxes after one retry → fall back to Tauri.
 
 **v0.1 — Daily driver**
 
