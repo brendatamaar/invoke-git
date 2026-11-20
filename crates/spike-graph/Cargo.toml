@@ -6,5 +6,6 @@ publish.workspace = true
 description = "Phase 0 throwaway: GPUI commit-graph prototype. Nothing here ships."
 
 [dependencies]
+gix = { version = "0.90.0", default-features = false, features = ["sha1", "max-performance"] }
 gpui.workspace = true
 gpui_platform.workspace = true

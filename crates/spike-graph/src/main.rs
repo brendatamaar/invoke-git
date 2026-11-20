@@ -1,36 +1,70 @@
 //! Phase 0 spike, Prototype B (commit graph). Throwaway: nothing here ships.
-//! For now it only opens an empty window; the graph comes in a later task.
+//!
+//! Usage: `spike-graph [--sweep SECONDS] [--limit N] [REPO]`. REPO defaults to
+//! the kernel fixture recorded in docs/spike-results.md. `--sweep` scrolls
+//! from the newest commit to 100k deep, prints the stats and quits.
 
-use gpui::{
-    App, Bounds, Context, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
-};
+mod layout;
+mod meta;
+mod stats;
+mod view;
+mod walk;
 
-/// `bg-app` and `ink-faint` (dark) from docs/design/tokens.json. Spike only:
-/// there is no tokens crate yet.
-const BG_APP: u32 = 0x0e0f11;
-const INK_FAINT: u32 = 0x8a8f98;
+use std::path::PathBuf;
 
-struct Empty {
-    label: SharedString,
+use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
+
+use view::Sweep;
+
+/// The read-only kernel clone from P0-1.
+const DEFAULT_REPO: &str = r"C:\dev\fixtures\linux";
+/// Enough for the 100k-deep gate with room to spare.
+const DEFAULT_LIMIT: usize = 200_000;
+
+struct Args {
+    repo: PathBuf,
+    limit: usize,
+    sweep: Sweep,
 }
 
-impl Render for Empty {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .justify_center()
-            .items_center()
-            .bg(rgb(BG_APP))
-            .text_color(rgb(INK_FAINT))
-            .child(self.label.clone())
+fn parse_args() -> Result<Args, String> {
+    let mut args = Args {
+        repo: PathBuf::from(DEFAULT_REPO),
+        limit: DEFAULT_LIMIT,
+        sweep: Sweep::Off,
+    };
+    let mut it = std::env::args_os().skip(1);
+    let usage = "usage: spike-graph [--sweep SECONDS] [--limit N] [REPO]";
+    while let Some(arg) = it.next() {
+        let mut number = |name: &str| {
+            it.next()
+                .and_then(|s| s.to_str()?.parse::<f64>().ok())
+                .filter(|n| *n > 0.0)
+                .ok_or(format!("{name} needs a positive number; {usage}"))
+        };
+        if arg == "--sweep" {
+            args.sweep = Sweep::Waiting {
+                seconds: number("--sweep")? as f32,
+            };
+        } else if arg == "--limit" {
+            args.limit = number("--limit")? as usize;
+        } else {
+            args.repo = PathBuf::from(arg);
+        }
     }
+    Ok(args)
 }
 
 fn main() {
-    gpui_platform::application().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("spike-graph: {error}");
+            std::process::exit(2);
+        }
+    };
+    gpui_platform::application().run(move |cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -40,11 +74,7 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_, cx| {
-                cx.new(|_| Empty {
-                    label: "spike-graph".into(),
-                })
-            },
+            |_, cx| cx.new(|_| view::GraphView::new(args.repo, args.limit, args.sweep)),
         )
         .expect("open the spike-graph window");
         cx.activate(true);
