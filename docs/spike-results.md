@@ -78,6 +78,51 @@ On AC power at 60 Hz, with no human input. The kernel clone is described above; 
 | Sweep 20 s, metadata read ahead on a background thread | 60.0 fps in every window, build p95 3.5–3.7 ms, worst frame 21.1 ms, 0 frames > 50 ms, 0 blank rows, 0 reads on the UI thread (disk cache was warm) |
 | Peak working set | 396 MB peak, 236 MB steady (was 773 MB when pass-through lanes were stored per row) |
 
+## Gate run (P0-4)
+
+Release builds from branch `p0-4-gate`, laptop plugged in (battery status "AC"), display at 60 Hz. Automated parts were run by the agent on 2026-11-20; the manual parts are waiting for the user's runs (see the runbook in `tasks/P0-4.md`).
+
+### Automated sweeps (agent)
+
+| Sweep | fps (each 5 s window) | Frame interval p95 | Build p95 | Worst frame | Frames > 50 ms | Blank rows | First paint | Peak memory |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `spike-diff --sweep 20` (all 50,290 rows) | 60.0 | 17.7–17.9 ms | 4.7–4.9 ms | 23.8 ms | 0 | 0 | 37.7 ms | 206 MB |
+| `spike-diff --sweep 60` | 60.0 | 17.4–17.8 ms | 3.2–3.8 ms | 19.5 ms | 0 | 0 | 54.2 ms | 212 MB |
+| `spike-graph --sweep 20` (100k deep) | 60.0 | 17.4–17.6 ms | 3.3–4.3 ms | 20.1 ms | 0 | 0 | 36.6 ms | 506 MB |
+| `spike-graph --sweep 60` (100k deep) | 60.0 | 17.3–17.9 ms | 3.2–3.8 ms | 21.9 ms | 0 | 0 | 35.0 ms | 507 MB |
+
+Peak memory was sampled every 0.5 s from the process's peak working set. Unstyled rows in the diff sweeps (43) are rows shown before their highlight chunk arrived, all in the first frames.
+
+### Manual runs (user)
+
+| Run | Result |
+| --- | --- |
+| A. Diff: wheel 10 s + scrollbar drag ×3 | _pending_ |
+| B. Graph: wheel 10 s + scrollbar drag ×3, 100k+ deep | _pending_ |
+| C. Text input: typing, Shift+arrows, drag, double-click, Ctrl+A/C/V | _pending_ |
+| C. Microsoft Japanese IME inline composition | _pending_ |
+| C. Microsoft Pinyin (optional) | _pending_ |
+| D. 90 Hz (information) | _pending_ |
+| Peak memory from Task Manager | _pending_ |
+| E. "API felt workable" | _pending_ |
+
+### Checklist
+
+| Box | Kind | Status | Evidence |
+| --- | --- | --- | --- |
+| Diff view scrolls at 60 fps or better, no blank rows, release build | Must pass | **Automated: pass.** Manual: pending | 60.0 fps in every window, 0 blank rows, worst frame 23.8 ms |
+| Graph scrolls 100k commits deep at 60 fps or better, no blank rows | Must pass | **Automated: pass.** Manual: pending | 60.0 fps in every window, 0 blank rows, worst frame 21.9 ms |
+| First paint under 100 ms for the diff view once files are in memory | Soft | **Pass** | 37.7 and 54.2 ms (diff); 35–37 ms (graph, for information) |
+| Text input works for a commit message box (IME and selection behave) | Soft | Pending | `spike-diff --commit-box` |
+| Custom drawing (lanes, highlight backgrounds) was doable without forking GPUI | Soft | **Pass** | Lanes, curves and dots with `canvas`, `paint_quad` and `PathBuilder`; diff backgrounds and syntax colours with divs and `StyledText` highlights. GPUI is used unmodified; the only change is mirroring Zed's own `async-task` patch, which is not a fork. |
+| The API felt workable: you would choose to keep going | Must pass | Pending | The user's call; the agent's notes are under "Risks and GPUI notes" |
+
+**Strict reading of "p95 ≤ 16.7 ms".** The frame-interval p95 is 17.3–17.9 ms even at a perfect 60.0 fps with no frame over 24 ms, because paint timestamps jitter about ±1 ms around a 16.67 ms vsync. Read literally, the rule would fail every vsync-paced app measured this way. The proposed reading is in `tasks/P0-3.DONE.md`, question 3: 60 fps, interval p95 ≤ 18 ms, no frame over 50 ms. It is an open decision for the user.
+
+### Gate outcome
+
+_Pending the manual runs and the user's verdict._
+
 ## Risks and GPUI notes
 
 - GPUI's git dependency needs Zed's `async-task` `[patch]` mirrored in our root `Cargo.toml` (see `README.md`). Every GPUI bump must re-check Zed's `[patch.crates-io]` section.
@@ -89,3 +134,4 @@ On AC power at 60 Hz, with no human input. The kernel clone is described above; 
 - **Commit metadata must not be read on the UI thread.** A cold read is about 43 µs, and fast scrolling needs about 80 new rows per frame, which gave frames up to 183 ms. A background reader 1,000 rows ahead removed every UI-thread read in the fast sweep. This matches the core design (IO only in `shell`).
 - Custom lane drawing with `canvas`, `paint_quad` (straight lanes, dots) and `PathBuilder` (curves) was straightforward and cheap. Build p95 is about 3.5 ms with 16 lanes drawn per row.
 - **The laptop must be plugged in.** On battery, the same diff sweep took 3–4 times the CPU per frame and paint times jittered by ±5 ms.
+- **GPUI core has no text-input widget.** It provides the platform plumbing (`EntityInputHandler`, `ElementInputHandler`, marked-text ranges for IME, shaped lines for hit-testing), and its `examples/input.rs` shows a working single-line field. The spike's commit box adapts that example (about 600 lines). A multi-line commit editor with word navigation, undo and wrapping would be our own work in v0.1 (backlog task 14), or would borrow from Zed's `editor` crate, which is far heavier.
