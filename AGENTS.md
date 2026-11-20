@@ -46,8 +46,9 @@ Always read your task file and its cited PRD laws. If code and docs disagree, st
 ## Working style
 
 - You run on a headless Linux VPS. You cannot open windows or see the UI. Never build GPUI crates here and never claim a UI change works. For UI changes, make it compile-ready, list exactly what I should run and check on Windows, and wait for my result.
-- On the VPS, run fmt, clippy and tests only for non-UI crates (`--exclude ui --exclude app --exclude spike-diff --exclude spike-graph` for workspace clippy and tests). Scope formatting to the non-UI packages too.
-- Work in small steps that compile and pass tests. Run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test` before calling a task done.
+- Before calling a task done, run `./scripts/check.sh`.
+- While iterating, use `cargo check -p <crate>` or `cargo test -p <crate>`; reserve the full check for the end of the task.
+- Never run cargo build, check, clippy or test on the `ui` or `app` crates here.
 - One backlog task per change. Say which task number you are working on.
 - If a spec gap blocks you, write down the question and your proposed answer, then ask. Do not invent behaviour silently.
 - Do not add dependencies beyond the PRD's build-vs-library table without asking.
