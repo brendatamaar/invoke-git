@@ -21,6 +21,14 @@ flowchart LR
 
 A failed gate means the phase continues, not that the next one starts with debt.
 
+## Development setup
+
+- Write code on a Linux VPS (2 vCPU, 4 GB RAM) and push it to GitHub.
+- On the VPS, build and test only the non-UI crates with `cargo test --workspace --exclude ui --exclude app --exclude spike-diff --exclude spike-graph`. Never build GPUI on the VPS.
+- Build, run and judge the UI on the Windows laptop. Run `git pull`, then `cargo run --release`. Install Rust with the MSVC toolchain and Visual Studio Build Tools.
+- CI on a Windows runner builds and tests everything on every push.
+- Phase 0 and UI tasks are laptop-heavy. Core tasks are VPS-friendly.
+
 ## Phase 0 — GPUI spike
 
 The spike answers one question in 1–2 weekends: can GPUI render a huge diff and a huge commit graph at full frame rate on Windows, with an API you can live with?
@@ -28,30 +36,35 @@ The spike answers one question in 1–2 weekends: can GPUI render a huge diff an
 **Setup**
 
 1. Create the Cargo workspace with two crates: `spike-diff` and `spike-graph` (throwaway; nothing here ships).
-2. Pin GPUI to one snapshot (a git revision of the Zed repo or a `gpui-pre` version) in `Cargo.toml`; record the revision in the README.
-3. Prepare fixtures: a generated 50k-line file and a modified copy (≈ 2k changed lines spread across it); a local clone of the Linux kernel; one large repo you use at work, if allowed.
-4. Write the commit-graph file for the kernel clone (`git commit-graph write --reachable`).
+2. Pin GPUI to one Zed commit as a git dependency in `Cargo.toml`. Once both release-build prototype windows open on Windows, record the commit and the reason for choosing it in `README.md`.
+3. Prepare fixtures: a generated 50k-line file and a modified copy (≈ 2k changed lines spread across it), plus your own Linux kernel clone. A large work repo is optional and outside the gate.
+4. Record the kernel clone’s commit hash in `docs/spike-results.md` and run `git commit-graph write --reachable` in the clone. Start the prototype’s commit walk from `HEAD` only.
 
 **Prototype A — diff view**
 
 - Load both 50k-line files, compute a line diff (any quick crate is fine here; the real engine comes later)
 - Render split view in a virtualized list with line numbers and add/remove colouring
-- Syntax-highlight visible lines with tree-sitter (Rust or TypeScript grammar)
+- Follow `docs/spec/diff-engine.md` for highlighting. Parse both full files in the background with tree-sitter’s Rust grammar and style only visible lines.
+- Use a temporary palette from `design/tokens.json`: keyword = `accent`, string = `add-ink`, comment = `ink-faint`, type = `lane-2`, function = `lane-7`, number = `warning`.
 - Scroll with the mouse wheel and by dragging the scrollbar end to end
 
 **Prototype B — commit graph**
 
 - Read commits from the kernel clone with `gix`, in pages of 5k
 - Naive lane assignment (no optimisation yet) and draw lanes + dots with a custom GPUI element
-- Columns: graph, subject, author, date; virtualized rows
+- Columns: graph, subject, author, date, short hash; virtualized rows
 - Scroll from the newest commit to 100k commits deep
 
-**Measure**
+### Measurement protocol
 
-- Frame time while scrolling (GPUI's own frame stats or a simple per-frame timer), on your Windows laptop, release build
-- Time to first paint for each prototype
-- Peak memory (Task Manager is enough)
-- Your own notes: how hard was each thing to do in GPUI, and what was missing
+- Reference machine: Intel Core i5-12500H, 16 GB RAM, Intel Iris Xe integrated graphics, Windows 11 version 25H2 (OS build 26200.9974). Run release builds with the laptop plugged in and no other heavy apps open.
+- Display: measure the gate at 60 Hz and also record results at 90 Hz for information.
+- Scroll runs: in each prototype, scroll with the mouse wheel for 10 seconds and drag the scrollbar from top to bottom three times.
+- Frame pass: at 60 Hz, the 95th-percentile frame time must be ≤ 16.7 ms, and no single frame may exceed 50 ms.
+- Blank rows: the renderer counts visible rows painted without their data. The count must be zero for the whole run.
+- First paint: measure from data ready (both files loaded or the first commit page ready) to the first presented frame with content. The budget is 100 ms.
+- Text input: Microsoft Japanese or Pinyin IME must compose inline and commit correctly. Verify Shift+arrow selection, mouse-drag selection, double-click word selection, Ctrl+A, copy and paste.
+- Record peak memory from Task Manager and note what was hard in GPUI.
 
 **Pass/fail checklist**
 
@@ -62,7 +75,12 @@ The spike answers one question in 1–2 weekends: can GPUI render a huge diff an
 - [ ] Custom drawing (lanes, highlight backgrounds) was doable without forking GPUI
 - [ ] The API felt workable: you would choose to keep going
 
-**Fallback:** if two or more boxes fail, switch to Tauri + React with the same Rust core. The spike's diff and graph code moves to the core unchanged; only the rendering is rewritten.
+### Gate rules
+
+- Must-pass boxes: diff scroll, graph scroll and “The API felt workable.” Phase 0 ends only when all three pass.
+- A failed box gets one retry: spend one more weekend on fixes, then re-measure.
+- If two or more boxes still fail after the retry, switch to Tauri + React with the same Rust core.
+- First paint, text input and custom drawing are soft checks. Log a single failure as a risk in `docs/spike-results.md`; it does not block the gate.
 
 ## v0.1 backlog
 

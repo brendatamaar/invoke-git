@@ -38,6 +38,8 @@ Read the relevant doc before changing anything. If code and docs disagree, stop 
 ## Working style
 
 - Work in small steps that compile and pass tests. Run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test` before calling a task done.
+- You run on a headless Linux VPS. You cannot open windows or see the UI. Never build GPUI crates here and never claim a UI change works. For UI changes, make it compile-ready, list exactly what I should run and check on Windows, and wait for my result.
+- On the VPS, run fmt, clippy and tests only for non-UI crates. Pass `--exclude ui --exclude app` plus the spike crates (`--exclude spike-diff --exclude spike-graph`) to workspace clippy and test commands. For `cargo fmt`, select only the non-UI packages with `-p` for each package.
 - One backlog task per change. Say which task number you are working on.
 - If a spec gap blocks you, write down the question and your proposed answer, then ask. Do not invent behaviour silently.
 - Do not add dependencies beyond the PRD's build-vs-library table without asking.
