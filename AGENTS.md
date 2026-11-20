@@ -4,7 +4,15 @@ Invoke Git is a fast, native desktop git client (a GitKraken alternative without
 
 ## Source of truth
 
-Read the relevant doc before changing anything. If code and docs disagree, stop and ask.
+Read only the docs for your task areas:
+
+- Diff or staging → `docs/spec/diff-engine.md`
+- Graph or history → `docs/spec/commit-graph.md`
+- State, shell, undo or errors → `docs/spec/core-design.md`
+- Test changes → `docs/spec/verification.md`
+- UI → `docs/design/tokens.json` and the matching `docs/design/screens/*.dc.html`
+
+Always read your task file and its cited PRD laws. If code and docs disagree, stop and ask.
 
 | Doc | What it decides |
 | --- | --- |
@@ -14,8 +22,8 @@ Read the relevant doc before changing anything. If code and docs disagree, stop 
 | `docs/spec/diff-engine.md` | Diff algorithm, data model, word diff, line staging, highlighting |
 | `docs/spec/commit-graph.md` | Paging, lane assignment, rendering, edge cases |
 | `docs/spec/verification.md` | Laws → tests, model-based harness, Quint, Kani, CI matrix |
-| `design/tokens.json`, `design/README.md` | Colours, type, spacing, radii, sizes and their usage rules |
-| `design/screens/*.dc.html` | Reference mockups for History, Changes, Pre-push review, Conflict |
+| `docs/design/tokens.json`, `docs/design/README.md` | Colours, type, spacing, radii, sizes and their usage rules |
+| `docs/design/screens/*.dc.html` | Reference mockups for History, Changes, Pre-push review, Conflict |
 
 ## Architecture rules (do not break)
 
