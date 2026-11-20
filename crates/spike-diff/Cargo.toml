@@ -1,0 +1,10 @@
+[package]
+name = "spike-diff"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description = "Phase 0 throwaway: GPUI diff-view prototype. Nothing here ships."
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true

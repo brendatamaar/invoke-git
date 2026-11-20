@@ -1,19 +1,25 @@
+mod fixtures;
 mod metadata;
 
 use std::env;
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 const UI_PACKAGES: [&str; 4] = ["ui", "app", "spike-diff", "spike-graph"];
 
 fn main() -> ExitCode {
-    if env::args_os().skip(1).collect::<Vec<_>>() != ["check"] {
-        eprintln!("Usage: cargo xtask check");
-        return ExitCode::FAILURE;
-    }
-    match check() {
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let result = match args.as_slice() {
+        [command] if command == "check" => check(),
+        [command] if command == "fixtures" => write_fixtures(),
+        _ => {
+            eprintln!("Usage: cargo xtask check | cargo xtask fixtures");
+            return ExitCode::FAILURE;
+        }
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("xtask: {error}");
@@ -110,6 +116,34 @@ fn check() -> Result<(), String> {
             eprintln!("xtask: Windows UI check skipped (ui and app are not workspace members)");
         }
     }
+    Ok(())
+}
+
+/// Writes the Phase 0 diff fixtures into the gitignored `fixtures/diff/`.
+fn write_fixtures() -> Result<(), String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("fixtures")
+        .join("diff");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("create {} failed: {error}", dir.display()))?;
+    let generated = fixtures::generate();
+    for (name, lines) in [("old.rs", &generated.old), ("new.rs", &generated.new)] {
+        let path = dir.join(name);
+        // LF endings on every platform, so both files match byte for byte.
+        let mut text = lines.join("\n");
+        text.push('\n');
+        fs::write(&path, text)
+            .map_err(|error| format!("write {} failed: {error}", path.display()))?;
+        eprintln!("xtask: wrote {} ({} lines)", path.display(), lines.len());
+    }
+    eprintln!(
+        "xtask: {} lines modified, {} deleted, {} inserted ({} changed)",
+        generated.modified,
+        generated.deleted,
+        generated.inserted,
+        generated.modified + generated.deleted + generated.inserted
+    );
     Ok(())
 }
 

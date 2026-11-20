@@ -1,3 +1,19 @@
 [workspace]
-members = ["xtask"]
+members = ["xtask", "crates/spike-diff", "crates/spike-graph"]
 resolver = "3"
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+# GPUI is pinned to one Zed commit; README.md records the revision and why.
+# Update it only when asked, in its own commit (AGENTS.md rule 8).
+[workspace.dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "2de9e435a5d98657f35c260b5f4dd0979df659e6" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "2de9e435a5d98657f35c260b5f4dd0979df659e6" }
+
+# Zed's own workspace patches crates.io for GPUI, but [patch] does not carry
+# over to dependents, so mirror the one GPUI needs on Windows. Keep it at the
+# rev from Zed's Cargo.toml at the pinned commit.
+[patch.crates-io]
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
