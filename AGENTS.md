@@ -49,10 +49,14 @@ Always read your task file and its cited PRD laws. If code and docs disagree, st
 - Before calling a task done, run `./scripts/check.sh`.
 - While iterating, use `cargo check -p <crate>` or `cargo test -p <crate>`; reserve the full check for the end of the task.
 - Never run cargo build, check, clippy or test on the `ui` or `app` crates here.
-- One backlog task per change. Say which task number you are working on.
 - If a spec gap blocks you, write down the question and your proposed answer, then ask. Do not invent behaviour silently.
 - Do not add dependencies beyond the PRD's build-vs-library table without asking.
 - Windows matters most: watch for path length, case-insensitive paths, CRLF and file locking.
+
+## Handoff
+
+- Do only the task in `tasks/NNN.md` and say its backlog number.
+- Write `tasks/NNN.DONE.md` with what changed, what is unfinished and anything surprising. For UI changes, include exact Windows commands and checks.
 
 ## Out of scope (non-goals)
 
