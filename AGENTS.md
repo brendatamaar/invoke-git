@@ -46,9 +46,8 @@ Always read your task file and its cited PRD laws. For doc/code disagreements, f
 ## Working style
 
 - You run on a headless Linux VPS. You cannot open windows or see the UI. Never build GPUI crates here.
-- Before calling a task done, run `./scripts/check.sh`.
-- While iterating, use `cargo check -p <crate>` or `cargo test -p <crate>`; reserve the full check for the end of the task.
-- Never run cargo build, check, clippy or test on the `ui` or `app` crates here.
+- Before calling a task done, run `cargo xtask check`.
+- While iterating, use `cargo check -p <crate>` or `cargo test -p <crate>`.
 - Do not add dependencies beyond the PRD's build-vs-library table without asking.
 - Windows matters most: watch for path length, case-insensitive paths, CRLF and file locking.
 
