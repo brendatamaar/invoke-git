@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Invoke Git — Changes</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0;background:#0e0f11}
+a{color:#8b95fa}a:hover{color:#b3baff}
+button,textarea,input{font-family:inherit}
+</style>
+</helmet>
+<div style="width: 100%; min-height: 900px; height: 900px; display: flex; flex-direction: column; background: #0e0f11; color: #eceef1; font-family: Inter, 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif; font-size: 13px; line-height: 20px;">
+
+  <header style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-height: 40px; padding: 4px 12px; box-sizing: border-box; background: #15161a; border-bottom: 1px solid #2a2d33;">
+    <button type="button" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px; border: 0; border-radius: 6px; background: transparent; color: #eceef1; font-size: 13px; font-weight: 600; cursor: pointer;">invoke-git
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="#a0a4ac" stroke-width="1.5" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+    </button>
+    <span style="width: 1px; height: 20px; background: #2a2d33;"></span>
+    <button type="button" style="display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 8px; border: 0; border-radius: 4px; background: #2b3060; color: #8b95fa; font-size: 13px; font-weight: 500; cursor: pointer;">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="4" cy="3.5" r="1.5"/><circle cx="4" cy="12.5" r="1.5"/><circle cx="12" cy="5" r="1.5"/><path d="M4 5v6M12 6.5c0 3-8 2-8 4.5"/></svg>main
+    </button>
+    <span style="font-size: 12px; line-height: 16px; color: #a0a4ac;">↑2 ↓0 vs origin/main</span>
+    <span style="flex-grow: 1;"></span>
+    <button type="button" style="height: 28px; padding: 0 10px; border: 0; border-radius: 6px; background: #1d1f24; color: #eceef1; font-size: 13px; font-weight: 500; cursor: pointer;">Fetch</button>
+    <button type="button" style="height: 28px; padding: 0 10px; border: 0; border-radius: 6px; background: #1d1f24; color: #eceef1; font-size: 13px; font-weight: 500; cursor: pointer;">Pull</button>
+    <a href="Review.dc.html" style="display: flex; align-items: center; height: 28px; padding: 0 12px; border-radius: 6px; background: #8b95fa; color: #0e0f11; font-size: 13px; font-weight: 600; text-decoration: none;">Review and push 2</a>
+  </header>
+
+  <div style="display: flex; flex-wrap: wrap; flex-grow: 1; min-height: 0;">
+
+    <nav aria-label="Repository" style="flex: 1 1 200px; box-sizing: border-box; padding: 12px 8px; display: flex; flex-direction: column; gap: 2px; background: #15161a; border-right: 1px solid #2a2d33;">
+      <a href="Changes.dc.html" aria-current="page" style="display: flex; align-items: center; justify-content: space-between; height: 28px; padding: 0 8px; border-radius: 6px; background: #1d1f24; color: #eceef1; font-weight: 500; text-decoration: none;"><span>Changes</span><span style="font-size: 12px; color: #a0a4ac;">3</span></a>
+      <a href="Main.dc.html" style="display: flex; align-items: center; height: 28px; padding: 0 8px; border-radius: 6px; color: #eceef1; text-decoration: none;">History</a>
+      <a href="Review.dc.html" style="display: flex; align-items: center; justify-content: space-between; height: 28px; padding: 0 8px; border-radius: 6px; color: #eceef1; text-decoration: none;"><span>Review</span><span style="font-size: 12px; color: #8b95fa;">2 to push</span></a>
+    </nav>
+
+    <section aria-label="Working changes" style="flex: 1 1 300px; box-sizing: border-box; display: flex; flex-direction: column; background: #15161a; border-right: 1px solid #2a2d33; min-height: 0;">
+      <div style="flex-grow: 1; overflow: auto; padding: 12px 8px; display: flex; flex-direction: column; gap: 16px;">
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 0 8px; margin-bottom: 2px;">
+            <span style="font-size: 11px; line-height: 16px; font-weight: 500; letter-spacing: 0.02em; color: #a0a4ac;">UNSTAGED · 2</span>
+            <button type="button" style="height: 24px; padding: 0 6px; border: 0; border-radius: 4px; background: transparent; color: #8b95fa; font-size: 12px; cursor: pointer;">Stage all</button>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px; background: #1d1f24;">
+            <span style="width: 14px; font-size: 12px; font-weight: 600; color: #f2b350;" title="Modified">M</span>
+            <span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">crates/diff/src/patch.rs</span>
+            <span style="font-size: 12px; color: #6fdb9c;">+6</span><span style="font-size: 12px; color: #ff9196;">−1</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px;">
+            <span style="width: 14px; font-size: 12px; font-weight: 600; color: #f2b350;" title="Modified">M</span>
+            <span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">crates/core/src/state.rs</span>
+            <span style="font-size: 12px; color: #6fdb9c;">+14</span><span style="font-size: 12px; color: #ff9196;">−3</span>
+          </div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 0 8px; margin-bottom: 2px;">
+            <span style="font-size: 11px; line-height: 16px; font-weight: 500; letter-spacing: 0.02em; color: #a0a4ac;">STAGED · 1</span>
+            <button type="button" style="height: 24px; padding: 0 6px; border: 0; border-radius: 4px; background: transparent; color: #8b95fa; font-size: 12px; cursor: pointer;">Unstage all</button>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px;">
+            <span style="width: 14px; font-size: 12px; font-weight: 600; color: #6fdb9c;" title="Added">A</span>
+            <span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">crates/shell/src/askpass.rs</span>
+            <span style="font-size: 12px; color: #6fdb9c;">+22</span><span style="font-size: 12px; color: #ff9196;">−0</span>
+          </div>
+        </div>
+      </div>
+      <form style="flex-shrink: 0; padding: 12px; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid #2a2d33;">
+        <label for="msg" style="font-size: 11px; line-height: 16px; font-weight: 500; letter-spacing: 0.02em; color: #a0a4ac;">COMMIT MESSAGE</label>
+        <textarea id="msg" rows="4" style="resize: none; box-sizing: border-box; width: 100%; padding: 8px; border: 1px solid #686d77; border-radius: 6px; background: #0e0f11; color: #eceef1; font-size: 13px; line-height: 20px;">Add askpass helper binary
+
+Git runs it for credential prompts; it relays them to the app over a named pipe.</textarea>
+        <div style="display: flex; align-items: center; justify-content: space-between; font-size: 12px; line-height: 16px; color: #8a8f98;">
+          <label style="display: flex; align-items: center; gap: 6px; color: #a0a4ac;"><input type="checkbox" style="accent-color: #8b95fa;">Amend last commit</label>
+          <span>Subject 25 / 72</span>
+        </div>
+        <button type="submit" style="height: 28px; border: 0; border-radius: 6px; background: #8b95fa; color: #0e0f11; font-size: 13px; font-weight: 600; cursor: pointer;">Commit 1 file to main</button>
+      </form>
+    </section>
+
+    <main style="flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; background: #15161a; min-height: 0;">
+      <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px; min-height: 40px; padding: 4px 16px; box-sizing: border-box; border-bottom: 1px solid #2a2d33;">
+        <span style="font-weight: 500;">crates/diff/src/patch.rs</span>
+        <span style="font-size: 12px; color: #6fdb9c;">+6</span><span style="font-size: 12px; color: #ff9196; margin-left: -8px;">−1</span>
+        <span style="flex-grow: 1;"></span>
+        <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #a0a4ac;"><input type="checkbox" style="accent-color: #8b95fa;">Ignore whitespace</label>
+        <div role="group" aria-label="Diff layout" style="display: flex; padding: 2px; border-radius: 6px; background: #0e0f11;">
+          <button type="button" aria-pressed="true" style="height: 24px; padding: 0 10px; border: 0; border-radius: 4px; background: #24272d; color: #eceef1; font-size: 12px; font-weight: 500; cursor: pointer;">Split</button>
+          <button type="button" aria-pressed="false" style="height: 24px; padding: 0 10px; border: 0; border-radius: 4px; background: transparent; color: #a0a4ac; font-size: 12px; cursor: pointer;">Unified</button>
+        </div>
+      </div>
+
+      <div style="flex-grow: 1; overflow: auto;">
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-height: 36px; padding: 4px 16px; box-sizing: border-box; background: #1d1f24; border-bottom: 1px solid #2a2d33;">
+          <span style="font-family: 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace; font-size: 12px; line-height: 16px; color: #a0a4ac;">@@ -42,8 +42,12 @@ pub fn build_patch</span>
+          <span style="flex-grow: 1;"></span>
+          <span style="font-size: 12px; color: #a0a4ac;">5 of 6 changed lines selected</span>
+          <button type="button" style="height: 24px; padding: 0 8px; border: 0; border-radius: 4px; background: #8b95fa; color: #0e0f11; font-size: 12px; font-weight: 600; cursor: pointer;">Stage selected lines</button>
+          <button type="button" style="height: 24px; padding: 0 8px; border: 0; border-radius: 4px; background: #24272d; color: #eceef1; font-size: 12px; font-weight: 500; cursor: pointer;">Stage hunk</button>
+          <button type="button" style="height: 24px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; color: #ff7d82; font-size: 12px; font-weight: 500; cursor: pointer;">Discard selected</button>
+        </div>
+        <div style="display: flex; flex-direction: column; font-family: 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace; font-size: 13px; line-height: 20px;">
+          <sc-for list="{{rows}}" as="r" hint-placeholder-count="12">
+            <div style="display: flex; min-height: 20px;">
+              <div style="flex: 1 1 0; min-width: 0; display: flex; background: {{r.lbg}}; border-right: 1px solid #2a2d33;">
+                <span style="width: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">
+                  <sc-if value="{{r.lbox}}" hint-placeholder-val="{{false}}">
+                    <input type="checkbox" aria-label="Select line {{r.ln}} for staging" checked="{{r.lchk}}" onChange="{{r.noop}}" style="margin: 0; width: 12px; height: 12px; accent-color: #8b95fa;">
+                  </sc-if>
+                </span>
+                <span style="width: 36px; flex-shrink: 0; text-align: right; padding-right: 8px; color: #8a8f98;">{{r.ln}}</span>
+                <span style="width: 14px; flex-shrink: 0; color: #ff9196;">{{r.lsign}}</span>
+                <span style="white-space: pre; overflow: hidden;">{{r.lpre}}<span style="background: {{r.lmbg}}; border-radius: 2px;">{{r.lm1}}</span>{{r.lmid}}<span style="background: {{r.lmbg}}; border-radius: 2px;">{{r.lm2}}</span>{{r.lpost}}</span>
+              </div>
+              <div style="flex: 1 1 0; min-width: 0; display: flex; background: {{r.rbg}};">
+                <span style="width: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">
+                  <sc-if value="{{r.rbox}}" hint-placeholder-val="{{false}}">
+                    <input type="checkbox" aria-label="Select line {{r.rn}} for staging" checked="{{r.rchk}}" onChange="{{r.noop}}" style="margin: 0; width: 12px; height: 12px; accent-color: #8b95fa;">
+                  </sc-if>
+                </span>
+                <span style="width: 36px; flex-shrink: 0; text-align: right; padding-right: 8px; color: #8a8f98;">{{r.rn}}</span>
+                <span style="width: 14px; flex-shrink: 0; color: #6fdb9c;">{{r.rsign}}</span>
+                <span style="white-space: pre; overflow: hidden;">{{r.rpre}}<span style="background: {{r.rmbg}}; border-radius: 2px;">{{r.rm1}}</span>{{r.rmid}}<span style="background: {{r.rmbg}}; border-radius: 2px;">{{r.rm2}}</span>{{r.rpost}}</span>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+        <div style="padding: 8px 16px; font-size: 12px; line-height: 16px; color: #8a8f98; border-top: 1px solid #2a2d33;">Checked lines go to the index with git apply --cached. Unchecked additions stay in your working tree.</div>
+      </div>
+    </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    var noop = function () {};
+    function side(kind, no, text, checked) {
+      // kind: 'ctx' | 'rem' | 'add' | 'none'; text: string or [pre, m1, mid, m2, post]
+      var parts = Array.isArray(text) ? text : [text || '', '', '', '', ''];
+      var bg = { ctx: 'transparent', rem: '#2e1719', add: '#132a1d', none: '#0e0f11' }[kind];
+      var mbg = kind === 'rem' ? '#62252b' : '#1f5032';
+      return {
+        no: kind === 'none' ? '' : String(no), sign: kind === 'rem' ? '−' : (kind === 'add' ? '+' : ''),
+        bg: bg, mbg: mbg, box: kind === 'rem' || kind === 'add', chk: !!checked,
+        pre: parts[0], m1: parts[1], mid: parts[2], m2: parts[3], post: parts[4]
+      };
+    }
+    function row(l, r) {
+      return {
+        ln: l.no, lsign: l.sign, lbg: l.bg, lmbg: l.mbg, lbox: l.box, lchk: l.chk, lpre: l.pre, lm1: l.m1, lmid: l.mid, lm2: l.m2, lpost: l.post,
+        rn: r.no, rsign: r.sign, rbg: r.bg, rmbg: r.mbg, rbox: r.box, rchk: r.chk, rpre: r.pre, rm1: r.m1, rmid: r.mid, rm2: r.m2, rpost: r.post,
+        noop: noop
+      };
+    }
+    function ctx(a, b, t) { return row(side('ctx', a, t), side('ctx', b, t)); }
+    return {
+      rows: [
+        ctx(42, 42, 'pub fn build_patch(diff: &FileDiff, sel: &Selection) -> Patch {'),
+        ctx(43, 43, '    let mut out = Patch::new(diff.header());'),
+        row(side('none'), side('add', 44, '    let mut shift: i64 = 0;', true)),
+        ctx(44, 45, '    for hunk in diff.hunks.iter().filter(|h| sel.touches(h)) {'),
+        ctx(45, 46, '        let lines = rewrite(hunk, sel);'),
+        row(side('rem', 46, ['        ', 'out.push(', 'Hunk::recount(hunk.old_start, lines)', ')', ';'], true),
+            side('add', 47, ['        ', 'let h = ', 'Hunk::recount(hunk.old_start', ', shift', ', lines);'], true)),
+        row(side('none'), side('add', 48, '        shift += h.net_change();', true)),
+        row(side('none'), side('add', 49, '        out.push(h);', true)),
+        ctx(47, 50, '    }'),
+        row(side('none'), side('add', 51, '    out.keep_eof_marker(diff);', false)),
+        ctx(48, 52, '    out'),
+        ctx(49, 53, '}')
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

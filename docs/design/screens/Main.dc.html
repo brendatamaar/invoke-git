@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Invoke Git — History</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0;background:#0e0f11}
+a{color:#8b95fa}a:hover{color:#b3baff}
+button{font-family:inherit}
+</style>
+</helmet>
+<div style="width: 100%; min-height: 900px; height: 900px; display: flex; flex-direction: column; background: #0e0f11; color: #eceef1; font-family: Inter, 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif; font-size: 13px; line-height: 20px;">
+
+  <header style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-height: 40px; padding: 4px 12px; box-sizing: border-box; background: #15161a; border-bottom: 1px solid #2a2d33;">
+    <button type="button" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px; border: 0; border-radius: 6px; background: transparent; color: #eceef1; font-size: 13px; font-weight: 600; cursor: pointer;">invoke-git
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="#a0a4ac" stroke-width="1.5" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+    </button>
+    <span style="width: 1px; height: 20px; background: #2a2d33;"></span>
+    <button type="button" style="display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 8px; border: 0; border-radius: 4px; background: #2b3060; color: #8b95fa; font-size: 13px; font-weight: 500; cursor: pointer;">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="4" cy="3.5" r="1.5"/><circle cx="4" cy="12.5" r="1.5"/><circle cx="12" cy="5" r="1.5"/><path d="M4 5v6M12 6.5c0 3-8 2-8 4.5"/></svg>main
+    </button>
+    <span style="font-size: 12px; line-height: 16px; color: #a0a4ac;">↑2 ↓0 vs origin/main</span>
+    <span style="flex-grow: 1;"></span>
+    <button type="button" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 0; border-radius: 6px; background: #1d1f24; color: #eceef1; font-size: 13px; font-weight: 500; cursor: pointer;">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 10.5a3 3 0 0 1 1-5.8 4 4 0 0 1 7.6 1A2.5 2.5 0 0 1 12 10.5M8 7v6M5.5 10.5L8 13l2.5-2.5"/></svg>Fetch
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 0; border-radius: 6px; background: #1d1f24; color: #eceef1; font-size: 13px; font-weight: 500; cursor: pointer;">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 3v10M4 9l4 4 4-4"/></svg>Pull
+    </button>
+    <a href="Review.dc.html" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px; border-radius: 6px; background: #8b95fa; color: #0e0f11; font-size: 13px; font-weight: 600; text-decoration: none;">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M8 13V3M4 7l4-4 4 4"/></svg>Review and push 2
+    </a>
+    <span style="width: 1px; height: 20px; background: #2a2d33;"></span>
+    <button type="button" aria-label="Undo last operation: Commit 'Keep hunk offsets when staging selected lines'" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: #a0a4ac; font-size: 13px; cursor: pointer;">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M5 4L2 7l3 3M2 7h7.5a4 4 0 0 1 0 8H7"/></svg>Undo
+    </button>
+  </header>
+
+  <div style="display: flex; flex-wrap: wrap; flex-grow: 1; min-height: 0;">
+
+    <nav aria-label="Repository" style="flex: 1 1 220px; box-sizing: border-box; padding: 12px 8px; display: flex; flex-direction: column; gap: 16px; background: #15161a; border-right: 1px solid #2a2d33; overflow: auto;">
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+        <a href="Changes.dc.html" style="display: flex; align-items: center; justify-content: space-between; height: 28px; padding: 0 8px; border-radius: 6px; color: #eceef1; text-decoration: none;"><span>Changes</span><span style="font-size: 12px; color: #a0a4ac;">3</span></a>
+        <a href="Main.dc.html" aria-current="page" style="display: flex; align-items: center; justify-content: space-between; height: 28px; padding: 0 8px; border-radius: 6px; background: #1d1f24; color: #eceef1; font-weight: 500; text-decoration: none;"><span>History</span></a>
+        <a href="Review.dc.html" style="display: flex; align-items: center; justify-content: space-between; height: 28px; padding: 0 8px; border-radius: 6px; color: #eceef1; text-decoration: none;"><span>Review</span><span style="font-size: 12px; color: #8b95fa;">2 to push</span></a>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+        <div style="padding: 0 8px; font-size: 11px; line-height: 16px; font-weight: 500; letter-spacing: 0.02em; color: #a0a4ac;">LOCAL</div>
+        <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; font-weight: 500;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #8b95fa;"></span>main</div>
+        <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #3fc7b5;"></span>feat/line-staging</div>
+        <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #f2b350;"></span>fix/askpass-pipe</div>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+        <div style="padding: 0 8px; font-size: 11px; line-height: 16px; font-weight: 500; letter-spacing: 0.02em; color: #a0a4ac;">REMOTE · ORIGIN</div>
+        <div style="height: 28px; padding: 4px 8px; box-sizing: border-box; color: #a0a4ac;">origin/main</div>
+        <div style="height: 28px; padding: 4px 8px; box-sizing: border-box; color: #a0a4ac;">origin/fix/askpass-pipe</div>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+        <div style="padding: 0 8px; font-size: 11px; line-height: 16px; font-weight: 500; letter-spacing: 0.02em; color: #a0a4ac;">TAGS</div>
+        <div style="height: 28px; padding: 4px 8px; box-sizing: border-box; color: #a0a4ac;">v0.0.1</div>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+        <div style="padding: 0 8px; font-size: 11px; line-height: 16px; font-weight: 500; letter-spacing: 0.02em; color: #a0a4ac;">STASHES</div>
+        <div style="height: 28px; padding: 4px 8px; box-sizing: border-box; color: #a0a4ac; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">WIP on main: askpass tests</div>
+      </div>
+    </nav>
+
+    <main style="flex: 999 1 560px; min-width: 0; display: flex; flex-wrap: wrap; min-height: 0;">
+
+      <section aria-label="Commit graph" style="flex: 999 1 520px; min-width: 0; display: flex; flex-direction: column; background: #15161a; border-right: 1px solid #2a2d33; overflow: auto;">
+        <div style="display: flex; align-items: center; height: 28px; padding: 0 8px; flex-shrink: 0; border-bottom: 1px solid #2a2d33; font-size: 11px; line-height: 16px; font-weight: 500; letter-spacing: 0.02em; color: #a0a4ac;">
+          <span style="width: 64px; flex-shrink: 0;">GRAPH</span>
+          <span style="flex-grow: 1;">SUBJECT</span>
+          <span style="width: 110px; flex-shrink: 0;">AUTHOR</span>
+          <span style="width: 96px; flex-shrink: 0;">DATE</span>
+          <span style="width: 64px; flex-shrink: 0;">HASH</span>
+        </div>
+        <sc-for list="{{rows}}" as="row" hint-placeholder-count="13">
+          <div style="display: flex; align-items: center; height: 28px; padding: 0 8px; flex-shrink: 0; background: {{row.rowBg}};">
+            <div style="position: relative; width: 64px; height: 28px; flex-shrink: 0;">
+              <sc-for list="{{row.segs}}" as="s" hint-placeholder-count="2">
+                <div style="position: absolute; box-sizing: border-box; left: {{s.l}}px; top: {{s.t}}px; width: {{s.w}}px; height: {{s.h}}px; background: {{s.bg}}; border-right: {{s.br}}; border-top: {{s.bt}}; border-bottom: {{s.bb}}; border-top-right-radius: {{s.rt}}px; border-bottom-right-radius: {{s.rb}}px;"></div>
+              </sc-for>
+              <div style="position: absolute; box-sizing: border-box; left: {{row.dotL}}px; top: 8px; width: 12px; height: 12px; border-radius: 50%; background: {{row.dotBg}}; border: 2px solid {{row.dotBorder}};"></div>
+            </div>
+            <div style="flex-grow: 1; min-width: 0; display: flex; align-items: center; gap: 6px; overflow: hidden;">
+              <sc-for list="{{row.refs}}" as="r" hint-placeholder-count="1">
+                <span style="flex-shrink: 0; height: 20px; padding: 0 6px; box-sizing: border-box; border-radius: 4px; font-size: 12px; line-height: 18px; font-weight: {{r.weight}}; background: {{r.bg}}; color: {{r.fg}}; border: 1px {{r.borderStyle}} {{r.border}};">{{r.name}}</span>
+              </sc-for>
+              <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: {{row.subjectColor}};">{{row.subject}}</span>
+            </div>
+            <span style="width: 110px; flex-shrink: 0; font-size: 12px; color: #a0a4ac; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{row.author}}</span>
+            <span style="width: 96px; flex-shrink: 0; font-size: 12px; color: #a0a4ac; white-space: nowrap;">{{row.date}}</span>
+            <span style="width: 64px; flex-shrink: 0; font-family: 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace; font-size: 12px; color: #8a8f98;">{{row.hash}}</span>
+          </div>
+        </sc-for>
+      </section>
+
+      <aside aria-label="Commit detail" style="flex: 1 1 340px; box-sizing: border-box; padding: 16px; display: flex; flex-direction: column; gap: 16px; background: #15161a; overflow: auto;">
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="display: flex; align-items: center; gap: 6px; font-size: 12px; line-height: 16px; color: #8b95fa;">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M8 13V3M4 7l4-4 4 4"/></svg>Not on origin/main yet
+          </div>
+          <h2 style="margin: 0; font-size: 15px; line-height: 20px; font-weight: 600;">Recount hunk headers after a partial stage</h2>
+          <p style="margin: 0; color: #a0a4ac;">Header lengths now come from the rewritten lines, so a hunk with unselected additions applies cleanly with git apply --cached.</p>
+        </div>
+        <dl style="margin: 0; display: grid; grid-template-columns: 72px minmax(0, 1fr); row-gap: 6px; column-gap: 12px; font-size: 12px; line-height: 16px;">
+          <dt style="color: #a0a4ac;">Commit</dt><dd style="margin: 0; font-family: 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace;">9e31d07</dd>
+          <dt style="color: #a0a4ac;">Author</dt><dd style="margin: 0;">Brendatama</dd>
+          <dt style="color: #a0a4ac;">Date</dt><dd style="margin: 0;">Today, 13:42</dd>
+          <dt style="color: #a0a4ac;">Parent</dt><dd style="margin: 0; font-family: 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace;">c07a5e2</dd>
+        </dl>
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <div style="font-size: 11px; line-height: 16px; font-weight: 500; letter-spacing: 0.02em; color: #a0a4ac; margin-bottom: 4px;">FILES CHANGED · 2</div>
+          <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px; background: #1d1f24;">
+            <span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">crates/diff/src/patch.rs</span>
+            <span style="font-size: 12px; color: #6fdb9c;">+9</span><span style="font-size: 12px; color: #ff9196;">−2</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px;">
+            <span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">crates/diff/tests/laws.rs</span>
+            <span style="font-size: 12px; color: #6fdb9c;">+31</span><span style="font-size: 12px; color: #ff9196;">−0</span>
+          </div>
+        </div>
+        <div style="display: flex; flex-direction: column; border: 1px solid #2a2d33; border-radius: 6px; overflow: hidden; font-family: 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace; font-size: 12px; line-height: 20px;">
+          <div style="padding: 0 8px; background: #1d1f24; color: #a0a4ac;">@@ -61,4 +61,6 @@ impl Hunk</div>
+          <div style="display: flex; padding-right: 8px;"><span style="width: 32px; flex-shrink: 0; text-align: right; color: #8a8f98; padding-right: 8px;">61</span><span style="width: 12px; flex-shrink: 0;"></span><span style="white-space: pre; overflow: hidden;">pub fn recount(start: u32,</span></div>
+          <div style="display: flex; padding-right: 8px; background: #2e1719;"><span style="width: 32px; flex-shrink: 0; text-align: right; color: #8a8f98; padding-right: 8px;">62</span><span style="width: 12px; flex-shrink: 0; color: #ff9196;">−</span><span style="white-space: pre; overflow: hidden;">    lines: Vec&lt;DiffLine&gt;) -&gt; Hunk {</span></div>
+          <div style="display: flex; padding-right: 8px; background: #132a1d;"><span style="width: 32px; flex-shrink: 0; text-align: right; color: #8a8f98; padding-right: 8px;">62</span><span style="width: 12px; flex-shrink: 0; color: #6fdb9c;">+</span><span style="white-space: pre; overflow: hidden;">    <span style="background: #1f5032; border-radius: 2px;">shift: i64,</span> lines: Vec&lt;DiffLine&gt;) -&gt; Hunk {</span></div>
+          <div style="display: flex; padding-right: 8px; background: #132a1d;"><span style="width: 32px; flex-shrink: 0; text-align: right; color: #8a8f98; padding-right: 8px;">63</span><span style="width: 12px; flex-shrink: 0; color: #6fdb9c;">+</span><span style="white-space: pre; overflow: hidden;">    let old_len = count(&amp;lines, Old);</span></div>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button type="button" style="height: 28px; padding: 0 10px; border: 0; border-radius: 6px; background: #1d1f24; color: #eceef1; font-size: 13px; font-weight: 500; cursor: pointer;">Open full diff</button>
+          <button type="button" style="height: 28px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: #a0a4ac; font-size: 13px; cursor: pointer;">Copy hash</button>
+        </div>
+      </aside>
+    </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    var C = ['#8b95fa', '#3fc7b5', '#f2b350'];
+    var X = [16, 30, 44];
+    function seg(l, t, h) { return { l: X[l] - 1, t: t, w: 2, h: h, bg: C[l], br: '0', bt: '0', bb: '0', rt: 0, rb: 0 }; }
+    function top(l) { return seg(l, 0, 14); }
+    function bot(l) { return seg(l, 14, 14); }
+    function pass(l) { return seg(l, 0, 28); }
+    function fromBelow(l, d) { var b = '2px solid ' + C[l]; return { l: X[d], t: 13, w: X[l] - X[d] + 1, h: 15, bg: 'transparent', br: b, bt: b, bb: '0', rt: 8, rb: 0 }; }
+    function fromAbove(l, d) { var b = '2px solid ' + C[l]; return { l: X[d], t: 0, w: X[l] - X[d] + 1, h: 15, bg: 'transparent', br: b, bt: '0', bb: b, rt: 0, rb: 8 }; }
+    var REF = {
+      current: { bg: '#2b3060', fg: '#8b95fa', border: '#2b3060', borderStyle: 'solid', weight: 600 },
+      local: { bg: '#1d1f24', fg: '#eceef1', border: '#2a2d33', borderStyle: 'solid', weight: 500 },
+      remote: { bg: 'transparent', fg: '#a0a4ac', border: '#2a2d33', borderStyle: 'solid', weight: 400 },
+      tag: { bg: 'transparent', fg: '#a0a4ac', border: '#686d77', borderStyle: 'dashed', weight: 400 }
+    };
+    function ref(kind, name) { var r = REF[kind]; return { name: name, bg: r.bg, fg: r.fg, border: r.border, borderStyle: r.borderStyle, weight: r.weight }; }
+    function row(lane, subject, author, date, hash, segs, opts) {
+      opts = opts || {};
+      var c = C[lane];
+      return {
+        subject: subject, author: author, date: date, hash: hash, segs: segs,
+        refs: opts.refs || [],
+        dotL: X[lane] - 6,
+        dotBg: opts.merge ? '#15161a' : c,
+        dotBorder: opts.head ? '#eceef1' : c,
+        rowBg: opts.selected ? '#1d1f24' : 'transparent',
+        subjectColor: opts.merge ? '#a0a4ac' : '#eceef1'
+      };
+    }
+    var me = 'Brendatama';
+    return {
+      rows: [
+        row(0, 'Keep hunk offsets when staging selected lines', me, '12 min ago', '4f2a9c1', [bot(0)], { head: true, refs: [ref('current', 'main')] }),
+        row(0, 'Recount hunk headers after a partial stage', me, '1 h ago', '9e31d07', [top(0), bot(0)], { selected: true }),
+        row(0, 'Merge feat/line-staging into main', me, '3 h ago', 'c07a5e2', [top(0), bot(0), fromBelow(1, 0)], { merge: true, refs: [ref('remote', 'origin/main')] }),
+        row(1, 'Patch builder keeps no-newline marker', me, '4 h ago', '51d8b3a', [pass(0), top(1), bot(1)], { refs: [ref('local', 'feat/line-staging')] }),
+        row(1, 'Stage selected lines through git apply --cached', me, '5 h ago', '7a20c4f', [pass(0), top(1), bot(1)]),
+        row(2, 'askpass: named pipe handshake', me, 'Yesterday', 'b81e07d', [pass(0), pass(1), bot(2)], { refs: [ref('local', 'fix/askpass-pipe'), ref('remote', 'origin/fix/askpass-pipe')] }),
+        row(0, 'Detect rebase step counts from .git', me, 'Yesterday', '2c9f610', [top(0), bot(0), pass(1), pass(2)]),
+        row(1, 'Build unified patch from a selection', me, 'Yesterday', 'e4b7a19', [pass(0), top(1), bot(1), pass(2)]),
+        row(0, 'Undo stack persisted in SQLite', me, '2 days ago', '0d6c2e8', [top(0), bot(0), pass(1), pass(2)]),
+        row(0, 'Diff engine: histogram with Myers fallback', me, '2 days ago', '8f14a3b', [top(0), bot(0), fromAbove(1, 0), fromAbove(2, 0)]),
+        row(0, 'Repo state detection from .git', me, '3 days ago', '36e9d55', [top(0), bot(0)], { refs: [ref('tag', 'v0.0.1')] }),
+        row(0, 'Core types: State, Event, Command', me, '3 days ago', 'a5c01fe', [top(0), bot(0)]),
+        row(0, 'Initial workspace and CI', me, '4 days ago', '1b7d2e0', [top(0)])
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>
