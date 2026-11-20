@@ -45,7 +45,8 @@ Always read your task file and its cited PRD laws. For doc/code disagreements, f
 
 ## Working style
 
-- You run on a headless Linux VPS. You cannot open windows or see the UI. Never build GPUI crates here.
+- Check your environment first. On the headless VPS (Linux, no display): never build or run the `ui` or `app` crates, and never claim a UI change works. On the Windows laptop: you may run `cargo check` on `ui` and `app`, but you still cannot see the window, so UI tasks end with a checklist for me to verify by running the app.
+- A task branch is owned by one machine at a time. Never commit to a branch another machine is working on.
 - Before calling a task done, run `cargo xtask check`.
 - While iterating, use `cargo check -p <crate>` or `cargo test -p <crate>`.
 - Do not add dependencies beyond the PRD's build-vs-library table without asking.
