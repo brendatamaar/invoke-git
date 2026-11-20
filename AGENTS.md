@@ -40,7 +40,7 @@ Always read your task file and its cited PRD laws. For doc/code disagreements, f
 
 - The 14 laws in `docs/PRD.md` are the contract. Each has one owning test (see `docs/spec/verification.md`).
 - New logic in a pure crate gets property tests (`proptest`). Prove each new test can fail by breaking the code once.
-- Tests touch only generated fixture repos in temp folders. **Never run git commands against the user's real repositories.**
+- Tests use only generated fixture repos in temp folders and never touch the user's real repositories. Normal git (commit, branch, worktree) in this project's own checkout is fine.
 - Benchmarks (`criterion`) guard the performance budgets; a regression past budget is a failure.
 
 ## Working style
