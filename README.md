@@ -1,5 +1,7 @@
 # Invoke Git
 
+[![CI](https://github.com/brendatamaar/invoke-git/actions/workflows/ci.yml/badge.svg)](https://github.com/brendatamaar/invoke-git/actions/workflows/ci.yml)
+
 A fast, native desktop git client with a review step before every push. Rust end to end, UI in GPUI. Windows first.
 
 Status: Phase 0, the GPUI spike. See [docs/PLAN.md](docs/PLAN.md) and [docs/PRD.md](docs/PRD.md).
@@ -29,10 +31,22 @@ Windows needs Rust (`stable-x86_64-pc-windows-msvc`) and Visual Studio Build Too
 cargo xtask fixtures                    # generate fixtures/diff/{old,new}.rs
 cargo run --release -p spike-diff       # Phase 0 Prototype A
 cargo run --release -p spike-graph      # Phase 0 Prototype B
+cargo run --release -p spike-diff -- --commit-box   # Phase 0 text-input check
 cargo xtask check                       # fmt, clippy, tests
 ```
 
-On the headless VPS, build only the non-UI crates (see `docs/PLAN.md`).
+On the headless VPS, build only the non-UI crates (see `docs/PLAN.md`). `cargo xtask check` skips the UI crates by itself when Linux has no display; `cargo xtask check --core` skips them on any machine.
+
+## CI
+
+GitHub Actions runs on every push (`.github/workflows/ci.yml`), following the matrix in `docs/spec/verification.md`:
+
+| Job | Runner | Runs |
+| --- | --- | --- |
+| Windows (everything) | `windows-latest` | `cargo xtask check`: fmt, clippy and tests for every crate, GPUI included |
+| Core | `ubuntu-latest`, `macos-latest` | `cargo xtask check --core`: the same, without the UI crates |
+
+Benchmarks, Quint model checking and the nightly long runs are added by their own backlog tasks (24 and 25).
 
 ## License
 

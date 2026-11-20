@@ -12,10 +12,12 @@ const UI_PACKAGES: [&str; 4] = ["ui", "app", "spike-diff", "spike-graph"];
 fn main() -> ExitCode {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let result = match args.as_slice() {
-        [command] if command == "check" => check(),
+        [command] if command == "check" => check(false),
+        // Core only: skip the GPUI crates everywhere (Linux and macOS CI).
+        [command, flag] if command == "check" && flag == "--core" => check(true),
         [command] if command == "fixtures" => write_fixtures(),
         _ => {
-            eprintln!("Usage: cargo xtask check | cargo xtask fixtures");
+            eprintln!("Usage: cargo xtask check [--core] | cargo xtask fixtures");
             return ExitCode::FAILURE;
         }
     };
@@ -28,7 +30,9 @@ fn main() -> ExitCode {
     }
 }
 
-fn check() -> Result<(), String> {
+/// fmt, clippy and tests for the workspace. UI crates are skipped on a
+/// headless Linux machine, or everywhere when `core_only` is set.
+fn check(core_only: bool) -> Result<(), String> {
     let lock_path = env::temp_dir().join("invoke-git-check.lock");
     let lock = OpenOptions::new()
         .read(true)
@@ -79,7 +83,11 @@ fn check() -> Result<(), String> {
     let packages = metadata::package_names(json)
         .ok_or("workspace package discovery failed: invalid Cargo metadata")?;
 
-    let excluded = |package: &str| headless_linux && UI_PACKAGES.contains(&package);
+    let skip_ui = core_only || headless_linux;
+    if skip_ui {
+        eprintln!("xtask: core only, skipping {}", UI_PACKAGES.join(", "));
+    }
+    let excluded = |package: &str| skip_ui && UI_PACKAGES.contains(&package);
     let mut fmt = cargo();
     fmt.arg("fmt");
     let mut workspace = vec!["--workspace"];
@@ -100,7 +108,7 @@ fn check() -> Result<(), String> {
     )?;
     run("cargo test", cargo().arg("test").args(&workspace))?;
 
-    if cfg!(windows) {
+    if cfg!(windows) && !core_only {
         let mut ui_check = cargo();
         ui_check.arg("check");
         let mut found = false;
