@@ -57,7 +57,7 @@ The spike answers one question in 1–2 weekends: can GPUI render a huge diff an
 
 ### Measurement protocol
 
-- Run release builds on the reference Windows 11 laptop (build `<fill in from winver>`) with an Intel Core i5-12500H, 16 GB RAM, and Intel Iris Xe integrated graphics. Plug it in and close other heavy apps.
+- Run release builds on the reference Windows 11 version 25H2 laptop (OS build 26200.9974) with an Intel Core i5-12500H, 16 GB RAM, and Intel Iris Xe integrated graphics. Plug it in and close other heavy apps.
 - Measure the gate at 60 Hz. Also record results at 90 Hz for information.
 - For each prototype, scroll with the mouse wheel for 10 seconds and drag the scrollbar from top to bottom three times.
 - At 60 Hz, the 95th-percentile frame time must be ≤ 16.7 ms, and no single frame may exceed 50 ms.
