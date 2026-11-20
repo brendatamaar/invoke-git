@@ -12,7 +12,7 @@ Read only the docs for your task areas:
 - Test changes → `docs/spec/verification.md`
 - UI → `docs/design/tokens.json` and the matching `docs/design/screens/*.dc.html`
 
-Always read your task file and its cited PRD laws. If code and docs disagree, stop and ask.
+Always read your task file and its cited PRD laws. For doc/code disagreements, follow Handoff.
 
 | Doc | What it decides |
 | --- | --- |
@@ -45,18 +45,19 @@ Always read your task file and its cited PRD laws. If code and docs disagree, st
 
 ## Working style
 
-- You run on a headless Linux VPS. You cannot open windows or see the UI. Never build GPUI crates here and never claim a UI change works. For UI changes, make it compile-ready, list exactly what I should run and check on Windows, and wait for my result.
+- You run on a headless Linux VPS. You cannot open windows or see the UI. Never build GPUI crates here.
 - Before calling a task done, run `./scripts/check.sh`.
 - While iterating, use `cargo check -p <crate>` or `cargo test -p <crate>`; reserve the full check for the end of the task.
 - Never run cargo build, check, clippy or test on the `ui` or `app` crates here.
-- If a spec gap blocks you, write down the question and your proposed answer, then ask. Do not invent behaviour silently.
 - Do not add dependencies beyond the PRD's build-vs-library table without asking.
 - Windows matters most: watch for path length, case-insensitive paths, CRLF and file locking.
 
 ## Handoff
 
 - Do only the task in `tasks/NNN.md` and say its backlog number.
-- Write `tasks/NNN.DONE.md` with what changed, what is unfinished and anything surprising. For UI changes, include exact Windows commands and checks.
+- Write `tasks/NNN.DONE.md` with what changed, what is unfinished and anything surprising.
+- For spec gaps or doc/code disagreements, record the question and proposed answer in DONE.md. Finish unblocked work, commit and stop. Do not guess silently.
+- UI tasks end at compile-ready plus a Windows checklist in DONE.md. Include exact commands and checks. Never claim a UI change works.
 
 ## Out of scope (non-goals)
 
