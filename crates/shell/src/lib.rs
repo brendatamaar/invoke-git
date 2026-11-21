@@ -11,9 +11,11 @@ pub mod progress;
 pub mod read;
 pub mod runner;
 mod tree;
+pub mod watch;
 
 pub use discover::{DiscoverError, Discovered, discover};
 pub use git::{Git, GitVersion, SetupError};
 pub use precondition::RepoPaths;
 pub use read::{execute as execute_read, read_state};
 pub use runner::GitRunner;
+pub use watch::{RepoWatcher, WatchError};
