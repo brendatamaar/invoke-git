@@ -183,6 +183,7 @@ fn event() -> impl Strategy<Value = Event> {
         )),
         1 => (op_id(), prompt()).prop_map(|(op, prompt)| Event::AuthNeeded(op, prompt)),
         3 => (op_id(), outcome()).prop_map(|(op, outcome)| Event::OpFinished(op, outcome)),
+        2 => (op_id(), oid()).prop_map(|(op, tree)| Event::UndoSnapshotTaken { op, tree }),
     ]
 }
 
@@ -299,6 +300,17 @@ proptest! {
                         prop_assert_eq!(point.op, running.id);
                         prop_assert_eq!(&point.index, &disk.index);
                     }
+                    Command::ReplayUndo(replay) => {
+                        prop_assert_eq!(replay.op, running.id);
+                        prop_assert_eq!(&replay.expect.head, &disk.head);
+                        prop_assert_eq!(&replay.expect.index, &disk.index);
+                        for item in &replay.refs {
+                            prop_assert_eq!(
+                                &item.expect,
+                                &invoke_core::undo::current_value(disk, &item.name)
+                            );
+                        }
+                    }
                     Command::ApplyPatchToIndex { op, expect_index, .. } => {
                         prop_assert_eq!(*op, running.id);
                         prop_assert_eq!(expect_index, &disk.index);
@@ -306,6 +318,16 @@ proptest! {
                     _ => unreachable!(),
                 }
             }
+            Ok(())
+        })?;
+    }
+
+    /// The stack never holds more than 50 points, and an undo that was
+    /// refused or is waiting leaves it alone.
+    #[test]
+    fn undo_stack_stays_bounded(events in vec(event(), 0..60)) {
+        run(events, |_, _, after, _| {
+            prop_assert!(after.undo.entries.len() <= 50);
             Ok(())
         })?;
     }
@@ -410,7 +432,7 @@ fn commit_round_trip() {
         state,
         Event::StateRead {
             read: *read,
-            disk: free,
+            disk: free.clone(),
         },
     );
     assert_eq!(
@@ -419,6 +441,7 @@ fn commit_round_trip() {
             Command::SnapshotForUndo(UndoPoint {
                 op,
                 label: "Commit 'Fix login'".into(),
+                head: HeadTarget::Branch(BranchName("main".into())),
                 refs: vec![RefValue {
                     name: RefName("refs/heads/main".into()),
                     oid: Some(oid.clone()),
@@ -442,8 +465,18 @@ fn commit_round_trip() {
         ]
     );
 
+    let tree = Oid::from_hex(&"c".repeat(40)).unwrap();
+    let (state, _) = step(
+        state,
+        Event::UndoSnapshotTaken {
+            op,
+            tree: tree.clone(),
+        },
+    );
     let (state, commands) = step(state, Event::OpFinished(op, OpOutcome::Succeeded));
-    assert!(matches!(commands.as_slice(), [Command::ReadState { .. }]));
+    let [Command::ReadState { read, .. }] = commands.as_slice() else {
+        panic!("{commands:?}");
+    };
     assert!(state.ops.running.is_none());
     assert_eq!(
         state.notice,
@@ -452,6 +485,48 @@ fn commit_round_trip() {
             outcome: OpOutcome::Succeeded
         })
     );
+
+    // The point is recorded once the fresh read shows what the commit left.
+    assert!(state.undo.entries.is_empty());
+    let new_oid = Oid::from_hex(&"d".repeat(40)).unwrap();
+    let new_index = IndexId::Checksum(Oid::from_hex(&"e".repeat(40)).unwrap());
+    let after = DiskState {
+        head: Head::Branch {
+            name: BranchName("main".into()),
+            oid: new_oid.clone(),
+        },
+        index: new_index.clone(),
+        refs: RefsSnapshot {
+            refs: [(RefName("refs/heads/main".into()), new_oid.clone())].into(),
+        },
+        lock: LockState::Free,
+        ..free
+    };
+    let (state, commands) = step(
+        state,
+        Event::StateRead {
+            read: *read,
+            disk: after,
+        },
+    );
+    assert!(commands.is_empty(), "{commands:?}");
+    let entry = state.undo.entries.back().cloned().expect("an undo point");
+    assert_eq!(entry.tree, tree);
+    assert_eq!(entry.point.label, "Commit 'Fix login'");
+    assert_eq!(entry.after_index, new_index);
+    assert_eq!(entry.after_refs[0].oid, Some(new_oid));
+
+    // Undo plans the replay from the point, with expected values.
+    let (state, commands) = step(state, Event::UndoRequested);
+    let [Command::ReplayUndo(replay)] = commands.as_slice() else {
+        panic!("{commands:?}");
+    };
+    assert_eq!(replay.tree, tree);
+    assert_eq!(
+        replay.refs[0].restore.as_ref(),
+        Some(&entry.point.refs[0].oid.clone().unwrap())
+    );
+    assert!(state.undo.entries.is_empty());
 }
 
 #[test]

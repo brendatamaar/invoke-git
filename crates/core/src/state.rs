@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName, RepoId, RepoPath};
 use crate::ops::{AuthPrompt, Failure, OpOutcome, Progress, WriteRequest};
+use crate::undo::{Irreversible, UndoStack};
 
 /// The state of one open repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,6 +15,7 @@ pub struct RepoState {
     pub snapshot: Snapshot,
     pub reads: Reads,
     pub ops: OpQueue,
+    pub undo: UndoStack,
     /// The newest thing the user should be told; replaced by the next one.
     pub notice: Option<Notice>,
 }
@@ -197,10 +199,29 @@ pub enum Action {
 }
 
 /// Why a request was turned down. Every refusal states one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// The skeleton does not handle this yet; the named backlog task adds it.
-    NotYetSupported { task: u8 },
+    NotYetSupported {
+        task: u8,
+    },
+    NothingToUndo,
+    /// The newest operation cannot be undone (for example a push).
+    NotUndoable(Irreversible),
+    /// Something else moved what the operation left; undo never overwrites
+    /// someone else's change.
+    Changed(UndoMoved),
+    /// A merge, rebase, cherry-pick or revert is in progress.
+    RepoBusy,
+}
+
+/// What moved since the operation, as found when an undo was planned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UndoMoved {
+    /// `HEAD` now points somewhere else (another branch, or detached).
+    Head,
+    Ref(RefName),
+    Index,
 }
 
 impl RepoState {
@@ -218,6 +239,7 @@ impl RepoState {
                 running: None,
                 queued: VecDeque::new(),
             },
+            undo: UndoStack::default(),
             notice: None,
         }
     }
