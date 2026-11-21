@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::ids::RepoPath;
+use crate::ids::{IndexId, RepoPath};
 
 /// A write the user asked for, waiting in or running from the op queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,6 +13,9 @@ pub enum WriteRequest {
     },
     /// Reverse the newest undo point.
     Undo,
+    // Task 11: index writes from the status tree.
+    Stage(StageRequest),
+    Unstage(StageRequest),
 }
 
 /// Typed git invocation. The shell turns it into argv (task 4); keeping it
@@ -98,6 +101,44 @@ pub enum Selection {
     },
 }
 
-/// A unified-diff patch for `git apply --cached`. Task 11 builds these.
+impl Selection {
+    pub fn path(&self) -> &RepoPath {
+        match self {
+            Selection::File(path)
+            | Selection::Hunk { path, .. }
+            | Selection::Lines { path, .. } => path,
+        }
+    }
+
+    /// What an undo point says: "Stage a.rs", "Unstage hunk 2 in a.rs",
+    /// "Stage 3 lines in a.rs".
+    pub fn label(&self, verb: &str) -> String {
+        match self {
+            Selection::File(path) => format!("{verb} {}", path.0),
+            Selection::Hunk { path, hunk } => format!("{verb} hunk {} in {}", hunk + 1, path.0),
+            Selection::Lines { path, lines, .. } => {
+                let n = lines.len();
+                let noun = if n == 1 { "line" } else { "lines" };
+                format!("{verb} {n} {noun} in {}", path.0)
+            }
+        }
+    }
+}
+
+/// A unified-diff patch for `git apply --cached` (built by `diff::build_patch`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Patch(pub String);
+
+/// A stage or unstage the user asked for (task 11).
+///
+/// The UI builds the patch from the diff it shows, so the core carries it
+/// and never needs file contents. `based_on` is the index id the diff was
+/// computed against: the write is refused, and the diff must be refreshed,
+/// unless the index on disk is still exactly that one (rule 5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageRequest {
+    /// What was selected; names the undo point and the notice.
+    pub selection: Selection,
+    pub patch: Patch,
+    pub based_on: IndexId,
+}

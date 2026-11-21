@@ -33,6 +33,14 @@ pub(crate) fn open(paths: &RepoPaths) -> Result<gix::Repository, String> {
         .map_err(|error| format!("open {}: {error}", paths.git_dir.display()))
 }
 
+/// Opens the repo through its working tree, which a status read needs.
+/// Opening by git dir alone knows no worktree when the git dir is
+/// elsewhere (`--separate-git-dir`) or a linked worktree's own.
+pub(crate) fn open_with_worktree(paths: &RepoPaths) -> Result<gix::Repository, String> {
+    gix::open_opts(&paths.workdir, gix::open::Options::isolated())
+        .map_err(|error| format!("open {}: {error}", paths.workdir.display()))
+}
+
 /// What `HEAD` says, as the core's [`Head`].
 pub(crate) fn read_head(repo: &gix::Repository) -> Result<Head, String> {
     let head = repo.head().map_err(|error| format!("read HEAD: {error}"))?;

@@ -4,7 +4,7 @@ use std::mem;
 
 use crate::event::{ChangeSet, Command, Event, Expect, HeadTarget, ReadScope, RefValue, UndoPoint};
 use crate::ids::{OpId, ReadId, RefName, RepoId};
-use crate::ops::{GitArgs, OpOutcome, WriteRequest};
+use crate::ops::{GitArgs, OpOutcome, StageRequest, WriteRequest};
 use crate::state::{
     Action, DiskState, Freshness, Head, LockState, Notice, OpPhase, QueuedOp, Refusal, RepoState,
     RunningOp, Snapshot,
@@ -25,8 +25,12 @@ pub fn open(id: RepoId) -> (RepoState, Vec<Command>) {
 pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
     let mut commands = Vec::new();
     match event {
-        Event::StageRequested(_) => refuse(&mut state, Action::Stage, 11),
-        Event::UnstageRequested(_) => refuse(&mut state, Action::Unstage, 11),
+        Event::StageRequested(request) => {
+            enqueue_index_write(&mut state, Action::Stage, request, WriteRequest::Stage);
+        }
+        Event::UnstageRequested(request) => {
+            enqueue_index_write(&mut state, Action::Unstage, request, WriteRequest::Unstage);
+        }
         Event::PushRequested { .. } => refuse(&mut state, Action::Push, 17),
         Event::UndoRequested => match state.undo.top() {
             Ok(_) => enqueue(&mut state, WriteRequest::Undo),
@@ -108,6 +112,21 @@ fn refuse(state: &mut RepoState, action: Action, task: u8) {
 
 fn refuse_because(state: &mut RepoState, action: Action, reason: Refusal) {
     state.notice = Some(Notice::Refused { action, reason });
+}
+
+/// Task 11: an empty patch changes nothing and is refused up front; the
+/// rest waits its turn like any write.
+fn enqueue_index_write(
+    state: &mut RepoState,
+    action: Action,
+    request: StageRequest,
+    wrap: fn(StageRequest) -> WriteRequest,
+) {
+    if request.patch.0.is_empty() {
+        refuse_because(state, action, Refusal::NothingSelected);
+    } else {
+        enqueue(state, wrap(request));
+    }
 }
 
 fn enqueue(state: &mut RepoState, request: WriteRequest) {
@@ -219,9 +238,11 @@ fn finish_undo(
 ) {
     let pending = mem::take(&mut state.undo.pending);
     state.undo.pending = match (pending, request, succeeded) {
-        (UndoPending::Taken { point, tree }, WriteRequest::Commit { .. }, true) => {
-            UndoPending::Settling { point, tree }
-        }
+        (
+            UndoPending::Taken { point, tree },
+            WriteRequest::Commit { .. } | WriteRequest::Stage(_) | WriteRequest::Unstage(_),
+            true,
+        ) => UndoPending::Settling { point, tree },
         (UndoPending::Replaying { entry }, WriteRequest::Undo, true) => {
             prune(vec![entry.point.op], commands);
             UndoPending::Rewinding
@@ -279,6 +300,34 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                         amend: *amend,
                     },
                     expect,
+                });
+                state.undo.pending = UndoPending::Recording { point };
+            }
+            // Task 11. The patch was built from a diff of one index; if the
+            // index on disk is another, the diff is stale and nothing runs.
+            WriteRequest::Stage(stage) | WriteRequest::Unstage(stage) => {
+                let (action, verb) = if matches!(request, WriteRequest::Stage(_)) {
+                    (Action::Stage, "Stage")
+                } else {
+                    (Action::Unstage, "Unstage")
+                };
+                if stage.based_on != expect.index {
+                    refuse_because(state, action, Refusal::StaleDiff);
+                    continue;
+                }
+                // Only the index changes, so the point records no refs.
+                let point = UndoPoint {
+                    op: id,
+                    label: stage.selection.label(verb),
+                    head: HeadTarget::of(&disk.head),
+                    refs: Vec::new(),
+                    index: expect.index.clone(),
+                };
+                commands.push(Command::SnapshotForUndo(point.clone()));
+                commands.push(Command::ApplyPatchToIndex {
+                    op: id,
+                    patch: stage.patch.clone(),
+                    expect_index: expect.index.clone(),
                 });
                 state.undo.pending = UndoPending::Recording { point };
             }

@@ -8,7 +8,7 @@ description = "IO for Invoke Git: runs the core's commands through gix and the g
 [dependencies]
 invoke-core = { path = "../core" }
 askpass = { path = "../askpass" }
-gix = { workspace = true, features = ["index", "excludes"] }
+gix = { workspace = true, features = ["index", "excludes", "status"] }
 notify = "8"
 
 [target.'cfg(windows)'.dependencies]
@@ -22,4 +22,5 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+diff = { path = "../diff" }
 proptest.workspace = true

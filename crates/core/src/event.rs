@@ -3,15 +3,17 @@
 use std::collections::BTreeSet;
 
 use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName};
-use crate::ops::{AuthAnswer, AuthPrompt, Failure, GitArgs, OpOutcome, Patch, Progress, Selection};
+use crate::ops::{
+    AuthAnswer, AuthPrompt, Failure, GitArgs, OpOutcome, Patch, Progress, StageRequest,
+};
 use crate::state::{DiskState, Head};
 use crate::undo::UndoReplay;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     // From the UI.
-    StageRequested(Selection),
-    UnstageRequested(Selection),
+    StageRequested(StageRequest),
+    UnstageRequested(StageRequest),
     CommitRequested {
         message: String,
         amend: bool,

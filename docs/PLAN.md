@@ -111,7 +111,7 @@ Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are 
 | 8 | Diff engine: Myers + histogram, hunks, word-level diff | Diff | 1 | Done |
 | 9 | Syntax highlighting layer on tree-sitter | Diff | 8 | Done |
 | 10 | Diff viewer: split and unified, virtualized | UI | 2, 8, 9 | Not started |
-| 11 | Status tree with file, hunk and line staging | Core + UI | 5, 10 | Not started |
+| 11 | Status tree with file, hunk and line staging | Core + UI | 5, 10 | Core done |
 | 12 | Undo system: reflog and index snapshots | Core | 5 | Done |
 | 13 | Discard file, hunk or lines, undoable | Core + UI | 11, 12 | Not started |
 | 14 | Commit, amend, commit message editor | Core + UI | 11 | Not started |
