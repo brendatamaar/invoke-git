@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName};
 use crate::ops::{AuthAnswer, AuthPrompt, Failure, GitArgs, OpOutcome, Patch, Progress, Selection};
 use crate::state::{DiskState, Head};
-use crate::undo::UndoReplay;
+use crate::undo::{Reversal, UndoReplay};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -22,6 +22,14 @@ pub enum Event {
     OpCancelRequested(OpId),
     AuthAnswered(OpId, AuthAnswer),
     UndoRequested,
+    // Task 20: stash. Apply, pop and drop name the entry by commit id.
+    StashSaveRequested {
+        message: String,
+        include_untracked: bool,
+    },
+    StashApplyRequested(Oid),
+    StashPopRequested(Oid),
+    StashDropRequested(Oid),
     RefreshRequested,
     NoticeDismissed,
     // From the shell.
@@ -125,6 +133,8 @@ pub struct UndoPoint {
     pub head: HeadTarget,
     pub refs: Vec<RefValue>,
     pub index: IndexId,
+    /// How this operation can be reversed, or why it cannot (task 20).
+    pub reverse: Reversal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

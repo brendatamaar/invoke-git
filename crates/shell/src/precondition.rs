@@ -129,6 +129,25 @@ pub fn check(paths: &RepoPaths, expect: &Expect) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Refuses a stash write when the entry at `stash@{index}` is not the stash
+/// with commit id `id` any more (someone saved, popped or dropped one since
+/// the core read the list). Read fresh through gix.
+pub fn check_stash(paths: &RepoPaths, index: usize, id: &Oid) -> Result<(), Failure> {
+    let fail = |class, details: String| Failure { class, details };
+    let repo = open(paths).map_err(|error| fail(ErrorClass::Bug, error))?;
+    let stashes = crate::read::read_stashes(&repo).map_err(|error| fail(ErrorClass::Bug, error))?;
+    match stashes.get(index) {
+        Some(entry) if entry.id == *id => Ok(()),
+        found => Err(fail(
+            ErrorClass::PreconditionChanged,
+            format!(
+                "stash moved: expected {id} at stash@{{{index}}}, found {}",
+                found.map_or("nothing".to_owned(), |entry| entry.id.to_string())
+            ),
+        )),
+    }
+}
+
 fn branch_name(full: String) -> BranchName {
     match full.strip_prefix("refs/heads/") {
         Some(short) => BranchName(short.to_owned()),

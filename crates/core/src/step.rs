@@ -3,13 +3,14 @@
 use std::mem;
 
 use crate::event::{ChangeSet, Command, Event, Expect, HeadTarget, ReadScope, RefValue, UndoPoint};
-use crate::ids::{OpId, ReadId, RefName, RepoId};
+use crate::ids::{Oid, OpId, ReadId, RefName, RepoId};
 use crate::ops::{GitArgs, OpOutcome, WriteRequest};
+use crate::stash;
 use crate::state::{
-    Action, DiskState, Freshness, Head, LockState, Notice, OpPhase, QueuedOp, Refusal, RepoState,
-    RunningOp, Snapshot,
+    Action, DiskState, Freshness, Head, LockState, Notice, OpPhase, Phase, QueuedOp, Refusal,
+    RepoState, RunningOp, Snapshot,
 };
-use crate::undo::{self, Reversible, UndoEntry, UndoPending};
+use crate::undo::{self, Irreversible, Reversal, Reversible, UndoEntry, UndoPending};
 
 /// Opens a repo: the initial state plus the first full read.
 pub fn open(id: RepoId) -> (RepoState, Vec<Command>) {
@@ -32,6 +33,25 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
             Ok(_) => enqueue(&mut state, WriteRequest::Undo),
             Err(reason) => refuse_because(&mut state, Action::Undo, reason),
         },
+        // Task 20: stash requests are checked against the fresh snapshot when
+        // they are dispatched, so a stash that moved meanwhile is refused.
+        Event::StashSaveRequested {
+            message,
+            include_untracked,
+        } => enqueue(
+            &mut state,
+            WriteRequest::StashSave {
+                message,
+                include_untracked,
+            },
+        ),
+        Event::StashApplyRequested(stash) => {
+            enqueue(&mut state, WriteRequest::StashApply { stash });
+        }
+        Event::StashPopRequested(stash) => enqueue(&mut state, WriteRequest::StashPop { stash }),
+        Event::StashDropRequested(stash) => {
+            enqueue(&mut state, WriteRequest::StashDrop { stash });
+        }
         Event::UndoSnapshotTaken { op, tree } => {
             if let UndoPending::Recording { point } = &state.undo.pending
                 && point.op == op
@@ -126,6 +146,12 @@ fn running_mut(state: &mut RepoState, op: OpId) -> Option<&mut RunningOp> {
 
 fn cancel(state: &mut RepoState, op: OpId, commands: &mut Vec<Command>) {
     if let Some(running) = running_mut(state, op) {
+        // Task 20: `git stash` is not atomic (it saves the stash, then
+        // resets the worktree), so a running stash op is never killed:
+        // law 13 would not hold. It is local and quick.
+        if is_stash(&running.request) {
+            return;
+        }
         if !matches!(running.phase, OpPhase::Cancelling) {
             running.phase = OpPhase::Cancelling;
             commands.push(Command::CancelOp(op));
@@ -137,6 +163,16 @@ fn cancel(state: &mut RepoState, op: OpId, commands: &mut Vec<Command>) {
             outcome: OpOutcome::Cancelled,
         });
     }
+}
+
+fn is_stash(request: &WriteRequest) -> bool {
+    matches!(
+        request,
+        WriteRequest::StashSave { .. }
+            | WriteRequest::StashApply { .. }
+            | WriteRequest::StashPop { .. }
+            | WriteRequest::StashDrop { .. }
+    )
 }
 
 fn request_read(state: &mut RepoState, scope: ReadScope, commands: &mut Vec<Command>) {
@@ -185,12 +221,17 @@ fn settle_undo(state: &mut RepoState, commands: &mut Vec<Command>) {
                     oid: undo::current_value(&disk, &before.name),
                 })
                 .collect();
+            let reversible = match &point.reverse {
+                Reversal::Never(why) => Reversible::No(*why),
+                Reversal::StashKept(_) => Reversible::No(Irreversible::StashNotOnTop),
+                Reversal::Refs | Reversal::StashStore(_) => Reversible::Yes,
+            };
             let pruned = state.undo.push(UndoEntry {
                 point,
                 tree,
                 after_refs,
                 after_index: disk.index,
-                reversible: Reversible::Yes,
+                reversible,
             });
             prune(pruned, commands);
         }
@@ -219,7 +260,9 @@ fn finish_undo(
 ) {
     let pending = mem::take(&mut state.undo.pending);
     state.undo.pending = match (pending, request, succeeded) {
-        (UndoPending::Taken { point, tree }, WriteRequest::Commit { .. }, true) => {
+        (UndoPending::Taken { point, tree }, request, true)
+            if !matches!(request, WriteRequest::Undo) =>
+        {
             UndoPending::Settling { point, tree }
         }
         (UndoPending::Replaying { entry }, WriteRequest::Undo, true) => {
@@ -270,6 +313,7 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     head: HeadTarget::of(&disk.head),
                     refs: vec![head_ref(&disk.head)],
                     index: expect.index.clone(),
+                    reverse: Reversal::Refs,
                 };
                 commands.push(Command::SnapshotForUndo(point.clone()));
                 commands.push(Command::RunGit {
@@ -282,6 +326,25 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                 });
                 state.undo.pending = UndoPending::Recording { point };
             }
+            // Task 20: stash. Planned against the snapshot the write runs on.
+            WriteRequest::StashSave { .. }
+            | WriteRequest::StashApply { .. }
+            | WriteRequest::StashPop { .. }
+            | WriteRequest::StashDrop { .. } => match plan_stash(&request, &disk, id) {
+                Ok((point, args)) => {
+                    commands.push(Command::SnapshotForUndo(point.clone()));
+                    commands.push(Command::RunGit {
+                        op: id,
+                        args,
+                        expect,
+                    });
+                    state.undo.pending = UndoPending::Recording { point };
+                }
+                Err((action, reason)) => {
+                    refuse_because(state, action, reason);
+                    continue;
+                }
+            },
             WriteRequest::Undo => match undo::plan(&state.undo, &disk, id) {
                 Ok(replay) => {
                     if let Some(entry) = state.undo.entries.pop_back() {
@@ -300,6 +363,114 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
             request,
             phase: OpPhase::Running { progress: None },
         });
+    }
+}
+
+/// Task 20: the undo point and git invocation for a stash request, or why it
+/// is refused. A stash is found by its commit id in the fresh snapshot; the
+/// position found is what the shell re-checks just before running.
+fn plan_stash(
+    request: &WriteRequest,
+    disk: &DiskState,
+    op: OpId,
+) -> Result<(UndoPoint, GitArgs), (Action, Refusal)> {
+    let stash_ref = stash::stash_ref();
+    let before = RefValue {
+        oid: undo::current_value(disk, &stash_ref),
+        name: stash_ref,
+    };
+    let find = |action: Action, id: &Oid| {
+        stash::position(&disk.stashes, id)
+            .map(|index| (index, disk.stashes[index].clone()))
+            .ok_or_else(|| (action, Refusal::StashGone(id.clone())))
+    };
+    let busy = |action: Action| {
+        if disk.phase == Phase::Clean {
+            Ok(())
+        } else {
+            Err((action, Refusal::RepoBusy))
+        }
+    };
+    let point = |label: String, refs: Vec<RefValue>, reverse: Reversal| UndoPoint {
+        op,
+        label,
+        head: HeadTarget::of(&disk.head),
+        refs,
+        index: disk.index.clone(),
+        reverse,
+    };
+    let rewrites = Reversal::Never(Irreversible::StashRewroteFiles);
+    match request {
+        WriteRequest::StashSave {
+            message,
+            include_untracked,
+        } => {
+            busy(Action::StashSave)?;
+            let message = stash::clean_message(message);
+            Ok((
+                point(stash::label("Stash", &message), vec![before], rewrites),
+                GitArgs::StashSave {
+                    message,
+                    include_untracked: *include_untracked,
+                },
+            ))
+        }
+        WriteRequest::StashApply { stash } => {
+            busy(Action::StashApply)?;
+            let (index, entry) = find(Action::StashApply, stash)?;
+            Ok((
+                point(
+                    stash::label("Apply stash", &entry.message),
+                    Vec::new(),
+                    rewrites,
+                ),
+                GitArgs::StashApply {
+                    index,
+                    stash: stash.clone(),
+                },
+            ))
+        }
+        WriteRequest::StashPop { stash } => {
+            busy(Action::StashPop)?;
+            let (index, entry) = find(Action::StashPop, stash)?;
+            Ok((
+                point(
+                    stash::label("Pop stash", &entry.message),
+                    vec![before],
+                    rewrites,
+                ),
+                GitArgs::StashPop {
+                    index,
+                    stash: stash.clone(),
+                },
+            ))
+        }
+        WriteRequest::StashDrop { stash } => {
+            // Dropping touches only the stash list, so a merge or rebase in
+            // progress does not matter.
+            let (index, entry) = find(Action::StashDrop, stash)?;
+            let reverse = if index == 0 {
+                Reversal::StashStore(entry.clone())
+            } else {
+                Reversal::StashKept(entry.clone())
+            };
+            Ok((
+                point(
+                    stash::label("Drop stash", &entry.message),
+                    vec![before],
+                    reverse,
+                ),
+                GitArgs::StashDrop {
+                    index,
+                    stash: stash.clone(),
+                },
+            ))
+        }
+        // Not reachable (the caller passes stash requests only); refused
+        // rather than panicking, because `step` never panics.
+        WriteRequest::Commit { .. } | WriteRequest::Undo => {
+            Err((Action::StashSave, Refusal::NotYetSupported { task: 20 }))
+        }
     }
 }
 

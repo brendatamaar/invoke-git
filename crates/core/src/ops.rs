@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::ids::RepoPath;
+use crate::ids::{Oid, RepoPath};
 
 /// A write the user asked for, waiting in or running from the op queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,13 +13,61 @@ pub enum WriteRequest {
     },
     /// Reverse the newest undo point.
     Undo,
+    // Task 20: stash. Apply, pop and drop name the stash by commit id.
+    StashSave {
+        message: String,
+        include_untracked: bool,
+    },
+    StashApply {
+        stash: Oid,
+    },
+    StashPop {
+        stash: Oid,
+    },
+    StashDrop {
+        stash: Oid,
+    },
 }
 
 /// Typed git invocation. The shell turns it into argv (task 4); keeping it
 /// typed here lets tests check what the core asked for without parsing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitArgs {
-    Commit { message: String, amend: bool },
+    Commit {
+        message: String,
+        amend: bool,
+    },
+    // Task 20: stash. `index` is the position (`stash@{index}`) the core
+    // found `stash` at; the shell checks that the entry there still has that
+    // id and refuses otherwise (rule 5).
+    StashSave {
+        message: String,
+        include_untracked: bool,
+    },
+    StashApply {
+        index: usize,
+        stash: Oid,
+    },
+    StashPop {
+        index: usize,
+        stash: Oid,
+    },
+    StashDrop {
+        index: usize,
+        stash: Oid,
+    },
+}
+
+impl GitArgs {
+    /// The stash entry this run expects to find, as (position, commit id).
+    pub fn stash_target(&self) -> Option<(usize, &Oid)> {
+        match self {
+            GitArgs::StashApply { index, stash }
+            | GitArgs::StashPop { index, stash }
+            | GitArgs::StashDrop { index, stash } => Some((*index, stash)),
+            GitArgs::Commit { .. } | GitArgs::StashSave { .. } => None,
+        }
+    }
 }
 
 /// Progress parsed from git's stderr, e.g. `Receiving objects: 45% (9/20)`.

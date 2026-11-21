@@ -128,7 +128,37 @@ pub fn invocation(args: &GitArgs) -> Invocation {
                 stdin: Some(message.as_bytes().to_vec()),
             }
         }
+        // Task 20: stash. The message is one argv element of the form
+        // `--message=<text>`, so it can never be taken for an option. The
+        // entry is addressed as `stash@{n}`; the runner has checked that
+        // the entry at `n` has the id the core asked for.
+        GitArgs::StashSave {
+            message,
+            include_untracked,
+        } => {
+            argv.extend(["stash", "push"].map(OsString::from));
+            if *include_untracked {
+                argv.push("--include-untracked".into());
+            }
+            if !message.is_empty() {
+                argv.push(format!("--message={message}").into());
+            }
+            plain(argv)
+        }
+        GitArgs::StashApply { index, .. } => stash_entry(argv, "apply", *index),
+        GitArgs::StashPop { index, .. } => stash_entry(argv, "pop", *index),
+        GitArgs::StashDrop { index, .. } => stash_entry(argv, "drop", *index),
     }
+}
+
+fn plain(args: Vec<OsString>) -> Invocation {
+    Invocation { args, stdin: None }
+}
+
+fn stash_entry(mut argv: Vec<OsString>, verb: &str, index: usize) -> Invocation {
+    argv.extend(["stash", verb].map(OsString::from));
+    argv.push(format!("stash@{{{index}}}").into());
+    plain(argv)
 }
 
 #[cfg(windows)]
@@ -194,7 +224,62 @@ mod tests {
         assert_eq!(amend.args.last().unwrap(), "--amend");
     }
 
+    #[test]
+    fn stash_argv() {
+        let oid = invoke_core::Oid::from_hex(&"a".repeat(40)).unwrap();
+        let argv = |args: &GitArgs| -> Vec<String> {
+            let run = invocation(args);
+            assert_eq!(run.stdin, None);
+            run.args[GLOBAL_ARGS.len()..]
+                .iter()
+                .map(|arg| arg.to_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            argv(&GitArgs::StashSave {
+                message: "wip".into(),
+                include_untracked: true
+            }),
+            ["stash", "push", "--include-untracked", "--message=wip"]
+        );
+        assert_eq!(
+            argv(&GitArgs::StashSave {
+                message: String::new(),
+                include_untracked: false
+            }),
+            ["stash", "push"]
+        );
+        let at = |index| (index, oid.clone());
+        let (index, stash) = at(3);
+        assert_eq!(
+            argv(&GitArgs::StashApply { index, stash }),
+            ["stash", "apply", "stash@{3}"]
+        );
+        let (index, stash) = at(0);
+        assert_eq!(
+            argv(&GitArgs::StashPop { index, stash }),
+            ["stash", "pop", "stash@{0}"]
+        );
+        let (index, stash) = at(12);
+        assert_eq!(
+            argv(&GitArgs::StashDrop { index, stash }),
+            ["stash", "drop", "stash@{12}"]
+        );
+    }
+
     proptest! {
+        /// A stash message is one argv element that starts with `--message=`.
+        #[test]
+        fn stash_messages_stay_one_option_value(message in "[^\\x00]{1,40}") {
+            let run = invocation(&GitArgs::StashSave {
+                message: message.clone(),
+                include_untracked: false,
+            });
+            let last = run.args.last().unwrap().to_str().unwrap().to_owned();
+            prop_assert_eq!(last, format!("--message={message}"));
+            prop_assert_eq!(run.args.len(), GLOBAL_ARGS.len() + 3);
+        }
+
         /// No message, however odd, ever reaches argv.
         #[test]
         fn messages_never_reach_argv(message in "\\PC*", amend in any::<bool>()) {

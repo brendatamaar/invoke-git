@@ -8,8 +8,8 @@ use std::path::Path;
 
 use invoke_core::detect::{Markers, RebaseFiles, detect_phase};
 use invoke_core::{
-    Command, Conflicts, DiskState, ErrorClass, Event, Failure, LockState, ReadId, RefName,
-    RefsSnapshot, RepoPath, StatusSnapshot,
+    Command, Conflicts, DiskState, ErrorClass, Event, Failure, LockState, Oid, ReadId, RefName,
+    RefsSnapshot, RepoPath, StashEntry, StatusSnapshot,
 };
 
 use crate::precondition::{self, RepoPaths};
@@ -47,6 +47,7 @@ pub fn read_state(paths: &RepoPaths) -> Result<DiskState, Failure> {
     let conflicts = read_conflicts(&repo, &index_path).map_err(fail)?;
     let phase = detect_phase(&read_markers(&paths.git_dir), conflicts);
     let refs = read_refs(&repo).map_err(fail)?;
+    let stashes = read_stashes(&repo).map_err(fail)?;
     let lock = if paths.git_dir.join("index.lock").exists() {
         LockState::HeldByOther
     } else {
@@ -58,6 +59,7 @@ pub fn read_state(paths: &RepoPaths) -> Result<DiskState, Failure> {
         index,
         status: StatusSnapshot::default(),
         refs,
+        stashes,
         lock,
     })
 }
@@ -97,6 +99,36 @@ fn read_conflicts(repo: &gix::Repository, index_path: &Path) -> Result<Conflicts
     Ok(Conflicts {
         paths: paths.into_iter().collect(),
     })
+}
+
+/// The stash list: the reflog of `refs/stash`, newest first, so index 0 is
+/// `stash@{0}`. Read through gix, never `git stash list`.
+///
+/// The log is read forward and reversed: the reverse reader works through a
+/// fixed window that a long message could cut.
+pub(crate) fn read_stashes(repo: &gix::Repository) -> Result<Vec<StashEntry>, String> {
+    let Some(reference) = repo
+        .try_find_reference("refs/stash")
+        .map_err(|error| format!("read refs/stash: {error}"))?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut log = reference.log_iter();
+    let lines = log
+        .all()
+        .map_err(|error| format!("read stash reflog: {error}"))?;
+    let mut entries = Vec::new();
+    for line in lines.into_iter().flatten() {
+        let line = line.map_err(|error| format!("parse stash reflog: {error}"))?;
+        let id = Oid::from_hex(&line.new_oid.to_string())
+            .map_err(|error| format!("stash reflog id: {error:?}"))?;
+        entries.push(StashEntry {
+            id,
+            message: line.message.to_string(),
+        });
+    }
+    entries.reverse();
+    Ok(entries)
 }
 
 /// Every ref under `refs/`, loose and packed, with the object it names.

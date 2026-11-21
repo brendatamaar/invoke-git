@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 
 use crate::event::{Expect, HeadTarget, RefValue, UndoPoint};
 use crate::ids::{IndexId, Oid, OpId, RefName};
+use crate::stash::{self, StashEntry};
 use crate::state::{DiskState, Head, Phase, Refusal, UndoMoved};
 
 /// Undo points kept per repo; the oldest is dropped (and pruned on disk)
@@ -50,6 +51,30 @@ pub enum Reversible {
 pub enum Irreversible {
     /// It changed the remote.
     Push,
+    /// A stash save, apply or pop rewrote working files. Undo never rewrites
+    /// them (only a discard's undo does, task 13); the stash entry itself is
+    /// the way back.
+    StashRewroteFiles,
+    /// A stash that was not the newest was dropped. Putting it back at its
+    /// old position would need the reflog rewritten; it can only go on top,
+    /// which is not an exact restore (law 8).
+    StashNotOnTop,
+}
+
+/// How an operation is reversed (task 20; recorded in its [`UndoPoint`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reversal {
+    /// Restore the recorded refs and the index tree (commit, amend).
+    Refs,
+    /// Put a dropped stash back with `git stash store`. The commit is kept
+    /// alive under `refs/invoke-git/undo/<op>-stash` until the point goes.
+    StashStore(StashEntry),
+    /// A stash that was not the newest was dropped: not undoable (see
+    /// [`Irreversible::StashNotOnTop`]), but the commit is kept alive the
+    /// same way, so the work can be recovered by hand.
+    StashKept(StashEntry),
+    /// Not undoable; an undo stops here with this reason.
+    Never(Irreversible),
 }
 
 /// Where the point of the operation in flight is in its life.
@@ -82,6 +107,19 @@ pub struct UndoReplay {
     /// Head and index as read just now; the shell refuses if they moved.
     pub expect: Expect,
     // Task 13 adds the discarded blobs to write back to their paths here.
+    /// Task 20: when set, the replay puts this stash back (the refs and
+    /// index above are then empty / unused: the stash is stored, not the
+    /// refs restored). The shell checks the stash list still has
+    /// `expect_top` on top first.
+    pub stash: Option<StashRestore>,
+}
+
+/// Putting a dropped stash back on top of the stash list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StashRestore {
+    pub entry: StashEntry,
+    /// What the newest stash must be now (`None`: the list must be empty).
+    pub expect_top: Option<Oid>,
 }
 
 /// One ref to restore, atomically: only if it still holds `expect`.
@@ -130,6 +168,9 @@ impl UndoStack {
 /// recorded refs are ever touched).
 pub fn plan(undo: &UndoStack, disk: &DiskState, op: OpId) -> Result<UndoReplay, Refusal> {
     let entry = undo.top()?;
+    if let Reversal::StashStore(stashed) = &entry.point.reverse {
+        return plan_stash_store(entry, stashed, disk, op);
+    }
     if disk.phase != Phase::Clean {
         return Err(Refusal::RepoBusy);
     }
@@ -159,6 +200,38 @@ pub fn plan(undo: &UndoStack, disk: &DiskState, op: OpId) -> Result<UndoReplay, 
             head: disk.head.clone(),
             index: disk.index.clone(),
         },
+        stash: None,
+    })
+}
+
+/// Undo of a stash drop touches only the stash list, so only that is
+/// checked: the stash list must still be as the drop left it (nobody saved,
+/// popped or dropped since). Branch switches, staging and merges in
+/// progress do not matter to it.
+fn plan_stash_store(
+    entry: &UndoEntry,
+    stashed: &StashEntry,
+    disk: &DiskState,
+    op: OpId,
+) -> Result<UndoReplay, Refusal> {
+    let name = stash::stash_ref();
+    let after = entry.after_refs.iter().find(|r| r.name == name);
+    let now = current_value(disk, &name);
+    if now != after.and_then(|after| after.oid.clone()) {
+        return Err(Refusal::Changed(UndoMoved::Ref(name)));
+    }
+    Ok(UndoReplay {
+        op,
+        refs: Vec::new(),
+        tree: entry.tree.clone(),
+        expect: Expect {
+            head: disk.head.clone(),
+            index: disk.index.clone(),
+        },
+        stash: Some(StashRestore {
+            entry: stashed.clone(),
+            expect_top: now,
+        }),
     })
 }
 

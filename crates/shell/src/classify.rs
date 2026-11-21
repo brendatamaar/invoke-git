@@ -53,6 +53,15 @@ const MARKERS: [(ErrorClass, &[&str]); 4] = [
             "non-fast-forward",
             "CONFLICT",
             "Automatic merge failed",
+            // Task 20: stash. A pop or apply that conflicts keeps the
+            // stash and leaves the repo in git's own state; one that git
+            // refuses (local changes in the way) changes nothing.
+            "Your local changes to the following files would be overwritten",
+            "already exists, no checkout",
+            "could not restore untracked files from stash",
+            "No stash entries found",
+            "No local changes to save",
+            "You do not have the initial commit yet",
         ],
     ),
 ];
@@ -71,6 +80,15 @@ pub fn classify(success: bool, output: &str) -> OpOutcome {
         class,
         details: output.to_owned(),
     })
+}
+
+/// `git stash push` with nothing to save exits 0 and prints `No local
+/// changes to save`. No stash was made, so it is not a success.
+pub fn classify_stash_save(success: bool, output: &str) -> OpOutcome {
+    if success && output.contains("No local changes to save") {
+        return classify(false, output);
+    }
+    classify(success, output)
 }
 
 #[cfg(test)]
@@ -124,12 +142,34 @@ mod tests {
                 Expected,
             ),
             ("fatal: repository '/nope' does not exist", Expected),
+            (
+                "CONFLICT (content): Merge conflict in a.txt\nThe stash entry is kept in case you need it again.",
+                Expected,
+            ),
+            (
+                "error: Your local changes to the following files would be overwritten by merge:\n\ta.txt",
+                Expected,
+            ),
+            ("No stash entries found.", Expected),
             ("fatal: something nobody expected", Bug),
         ];
         for (output, expected) in cases {
             assert_eq!(class(output), Some(expected), "{output}");
         }
         assert_eq!(classify(true, "fatal: ignored"), OpOutcome::Succeeded);
+    }
+
+    #[test]
+    fn saving_nothing_is_an_expected_failure() {
+        let out = "No local changes to save\n";
+        match classify_stash_save(true, out) {
+            OpOutcome::Failed(failure) => assert_eq!(failure.class, ErrorClass::Expected),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            classify_stash_save(true, "Saved working directory and index state"),
+            OpOutcome::Succeeded
+        );
     }
 
     #[test]

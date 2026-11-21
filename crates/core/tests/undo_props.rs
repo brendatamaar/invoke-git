@@ -41,6 +41,7 @@ impl World {
             refs: RefsSnapshot {
                 refs: self.refs.clone(),
             },
+            stashes: Vec::new(),
             lock: self.lock,
         }
     }

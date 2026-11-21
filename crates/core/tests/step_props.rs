@@ -83,16 +83,31 @@ fn disk() -> impl Strategy<Value = DiskState> {
         1 => Just(LockState::HeldByUs),
         1 => Just(LockState::HeldByOther),
     ];
-    (head(), phase(), index, status, refs, lock).prop_map(
-        |(head, phase, index, status, refs, lock)| DiskState {
+    // Stashes come from a small pool of ids, so stash requests (drawn from
+    // the same pool) often name an entry that exists.
+    let stashes = vec(stash_oid(), 0..3).prop_map(|ids| {
+        ids.into_iter()
+            .map(|id| StashEntry {
+                id,
+                message: "On main: wip".into(),
+            })
+            .collect::<Vec<_>>()
+    });
+    (head(), phase(), index, status, refs, stashes, lock).prop_map(
+        |(head, phase, index, status, refs, stashes, lock)| DiskState {
             head,
             phase,
             index,
             status,
             refs,
+            stashes,
             lock,
         },
     )
+}
+
+fn stash_oid() -> impl Strategy<Value = Oid> {
+    (0..4u8).prop_map(|k| Oid::from_hex(&format!("{:040x}", 0xa000 + u64::from(k))).unwrap())
 }
 
 fn failure() -> impl Strategy<Value = Failure> {
@@ -168,6 +183,12 @@ fn event() -> impl Strategy<Value = Event> {
         1 => op_id().prop_map(Event::OpCancelRequested),
         1 => op_id().prop_map(|op| Event::AuthAnswered(op, AuthAnswer("secret".into()))),
         1 => Just(Event::UndoRequested),
+        1 => ("[a-z \\n]{0,8}", any::<bool>()).prop_map(|(message, include_untracked)| {
+            Event::StashSaveRequested { message, include_untracked }
+        }),
+        1 => stash_oid().prop_map(Event::StashApplyRequested),
+        1 => stash_oid().prop_map(Event::StashPopRequested),
+        1 => stash_oid().prop_map(Event::StashDropRequested),
         1 => Just(Event::RefreshRequested),
         1 => Just(Event::NoticeDismissed),
         2 => areas.prop_map(|areas| Event::DiskChanged(ChangeSet(areas))),
@@ -343,17 +364,23 @@ proptest! {
                 Event::CommitRequested { .. } => Action::Commit,
                 Event::PushRequested { .. } => Action::Push,
                 Event::UndoRequested => Action::Undo,
+                Event::StashSaveRequested { .. } => Action::StashSave,
+                Event::StashApplyRequested(_) => Action::StashApply,
+                Event::StashPopRequested(_) => Action::StashPop,
+                Event::StashDropRequested(_) => Action::StashDrop,
                 _ => return Ok(()),
             };
-            let refused = matches!(
-                after.notice,
-                Some(Notice::Refused { action: refused, .. }) if refused == action
-            );
             let accepted = after.ops.next.0 == before.ops.next.0 + 1
                 && (after.ops.queued.back().map(|queued| queued.id)
                     == Some(before.ops.next)
                     || after.ops.running.as_ref().map(|running| running.id)
                         == Some(before.ops.next));
+            // An older refusal of the same action may still be on show when
+            // a later request is accepted; it is not this request's.
+            let refused = matches!(
+                after.notice,
+                Some(Notice::Refused { action: refused, .. }) if refused == action
+            ) && (after.notice != before.notice || !accepted);
             prop_assert!(refused != accepted, "{event:?}: refused={refused} accepted={accepted}");
             Ok(())
         })?;
@@ -398,6 +425,7 @@ fn commit_round_trip() {
         index: index.clone(),
         status: StatusSnapshot::default(),
         refs: RefsSnapshot::default(),
+        stashes: Vec::new(),
         lock: LockState::HeldByOther,
     };
 
@@ -447,6 +475,7 @@ fn commit_round_trip() {
                     oid: Some(oid.clone()),
                 }],
                 index: index.clone(),
+                reverse: Reversal::Refs,
             }),
             Command::RunGit {
                 op,
