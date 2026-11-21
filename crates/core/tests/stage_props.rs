@@ -27,6 +27,7 @@ fn disk(index: IndexId, lock: LockState) -> DiskState {
             refs: [(RefName("refs/heads/main".into()), hex('a'))].into(),
             ..RefsSnapshot::default()
         },
+        stashes: Vec::new(),
         lock,
     }
 }
@@ -74,6 +75,7 @@ fn stage_snapshots_then_applies_with_the_expected_index() {
                 refs: Vec::new(),
                 index: index('b'),
                 index_effect: IndexEffect::Rewrites,
+                reverse: Reversal::Refs,
             }),
             Command::ApplyPatchToIndex {
                 op,

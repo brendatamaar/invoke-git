@@ -36,6 +36,20 @@ pub enum WriteRequest {
         /// Delete even if the branch is not fully merged.
         force: bool,
     },
+    // Task 20: stash. Apply, pop and drop name the stash by commit id.
+    StashSave {
+        message: String,
+        include_untracked: bool,
+    },
+    StashApply {
+        stash: Oid,
+    },
+    StashPop {
+        stash: Oid,
+    },
+    StashDrop {
+        stash: Oid,
+    },
 }
 
 impl WriteRequest {
@@ -86,9 +100,38 @@ pub enum GitArgs {
         tip: Oid,
         force: bool,
     },
+    // Task 20: stash. `index` is the position (`stash@{index}`) the core
+    // found `stash` at; the shell checks that the entry there still has that
+    // id and refuses otherwise (rule 5).
+    StashSave {
+        message: String,
+        include_untracked: bool,
+    },
+    StashApply {
+        index: usize,
+        stash: Oid,
+    },
+    StashPop {
+        index: usize,
+        stash: Oid,
+    },
+    StashDrop {
+        index: usize,
+        stash: Oid,
+    },
 }
 
 impl GitArgs {
+    /// The stash entry this run expects to find, as (position, commit id).
+    pub fn stash_target(&self) -> Option<(usize, &Oid)> {
+        match self {
+            GitArgs::StashApply { index, stash }
+            | GitArgs::StashPop { index, stash }
+            | GitArgs::StashDrop { index, stash } => Some((*index, stash)),
+            _ => None,
+        }
+    }
+
     /// The refs this run expects to find, besides `HEAD` and the index
     /// (rule 5). `oid: None` means the ref must not exist.
     pub fn expected_refs(&self) -> Vec<RefValue> {
@@ -97,7 +140,11 @@ impl GitArgs {
             oid: oid.cloned(),
         };
         match self {
-            GitArgs::Commit { .. } => Vec::new(),
+            GitArgs::Commit { .. }
+            | GitArgs::StashSave { .. }
+            | GitArgs::StashApply { .. }
+            | GitArgs::StashPop { .. }
+            | GitArgs::StashDrop { .. } => Vec::new(),
             GitArgs::CreateBranch { name, .. } => vec![at(name, None)],
             GitArgs::SwitchBranch { name, tip } | GitArgs::DeleteBranch { name, tip, .. } => {
                 vec![at(name, Some(tip))]

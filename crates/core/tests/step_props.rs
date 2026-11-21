@@ -87,16 +87,31 @@ fn disk() -> impl Strategy<Value = DiskState> {
         1 => Just(LockState::HeldByUs),
         1 => Just(LockState::HeldByOther),
     ];
-    (head(), phase(), index, status, refs, lock).prop_map(
-        |(head, phase, index, status, refs, lock)| DiskState {
+    // Stashes come from a small pool of ids, so stash requests (drawn from
+    // the same pool) often name an entry that exists.
+    let stashes = vec(stash_oid(), 0..3).prop_map(|ids| {
+        ids.into_iter()
+            .map(|id| StashEntry {
+                id,
+                message: "On main: wip".into(),
+            })
+            .collect::<Vec<_>>()
+    });
+    (head(), phase(), index, status, refs, stashes, lock).prop_map(
+        |(head, phase, index, status, refs, stashes, lock)| DiskState {
             head,
             phase,
             index,
             status,
             refs,
+            stashes,
             lock,
         },
     )
+}
+
+fn stash_oid() -> impl Strategy<Value = Oid> {
+    (0..4u8).prop_map(|k| Oid::from_hex(&format!("{:040x}", 0xa000 + u64::from(k))).unwrap())
 }
 
 fn failure() -> impl Strategy<Value = Failure> {
@@ -201,6 +216,12 @@ fn event() -> impl Strategy<Value = Event> {
             .prop_map(|(from, to)| Event::BranchRenameRequested { from, to }),
         1 => (branch(), any::<bool>())
             .prop_map(|(name, force)| Event::BranchDeleteRequested { name, force }),
+        1 => ("[a-z \\n]{0,8}", any::<bool>()).prop_map(|(message, include_untracked)| {
+            Event::StashSaveRequested { message, include_untracked }
+        }),
+        1 => stash_oid().prop_map(Event::StashApplyRequested),
+        1 => stash_oid().prop_map(Event::StashPopRequested),
+        1 => stash_oid().prop_map(Event::StashDropRequested),
         1 => Just(Event::RefreshRequested),
         1 => Just(Event::NoticeDismissed),
         2 => areas.prop_map(|areas| Event::DiskChanged(ChangeSet(areas))),
@@ -385,6 +406,10 @@ proptest! {
                 Event::BranchSwitchRequested(_) => Action::SwitchBranch,
                 Event::BranchRenameRequested { .. } => Action::RenameBranch,
                 Event::BranchDeleteRequested { .. } => Action::DeleteBranch,
+                Event::StashSaveRequested { .. } => Action::StashSave,
+                Event::StashApplyRequested(_) => Action::StashApply,
+                Event::StashPopRequested(_) => Action::StashPop,
+                Event::StashDropRequested(_) => Action::StashDrop,
                 _ => return Ok(()),
             };
             let accepted = after.ops.next.0 == before.ops.next.0 + 1
@@ -442,6 +467,7 @@ fn commit_round_trip() {
         index: index.clone(),
         status: StatusSnapshot::default(),
         refs: RefsSnapshot::default(),
+        stashes: Vec::new(),
         lock: LockState::HeldByOther,
     };
 
@@ -492,6 +518,7 @@ fn commit_round_trip() {
                 }],
                 index: index.clone(),
                 index_effect: IndexEffect::Rewrites,
+                reverse: Reversal::Refs,
             }),
             Command::RunGit {
                 op,

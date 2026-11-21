@@ -11,6 +11,7 @@ use crate::event::{HeadTarget, IndexEffect, RefValue, UndoPoint};
 use crate::ids::{BranchName, Oid, OpId, RefName};
 use crate::ops::{BranchStart, GitArgs, WriteRequest};
 use crate::state::{Action, BranchRefusal, DiskState, Head, Phase, Refusal};
+use crate::undo::Reversal;
 
 /// The request's name for notices; `None` when it is not about branches.
 pub fn action_of(request: &WriteRequest) -> Option<Action> {
@@ -22,7 +23,11 @@ pub fn action_of(request: &WriteRequest) -> Option<Action> {
         WriteRequest::Commit { .. }
         | WriteRequest::Undo
         | WriteRequest::Stage(_)
-        | WriteRequest::Unstage(_) => None,
+        | WriteRequest::Unstage(_)
+        | WriteRequest::StashSave { .. }
+        | WriteRequest::StashApply { .. }
+        | WriteRequest::StashPop { .. }
+        | WriteRequest::StashDrop { .. } => None,
     }
 }
 
@@ -63,6 +68,7 @@ fn check(
         refs,
         index: disk.index.clone(),
         index_effect,
+        reverse: Reversal::Refs,
     };
     let at = |name: &BranchName, oid: Option<&Oid>| RefValue {
         name: name.to_ref(),
@@ -180,7 +186,11 @@ fn check(
         WriteRequest::Commit { .. }
         | WriteRequest::Undo
         | WriteRequest::Stage(_)
-        | WriteRequest::Unstage(_) => Err(Refusal::NotYetSupported { task: 15 }),
+        | WriteRequest::Unstage(_)
+        | WriteRequest::StashSave { .. }
+        | WriteRequest::StashApply { .. }
+        | WriteRequest::StashPop { .. }
+        | WriteRequest::StashDrop { .. } => Err(Refusal::NotYetSupported { task: 15 }),
     }
 }
 

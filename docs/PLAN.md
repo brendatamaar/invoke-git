@@ -120,7 +120,7 @@ Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are 
 | 17 | Fetch, pull (merge or rebase), push with `--force-with-lease`, set upstream | Shell + UI | 4, 16 | Not started |
 | 18 | Commit graph: lane layout, paging, renderer | Graph | 2 | Core done |
 | 19 | Commit detail view with its diff | UI | 10, 18 | Not started |
-| 20 | Stash: save (incl. untracked), apply, pop, drop | Core + UI | 5 | Not started |
+| 20 | Stash: save (incl. untracked), apply, pop, drop | Core + UI | 5 | Core done |
 | 21 | Pre-push review screen: outgoing commits, combined and per-commit diffs | UI | 10, 17 | Not started |
 | 22 | Notes and annotations: SQLite store, anchoring, to-do warning on push | Core + UI | 21 | Not started |
 | 23 | Conflict resolution UI with continue and abort | Core + UI | 10, 17 | Not started |

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::ids::{BranchName, IndexId, NameProblem, Oid, OpId, ReadId, RefName, RepoId, RepoPath};
 use crate::ops::{AuthPrompt, Failure, OpOutcome, Progress, WriteRequest};
+use crate::stash::StashEntry;
 use crate::undo::{Irreversible, UndoStack};
 
 /// The state of one open repository.
@@ -66,6 +67,8 @@ pub struct DiskState {
     pub index: IndexId,
     pub status: StatusSnapshot,
     pub refs: RefsSnapshot,
+    /// The stash list, newest first (`stash@{0}` is first). Task 20.
+    pub stashes: Vec<StashEntry>,
     pub lock: LockState,
 }
 
@@ -266,6 +269,11 @@ pub enum Action {
     SwitchBranch,
     RenameBranch,
     DeleteBranch,
+    // Task 20.
+    StashSave,
+    StashApply,
+    StashPop,
+    StashDrop,
 }
 
 /// Why a request was turned down. Every refusal states one.
@@ -288,6 +296,10 @@ pub enum Refusal {
     Changed(UndoMoved),
     /// A merge, rebase, cherry-pick or revert is in progress.
     RepoBusy,
+    /// Task 20: the stash is no longer in the stash list (dropped, popped or
+    /// saved over by someone else). Stashes are addressed by commit id, so
+    /// a request never lands on a different entry that took its place.
+    StashGone(Oid),
     /// A branch request that cannot run on the snapshot it was checked
     /// against (task 15).
     Branch(BranchRefusal),

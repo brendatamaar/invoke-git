@@ -7,7 +7,7 @@ use crate::ops::{
     AuthAnswer, AuthPrompt, BranchStart, Failure, GitArgs, OpOutcome, Patch, Progress, StageRequest,
 };
 use crate::state::{DiskState, Head};
-use crate::undo::UndoReplay;
+use crate::undo::{Reversal, UndoReplay};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -40,6 +40,14 @@ pub enum Event {
         name: BranchName,
         force: bool,
     },
+    // Task 20: stash. Apply, pop and drop name the entry by commit id.
+    StashSaveRequested {
+        message: String,
+        include_untracked: bool,
+    },
+    StashApplyRequested(Oid),
+    StashPopRequested(Oid),
+    StashDropRequested(Oid),
     RefreshRequested,
     NoticeDismissed,
     // From the shell.
@@ -146,6 +154,8 @@ pub struct UndoPoint {
     /// Whether the operation rewrites the index (task 15: creating,
     /// renaming and deleting a branch do not).
     pub index_effect: IndexEffect,
+    /// How this operation can be reversed, or why it cannot (task 20).
+    pub reverse: Reversal,
 }
 
 /// Whether an operation changes the index, and so whether undoing it must

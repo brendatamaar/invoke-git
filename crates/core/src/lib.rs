@@ -10,6 +10,7 @@ pub mod detect;
 pub mod event;
 pub mod ids;
 pub mod ops;
+pub mod stash;
 pub mod state;
 mod step;
 pub mod undo;
@@ -26,6 +27,7 @@ pub use ops::{
     AuthAnswer, AuthKind, AuthPrompt, BranchStart, ErrorClass, Failure, GitArgs, OpOutcome, Patch,
     Progress, Selection, StageRequest, WriteRequest,
 };
+pub use stash::StashEntry;
 pub use state::{
     Action, BranchRefusal, Conflicts, DiskState, FileChange, Freshness, Head, LockState, Notice,
     OpPhase, OpQueue, Phase, QueuedOp, Reads, RefsSnapshot, Refusal, RepoState, RunningOp,
@@ -33,6 +35,6 @@ pub use state::{
 };
 pub use step::{open, step};
 pub use undo::{
-    HeadRestore, Irreversible, MAX_POINTS, RestoreRef, Reversible, UndoEntry, UndoPending,
-    UndoReplay, UndoStack,
+    HeadRestore, Irreversible, MAX_POINTS, RestoreRef, Reversal, Reversible, StashRestore,
+    UndoEntry, UndoPending, UndoReplay, UndoStack,
 };

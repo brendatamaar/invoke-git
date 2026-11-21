@@ -76,6 +76,7 @@ impl World {
                 refs: self.refs.clone(),
                 ..RefsSnapshot::default()
             },
+            stashes: Vec::new(),
             lock: self.lock,
         }
     }
@@ -378,7 +379,11 @@ impl Sim {
                 moved.insert(n.to_ref());
                 recorded_names = vec![n.to_ref()];
             }
-            GitArgs::Commit { .. } => panic!("no commits in this simulation"),
+            GitArgs::Commit { .. }
+            | GitArgs::StashSave { .. }
+            | GitArgs::StashApply { .. }
+            | GitArgs::StashPop { .. }
+            | GitArgs::StashDrop { .. } => panic!("no commits or stashes in this simulation"),
         }
         if rewrites {
             self.world.index = IndexId::Checksum(oid(self.next()));
@@ -719,6 +724,7 @@ fn arb_disk() -> impl Strategy<Value = DiskState> {
                     refs,
                     ..RefsSnapshot::default()
                 },
+                stashes: Vec::new(),
                 lock: LockState::Free,
             }
         })

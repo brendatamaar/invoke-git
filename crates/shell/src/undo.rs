@@ -12,8 +12,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use invoke_core::{
-    ErrorClass, Event, Failure, Head, HeadRestore, IndexEffect, Oid, OpId, OpOutcome, UndoPoint,
-    UndoReplay,
+    ErrorClass, Event, Failure, Head, HeadRestore, IndexEffect, Oid, OpId, OpOutcome, Reversal,
+    StashRestore, UndoPoint, UndoReplay,
 };
 
 use crate::classify::classify;
@@ -23,6 +23,12 @@ use crate::precondition::{self, RepoPaths};
 /// Where the saved tree of the point of `op` is kept.
 pub fn undo_ref(op: OpId) -> String {
     format!("refs/invoke-git/undo/{}", op.0)
+}
+
+/// Task 20: where the commit of a dropped stash is kept alive, so the drop
+/// can be undone and `git gc` leaves it alone.
+pub fn stash_keep_ref(op: OpId) -> String {
+    format!("refs/invoke-git/undo/{}-stash", op.0)
 }
 
 /// The answer to `SnapshotForUndo`.
@@ -106,6 +112,16 @@ impl UndoRunner {
             .map_err(|error| fail(ErrorClass::Bug, format!("write-tree: {error:?}")))?;
         self.run(&["update-ref", &undo_ref(op), tree.as_hex()], &[], None)
             .map_err(|details| fail(ErrorClass::Bug, details))?;
+        // Task 20: a drop's undo needs the stash commit, which nothing but
+        // the stash list keeps alive.
+        if let Reversal::StashStore(entry) | Reversal::StashKept(entry) = &point.reverse {
+            self.run(
+                &["update-ref", &stash_keep_ref(op), entry.id.as_hex()],
+                &[],
+                None,
+            )
+            .map_err(|details| fail(ErrorClass::Bug, details))?;
+        }
         Ok(tree)
     }
 
@@ -119,6 +135,9 @@ impl UndoRunner {
     fn replay_outcome(&self, replay: &UndoReplay) -> OpOutcome {
         if let Err(failure) = precondition::check(&self.paths, &replay.expect) {
             return OpOutcome::Failed(failure);
+        }
+        if let Some(restore) = &replay.stash {
+            return self.restore_stash(restore);
         }
         let zero = "0".repeat(replay.tree.as_hex().len());
         let transaction = |restore: bool| {
@@ -222,11 +241,42 @@ impl UndoRunner {
         result.map(|_| ())
     }
 
+    /// Undo of a stash drop: put the stash back on top of the list, if the
+    /// list is still as the drop left it. Index and refs are not touched
+    /// (`git stash store` writes only `refs/stash` and its reflog).
+    fn restore_stash(&self, restore: &StashRestore) -> OpOutcome {
+        let fail = |class, details: String| failed(class, details);
+        let repo = match precondition::open(&self.paths) {
+            Ok(repo) => repo,
+            Err(details) => return fail(ErrorClass::Bug, details),
+        };
+        match crate::read::read_stashes(&repo) {
+            Ok(stashes) if invoke_core::stash::top(&stashes) == restore.expect_top.as_ref() => {}
+            Ok(_) => {
+                return fail(
+                    ErrorClass::PreconditionChanged,
+                    "the stash list changed since the drop".into(),
+                );
+            }
+            Err(details) => return fail(ErrorClass::Bug, details),
+        }
+        let message = format!("--message={}", restore.entry.message);
+        match self.run(
+            &["stash", "store", &message, restore.entry.id.as_hex()],
+            &[],
+            None,
+        ) {
+            Ok(_) => OpOutcome::Succeeded,
+            Err(details) => fail(ErrorClass::Bug, details),
+        }
+    }
+
     /// Deletes the saved trees of points that left the stack. Best effort:
     /// a ref that is already gone is fine.
     pub fn prune(&self, ops: &[OpId]) {
         for op in ops {
             let _ = self.run(&["update-ref", "-d", &undo_ref(*op)], &[], None);
+            let _ = self.run(&["update-ref", "-d", &stash_keep_ref(*op)], &[], None);
         }
     }
 

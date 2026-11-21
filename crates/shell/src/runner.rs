@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use invoke_core::{ErrorClass, Event, Expect, Failure, GitArgs, OpId, OpOutcome, Progress};
 
-use crate::classify::classify;
+use crate::classify::{classify, classify_stash_save};
 use crate::git::{Git, invocation};
 use crate::precondition::{self, RepoPaths};
 use crate::progress::{self, Lines};
@@ -151,6 +151,12 @@ impl Job {
         if let Err(failure) = precondition::check_refs(&self.paths, &self.args.expected_refs()) {
             return OpOutcome::Failed(failure);
         }
+        // Task 20: a stash is addressed by id; refuse if it moved (rule 5).
+        if let Some((index, id)) = self.args.stash_target()
+            && let Err(failure) = precondition::check_stash(&self.paths, index, id)
+        {
+            return OpOutcome::Failed(failure);
+        }
         let run = invocation(&self.args);
         let mut command = self.git.command(&self.paths.workdir);
         command
@@ -164,7 +170,10 @@ impl Job {
             Ok(done) if done.killed && !done.success => OpOutcome::Cancelled,
             // A cancel that lost the race to a finished git reports what
             // really happened.
-            Ok(done) => classify(done.success, &done.output),
+            Ok(done) => match self.args {
+                GitArgs::StashSave { .. } => classify_stash_save(done.success, &done.output),
+                _ => classify(done.success, &done.output),
+            },
             Err(error) => failed(ErrorClass::Environment, format!("start git: {error}")),
         }
     }

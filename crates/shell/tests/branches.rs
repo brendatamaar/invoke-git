@@ -1010,6 +1010,7 @@ fn replay_with_a_head_move_checks_refs_before_moving_head() {
             "feature".into(),
         ))),
         expect: precondition::current(&repo.paths).unwrap(),
+        stash: None,
     };
     let Event::OpFinished(_, OpOutcome::Failed(failure)) = driver.undo.replay(&replay) else {
         panic!("replay should fail");
@@ -1037,6 +1038,7 @@ fn a_failed_replay_puts_head_back() {
         index_effect: invoke_core::IndexEffect::Untouched,
         head: Some(invoke_core::HeadRestore::Branch(BranchName("old".into()))),
         expect: precondition::current(&repo.paths).unwrap(),
+        stash: None,
     };
     let Event::OpFinished(_, OpOutcome::Failed(failure)) = driver.undo.replay(&replay) else {
         panic!("replay should fail");
