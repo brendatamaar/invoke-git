@@ -1,0 +1,9 @@
+[package]
+name = "diff"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description = "Pure diff engine: Myers, histogram, hunks, word-level diff. No IO."
+
+[dev-dependencies]
+proptest.workspace = true

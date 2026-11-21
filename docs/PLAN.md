@@ -108,7 +108,7 @@ Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are 
 | 5 | Repo discovery and repo-state detection from `.git` | Core | 3 | Done |
 | 6 | File watcher with debounce, emitting refresh events | Shell | 4 | Not started |
 | 7 | App window, open and init repo, repo tabs | UI | 2, 5 | Not started |
-| 8 | Diff engine: Myers + histogram, hunks, word-level diff | Diff | 1 | Not started |
+| 8 | Diff engine: Myers + histogram, hunks, word-level diff | Diff | 1 | Done |
 | 9 | Syntax highlighting layer on tree-sitter | Diff | 8 | Not started |
 | 10 | Diff viewer: split and unified, virtualized | UI | 2, 8, 9 | Not started |
 | 11 | Status tree with file, hunk and line staging | Core + UI | 5, 10 | Not started |
