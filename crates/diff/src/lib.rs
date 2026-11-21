@@ -10,6 +10,7 @@ mod hunks;
 mod lines;
 mod model;
 mod myers;
+mod patch;
 mod slide;
 mod word;
 
@@ -20,6 +21,7 @@ pub use model::{
     Algorithm, Change, DiffLine, DiffNote, DiffOptions, Eol, Hunk, InlineSpans, LineKind, Stats,
     TextDiff, TextRange, Whitespace,
 };
+pub use patch::{Direction, Mode, PatchError, PatchSpec, Pick, build_patch};
 pub use word::word_diff;
 
 use hunks::{Buffers, build_hunks, changes_from_flags};

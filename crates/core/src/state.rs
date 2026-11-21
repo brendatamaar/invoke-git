@@ -106,10 +106,56 @@ pub struct Conflicts {
     pub paths: Vec<RepoPath>,
 }
 
-/// Index and worktree changes. Task 11 extends this into the status tree.
+/// Index and worktree changes, one entry per path.
+///
+/// `entries` is sorted by path (byte order), so the files under one
+/// directory are always a contiguous run and a tree view can be built in a
+/// single pass. Build one with [`StatusSnapshot::from_entries`]; the shell
+/// reads it fresh with every `StateRead` (law 11).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatusSnapshot {
     pub entries: Vec<StatusEntry>,
+}
+
+impl StatusSnapshot {
+    /// Sorts by path and merges entries of one path (staged and unstaged
+    /// halves arrive separately from git). Entries without any change are
+    /// dropped.
+    pub fn from_entries(entries: impl IntoIterator<Item = StatusEntry>) -> Self {
+        let mut merged: BTreeMap<RepoPath, (Option<FileChange>, Option<FileChange>)> =
+            BTreeMap::new();
+        for entry in entries {
+            let slot = merged.entry(entry.path).or_default();
+            slot.0 = slot.0.take().or(entry.staged);
+            slot.1 = slot.1.take().or(entry.unstaged);
+        }
+        Self {
+            entries: merged
+                .into_iter()
+                .filter(|(_, (staged, unstaged))| staged.is_some() || unstaged.is_some())
+                .map(|(path, (staged, unstaged))| StatusEntry {
+                    path,
+                    staged,
+                    unstaged,
+                })
+                .collect(),
+        }
+    }
+
+    /// Paths with a change in the index, in tree order.
+    pub fn staged(&self) -> impl Iterator<Item = (&RepoPath, &FileChange)> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.staged.as_ref().map(|c| (&e.path, c)))
+    }
+
+    /// Paths with a change in the worktree (untracked files included), in
+    /// tree order.
+    pub fn unstaged(&self) -> impl Iterator<Item = (&RepoPath, &FileChange)> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.unstaged.as_ref().map(|c| (&e.path, c)))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,6 +252,11 @@ pub enum Refusal {
         task: u8,
     },
     NothingToUndo,
+    /// Task 11: the diff the patch was built from is older than the index
+    /// on disk. Refresh the diff and select again.
+    StaleDiff,
+    /// Task 11: the selection produced no change to apply.
+    NothingSelected,
     /// The newest operation cannot be undone (for example a push).
     NotUndoable(Irreversible),
     /// Something else moved what the operation left; undo never overwrites

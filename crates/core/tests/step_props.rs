@@ -76,7 +76,7 @@ fn disk() -> impl Strategy<Value = DiskState> {
     });
     let refs = btree_map("refs/heads/[a-c]".prop_map(RefName), oid(), 0..3)
         .prop_map(|refs| RefsSnapshot { refs });
-    let index = prop_oneof![Just(IndexId::Absent), oid().prop_map(IndexId::Checksum)];
+    let index = prop_oneof![3 => Just(IndexId::Absent), 1 => oid().prop_map(IndexId::Checksum)];
     // Weighted towards Free so writes get dispatched often.
     let lock = prop_oneof![
         3 => Just(LockState::Free),
@@ -127,6 +127,22 @@ fn selection() -> impl Strategy<Value = Selection> {
     ]
 }
 
+/// Task 11: a stage request. The patch is opaque text to the core (an
+/// empty one is refused); `based_on` is usually `Absent`, which is also
+/// the usual index of `disk()`, so about half the requests match.
+fn stage_request() -> impl Strategy<Value = StageRequest> {
+    (
+        selection(),
+        prop_oneof![Just(String::new()), "[ -~]{1,12}"],
+        prop_oneof![3 => Just(IndexId::Absent), 1 => oid().prop_map(IndexId::Checksum)],
+    )
+        .prop_map(|(selection, patch, based_on)| StageRequest {
+            selection,
+            patch: Patch(patch),
+            based_on,
+        })
+}
+
 fn op_id() -> impl Strategy<Value = OpId> {
     (0..6u64).prop_map(OpId)
 }
@@ -160,8 +176,8 @@ fn event() -> impl Strategy<Value = Event> {
         0..3,
     );
     prop_oneof![
-        1 => selection().prop_map(Event::StageRequested),
-        1 => selection().prop_map(Event::UnstageRequested),
+        1 => stage_request().prop_map(Event::StageRequested),
+        1 => stage_request().prop_map(Event::UnstageRequested),
         3 => ("[a-z ]{0,8}", any::<bool>())
             .prop_map(|(message, amend)| Event::CommitRequested { message, amend }),
         1 => any::<bool>().prop_map(|force_with_lease| Event::PushRequested { force_with_lease }),
@@ -354,7 +370,9 @@ proptest! {
                     == Some(before.ops.next)
                     || after.ops.running.as_ref().map(|running| running.id)
                         == Some(before.ops.next));
-            prop_assert!(refused != accepted, "{event:?}: refused={refused} accepted={accepted}");
+            // An accepted request may leave an older refusal of the same
+            // action in `notice`, so only "neither" is a failure.
+            prop_assert!(refused || accepted, "{event:?}: refused={refused} accepted={accepted}");
             Ok(())
         })?;
     }

@@ -9,10 +9,11 @@ use std::path::Path;
 use invoke_core::detect::{Markers, RebaseFiles, detect_phase};
 use invoke_core::{
     Command, Conflicts, DiskState, ErrorClass, Event, Failure, LockState, ReadId, RefName,
-    RefsSnapshot, RepoPath, StatusSnapshot,
+    RefsSnapshot, RepoPath,
 };
 
 use crate::precondition::{self, RepoPaths};
+use crate::status::read_status;
 
 /// Runs a `ReadState` command and returns the event that answers it. Other
 /// commands are not reads and give `None`. The scope is ignored: every read
@@ -33,7 +34,7 @@ pub fn read_event(paths: &RepoPaths, read: ReadId) -> Event {
 }
 
 /// Reads head, phase (with conflicts), index id, refs and lock from disk.
-/// `status` is left empty until task 11.
+/// `status` is the sorted status list (task 11).
 pub fn read_state(paths: &RepoPaths) -> Result<DiskState, Failure> {
     let fail = |details: String| Failure {
         class: ErrorClass::Bug,
@@ -47,6 +48,9 @@ pub fn read_state(paths: &RepoPaths) -> Result<DiskState, Failure> {
     let conflicts = read_conflicts(&repo, &index_path).map_err(fail)?;
     let phase = detect_phase(&read_markers(&paths.git_dir), conflicts);
     let refs = read_refs(&repo).map_err(fail)?;
+    let status = precondition::open_with_worktree(paths)
+        .and_then(|worktree| read_status(&worktree))
+        .map_err(fail)?;
     let lock = if paths.git_dir.join("index.lock").exists() {
         LockState::HeldByOther
     } else {
@@ -56,7 +60,7 @@ pub fn read_state(paths: &RepoPaths) -> Result<DiskState, Failure> {
         head,
         phase,
         index,
-        status: StatusSnapshot::default(),
+        status,
         refs,
         lock,
     })
