@@ -85,21 +85,18 @@ fn signal_group(group: u32, signal: &str) {
 
 #[cfg(windows)]
 mod windows {
-    use std::mem::{size_of, zeroed};
     use std::os::windows::io::AsRawHandle;
     use std::process::Child;
     use std::ptr::null;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
     };
 
-    /// A job holding one git child and its descendants. It is not
-    /// kill-on-close: a daemon git starts on purpose (fsmonitor) survives a
-    /// normal exit, and only a cancel terminates the job.
+    /// A job holding one git child and all its descendants. It is not
+    /// kill-on-close, so processes still running after a normal exit are
+    /// left alone; only a cancel terminates the job.
     pub struct Job(HANDLE);
 
     // SAFETY: a job handle may be used from any thread.
@@ -120,16 +117,11 @@ mod windows {
                     return None;
                 }
                 let job = Job(handle);
-                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-                // Children that ask to leave the job may; refusing would make
-                // their CreateProcess fail.
-                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
-                SetInformationJobObject(
-                    job.0,
-                    JobObjectExtendedLimitInformation,
-                    (&raw const limits).cast(),
-                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                );
+                // Default limits: no breakaway. With breakaway allowed, the
+                // MSYS runtime behind Git for Windows' `sh` starts its
+                // children outside the job, so a cancel missed a hook's
+                // `sleep`. The price: a child that insists on leaving the
+                // job (a daemon) fails to start, and git runs without it.
                 if AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) == 0 {
                     return None;
                 }
