@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 
 use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName};
 use crate::ops::{
-    AuthAnswer, AuthPrompt, BranchStart, Failure, GitArgs, OpOutcome, Patch, Progress, StageRequest,
+    AuthAnswer, AuthPrompt, BranchStart, Failure, GitArgs, OpOutcome, Patch, Progress, PullMode,
+    RemoteBranch, StageRequest,
 };
 use crate::state::{DiskState, Head};
 use crate::undo::{Reversal, UndoReplay};
@@ -18,8 +19,24 @@ pub enum Event {
         message: String,
         amend: bool,
     },
+    /// Push the checked-out branch to `to`. With `force_with_lease` the
+    /// lease is the remote-tracking value in the snapshot at this moment,
+    /// the one the user reviewed; no known value, no force (law 10).
     PushRequested {
+        to: RemoteBranch,
         force_with_lease: bool,
+        set_upstream: bool,
+    },
+    // Task 17.
+    FetchRequested {
+        remote: String,
+    },
+    PullRequested {
+        from: RemoteBranch,
+        mode: PullMode,
+    },
+    SetUpstreamRequested {
+        upstream: RemoteBranch,
     },
     OpCancelRequested(OpId),
     AuthAnswered(OpId, AuthAnswer),

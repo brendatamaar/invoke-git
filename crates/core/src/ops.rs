@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::event::RefValue;
-use crate::ids::{BranchName, IndexId, Oid, RepoPath};
+use crate::ids::{BranchName, IndexId, Oid, RefName, RepoPath};
 
 /// A write the user asked for, waiting in or running from the op queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,12 +50,42 @@ pub enum WriteRequest {
     StashDrop {
         stash: Oid,
     },
+    // Task 17: network and branch-config writes.
+    /// Moves remote-tracking refs only (law 9); never a local branch.
+    Fetch {
+        remote: String,
+    },
+    /// Fetch, then merge or rebase the current branch onto `from`.
+    Pull {
+        /// The branch checked out when the user asked.
+        local: BranchName,
+        from: RemoteBranch,
+        mode: PullMode,
+    },
+    Push {
+        /// The branch checked out when the user asked; it is what is pushed.
+        local: BranchName,
+        to: RemoteBranch,
+        /// `Some` makes it a force push, leased against the remote value the
+        /// user reviewed (law 10). There is no force push without one.
+        lease: Option<Lease>,
+        set_upstream: bool,
+    },
+    SetUpstream {
+        local: BranchName,
+        upstream: RemoteBranch,
+    },
 }
 
 impl WriteRequest {
-    /// Writes that take an undo point before they run.
+    /// Writes that take an undo point before they run. Fetch moves only
+    /// remote-tracking refs and set-upstream only config: nothing an undo
+    /// could restore (task 17).
     pub fn takes_undo_point(&self) -> bool {
-        !matches!(self, WriteRequest::Undo)
+        !matches!(
+            self,
+            WriteRequest::Undo | WriteRequest::Fetch { .. } | WriteRequest::SetUpstream { .. }
+        )
     }
 }
 
@@ -66,6 +96,41 @@ pub enum BranchStart {
     /// left by creating a branch.
     Head,
     Commit(Oid),
+}
+
+/// A branch on a remote, such as `origin` and `main`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteBranch {
+    pub remote: String,
+    pub branch: BranchName,
+}
+
+impl RemoteBranch {
+    /// Our last-known copy: `refs/remotes/<remote>/<branch>`.
+    pub fn tracking_ref(&self) -> RefName {
+        RefName(format!("refs/remotes/{}/{}", self.remote, self.branch.0))
+    }
+
+    /// The branch as the remote names it: `refs/heads/<branch>`.
+    pub fn remote_ref(&self) -> RefName {
+        self.branch.to_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullMode {
+    Merge,
+    Rebase,
+}
+
+/// `--force-with-lease=<ref>:<expected>`: the push is refused by the remote
+/// unless `remote_ref` still holds `expected`. Both parts are mandatory, so
+/// a bare `--force-with-lease` (which trusts whatever was fetched last) and
+/// a plain `--force` cannot be expressed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lease {
+    pub remote_ref: RefName,
+    pub expected: Oid,
 }
 
 /// Typed git invocation. The shell turns it into argv (task 4); keeping it
@@ -119,6 +184,24 @@ pub enum GitArgs {
         index: usize,
         stash: Oid,
     },
+    // Task 17.
+    Fetch {
+        remote: String,
+    },
+    Pull {
+        from: RemoteBranch,
+        mode: PullMode,
+    },
+    Push {
+        local: BranchName,
+        to: RemoteBranch,
+        lease: Option<Lease>,
+        set_upstream: bool,
+    },
+    SetUpstream {
+        local: BranchName,
+        upstream: RemoteBranch,
+    },
 }
 
 impl GitArgs {
@@ -144,7 +227,12 @@ impl GitArgs {
             | GitArgs::StashSave { .. }
             | GitArgs::StashApply { .. }
             | GitArgs::StashPop { .. }
-            | GitArgs::StashDrop { .. } => Vec::new(),
+            | GitArgs::StashDrop { .. }
+            // Task 17: the lease and `HEAD` are what these expect.
+            | GitArgs::Fetch { .. }
+            | GitArgs::Pull { .. }
+            | GitArgs::Push { .. }
+            | GitArgs::SetUpstream { .. } => Vec::new(),
             GitArgs::CreateBranch { name, .. } => vec![at(name, None)],
             GitArgs::SwitchBranch { name, tip } | GitArgs::DeleteBranch { name, tip, .. } => {
                 vec![at(name, Some(tip))]
@@ -153,6 +241,14 @@ impl GitArgs {
                 vec![at(from, Some(tip)), at(to, None)]
             }
         }
+    }
+
+    /// Talks to a remote, so it may ask for credentials and shows progress.
+    pub fn is_network(&self) -> bool {
+        matches!(
+            self,
+            GitArgs::Fetch { .. } | GitArgs::Pull { .. } | GitArgs::Push { .. }
+        )
     }
 }
 

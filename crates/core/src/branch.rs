@@ -27,7 +27,11 @@ pub fn action_of(request: &WriteRequest) -> Option<Action> {
         | WriteRequest::StashSave { .. }
         | WriteRequest::StashApply { .. }
         | WriteRequest::StashPop { .. }
-        | WriteRequest::StashDrop { .. } => None,
+        | WriteRequest::StashDrop { .. }
+        | WriteRequest::Fetch { .. }
+        | WriteRequest::Pull { .. }
+        | WriteRequest::Push { .. }
+        | WriteRequest::SetUpstream { .. } => None,
     }
 }
 
@@ -190,7 +194,11 @@ fn check(
         | WriteRequest::StashSave { .. }
         | WriteRequest::StashApply { .. }
         | WriteRequest::StashPop { .. }
-        | WriteRequest::StashDrop { .. } => Err(Refusal::NotYetSupported { task: 15 }),
+        | WriteRequest::StashDrop { .. }
+        | WriteRequest::Fetch { .. }
+        | WriteRequest::Pull { .. }
+        | WriteRequest::Push { .. }
+        | WriteRequest::SetUpstream { .. } => Err(Refusal::NotYetSupported { task: 15 }),
     }
 }
 

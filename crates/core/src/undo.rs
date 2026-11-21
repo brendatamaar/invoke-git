@@ -63,6 +63,8 @@ pub enum Irreversible {
     /// old position would need the reflog rewritten; it can only go on top,
     /// which is not an exact restore (law 8).
     StashNotOnTop,
+    /// A pull rewrote working-tree files, which an undo never does (task 17).
+    Pull,
 }
 
 /// How an operation is reversed (task 20; recorded in its [`UndoPoint`]).
