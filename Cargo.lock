@@ -5073,6 +5073,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell"
+version = "0.0.0"
+dependencies = [
+ "gix",
+ "invoke-core",
+ "proptest",
+ "windows-sys",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

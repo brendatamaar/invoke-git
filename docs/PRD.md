@@ -337,6 +337,7 @@ Build everything that is the product; use libraries only for plumbing that would
 | File watching | Library | `notify` |
 | Keychain | Library | `keyring` |
 | Async runtime | Library | GPUI executors, `smol` where needed |
+| Process-tree cancel on Windows (job objects) | Library | `windows-sys` (Win32 bindings, Windows only) |
 | Testing | Library | `proptest`, `proptest-state-machine`, `criterion`, Kani, Quint |
 
 ## Risks and mitigations

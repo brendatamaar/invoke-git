@@ -104,7 +104,7 @@ Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are 
 | 1 | Cargo workspace, CI (Windows build; core tests on Linux and macOS), license, README | Foundation | — | Done |
 | 2 | Design tokens crate and component layer skeleton over GPUI | UI | 1 | Not started |
 | 3 | Core types: `State`, `Event`, `Command`, `step()` skeleton | Core | 1 | Done |
-| 4 | Shell: command runner, git CLI wrapper with progress and cancel | Shell | 3 | Not started |
+| 4 | Shell: command runner, git CLI wrapper with progress and cancel | Shell | 3 | Done |
 | 5 | Repo discovery and repo-state detection from `.git` | Core | 3 | Not started |
 | 6 | File watcher with debounce, emitting refresh events | Shell | 4 | Not started |
 | 7 | App window, open and init repo, repo tabs | UI | 2, 5 | Not started |
