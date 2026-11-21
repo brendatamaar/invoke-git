@@ -3,7 +3,9 @@
 //! outcome into an event. It holds no business logic; the parsing here is
 //! the boundary between git's text and the core's types.
 
+pub mod askpass;
 pub mod classify;
+pub mod clone;
 pub mod discover;
 pub mod git;
 pub mod precondition;
@@ -12,6 +14,7 @@ pub mod read;
 pub mod runner;
 mod tree;
 
+pub use clone::CloneRunner;
 pub use discover::{DiscoverError, Discovered, discover};
 pub use git::{Git, GitVersion, SetupError};
 pub use precondition::RepoPaths;

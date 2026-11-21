@@ -5,14 +5,14 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use invoke_core::{ErrorClass, Event, Expect, Failure, GitArgs, OpId, OpOutcome};
+use invoke_core::{ErrorClass, Event, Expect, Failure, GitArgs, OpId, OpOutcome, Progress};
 
 use crate::classify::classify;
 use crate::git::{Git, invocation};
@@ -37,9 +37,32 @@ pub struct GitRunner {
     ops: Arc<Mutex<HashMap<OpId, Arc<Control>>>>,
 }
 
+/// Cancel flag shared between the caller and the thread running git.
 #[derive(Default)]
-struct Control {
+pub(crate) struct Control {
     cancelled: AtomicBool,
+}
+
+impl Control {
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// Called for each parsed progress line of stderr.
+pub(crate) type ProgressSink = Box<dyn Fn(Progress) + Send>;
+
+/// How a spawned git ended.
+pub(crate) struct Finished {
+    pub success: bool,
+    /// A cancel was sent (it may have lost the race to a normal exit).
+    pub killed: bool,
+    /// stdout then stderr, the last 64 KiB of each.
+    pub output: String,
 }
 
 impl GitRunner {
@@ -95,7 +118,7 @@ impl GitRunner {
     /// already treats a late cancel as a no-op.
     pub fn cancel(&self, op: OpId) {
         if let Some(control) = lock(&self.ops).get(&op) {
-            control.cancelled.store(true, Ordering::SeqCst);
+            control.cancel();
         }
     }
 }
@@ -113,7 +136,7 @@ struct Job {
 
 impl Job {
     fn cancelled(&self) -> bool {
-        self.control.cancelled.load(Ordering::SeqCst)
+        self.control.is_cancelled()
     }
 
     fn execute(self) -> OpOutcome {
@@ -127,66 +150,83 @@ impl Job {
         let mut command = self.git.command(&self.paths.workdir);
         command
             .args(&run.args)
-            .envs(self.env.iter().map(|(key, value)| (key, value)))
-            .stdin(if run.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        tree::prepare(&mut command);
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => return failed(ErrorClass::Environment, format!("start git: {error}")),
-        };
-        let tree = ProcessTree::attach(&child);
-
-        if let (Some(mut stdin), Some(bytes)) = (child.stdin.take(), run.stdin) {
-            // A thread, so a git that writes a lot before reading cannot
-            // deadlock against us.
-            thread::spawn(move || {
-                let _ = stdin.write_all(&bytes);
-            });
-        }
-        let stdout = drain(child.stdout.take(), None);
-        let stderr = drain(child.stderr.take(), Some((self.op, self.events.clone())));
-
-        let (success, killed) = self.wait(&mut child, &tree);
-        let mut output = collect(stdout);
-        output.push_str(&collect(stderr));
-        if killed && !success {
-            OpOutcome::Cancelled
-        } else {
+            .envs(self.env.iter().map(|(key, value)| (key, value)));
+        let (op, events) = (self.op, self.events.clone());
+        let sink: ProgressSink = Box::new(move |update| {
+            let _ = events.send(Event::OpProgress(op, update));
+        });
+        match run_child(command, run.stdin, Some(sink), &self.control) {
+            Ok(done) if done.killed && !done.success => OpOutcome::Cancelled,
             // A cancel that lost the race to a finished git reports what
             // really happened.
-            classify(success, &output)
+            Ok(done) => classify(done.success, &done.output),
+            Err(error) => failed(ErrorClass::Environment, format!("start git: {error}")),
         }
     }
+}
 
-    /// Waits for git, terminating the tree on cancel and killing it if it
-    /// outlives the grace period. Returns (exit success, cancel was sent).
-    fn wait(&self, child: &mut Child, tree: &ProcessTree) -> (bool, bool) {
-        let mut terminated_at: Option<Instant> = None;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return (status.success(), terminated_at.is_some()),
-                Ok(None) => {}
-                Err(_) => {
-                    tree.kill(child);
-                    return (false, terminated_at.is_some());
-                }
+/// Runs a prepared git command to its end: pipes, process tree, progress
+/// parsing, cancel. Shared by `RunGit` ops and clones.
+pub(crate) fn run_child(
+    mut command: Command,
+    stdin: Option<Vec<u8>>,
+    progress: Option<ProgressSink>,
+    control: &Control,
+) -> std::io::Result<Finished> {
+    command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    tree::prepare(&mut command);
+    let mut child = command.spawn()?;
+    let tree = ProcessTree::attach(&child);
+
+    if let (Some(mut pipe), Some(bytes)) = (child.stdin.take(), stdin) {
+        // A thread, so a git that writes a lot before reading cannot
+        // deadlock against us.
+        thread::spawn(move || {
+            let _ = pipe.write_all(&bytes);
+        });
+    }
+    let stdout = drain(child.stdout.take(), None);
+    let stderr = drain(child.stderr.take(), progress);
+
+    let (success, killed) = wait(control, &mut child, &tree);
+    let mut output = collect(stdout);
+    output.push_str(&collect(stderr));
+    Ok(Finished {
+        success,
+        killed,
+        output,
+    })
+}
+
+/// Waits for git, terminating the tree on cancel and killing it if it
+/// outlives the grace period. Returns (exit success, cancel was sent).
+fn wait(control: &Control, child: &mut Child, tree: &ProcessTree) -> (bool, bool) {
+    let mut terminated_at: Option<Instant> = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return (status.success(), terminated_at.is_some()),
+            Ok(None) => {}
+            Err(_) => {
+                tree.kill(child);
+                return (false, terminated_at.is_some());
             }
-            match terminated_at {
-                None if self.cancelled() => {
-                    tree.terminate(child);
-                    terminated_at = Some(Instant::now());
-                }
-                Some(at) if at.elapsed() >= GRACE => tree.kill(child),
-                _ => {}
-            }
-            thread::sleep(POLL);
         }
+        match terminated_at {
+            None if control.is_cancelled() => {
+                tree.terminate(child);
+                terminated_at = Some(Instant::now());
+            }
+            Some(at) if at.elapsed() >= GRACE => tree.kill(child),
+            _ => {}
+        }
+        thread::sleep(POLL);
     }
 }
 
@@ -194,10 +234,7 @@ type Drained = mpsc::Receiver<Vec<u8>>;
 
 /// Reads a stream to its end on its own thread, keeping the tail. With an
 /// op and sink, also turns progress lines into `OpProgress` events.
-fn drain(
-    stream: Option<impl Read + Send + 'static>,
-    progress: Option<(OpId, Sender<Event>)>,
-) -> Drained {
+fn drain(stream: Option<impl Read + Send + 'static>, progress: Option<ProgressSink>) -> Drained {
     let (done, result) = mpsc::channel();
     if let Some(mut stream) = stream {
         thread::spawn(move || {
@@ -214,10 +251,10 @@ fn drain(
                 if kept.len() > 2 * KEEP {
                     kept.drain(..kept.len() - KEEP);
                 }
-                if let Some((op, events)) = &progress {
+                if let Some(sink) = &progress {
                     for line in lines.push(chunk) {
                         if let Some(update) = progress::parse(&line) {
-                            let _ = events.send(Event::OpProgress(*op, update));
+                            sink(update);
                         }
                     }
                 }
@@ -236,10 +273,10 @@ fn collect(drained: Drained) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn failed(class: ErrorClass, details: String) -> OpOutcome {
+pub(crate) fn failed(class: ErrorClass, details: String) -> OpOutcome {
     OpOutcome::Failed(Failure { class, details })
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

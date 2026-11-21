@@ -195,6 +195,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "askpass"
+version = "0.0.0"
+dependencies = [
+ "invoke-core",
+ "proptest",
+ "shell",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5141,6 +5150,7 @@ dependencies = [
 name = "shell"
 version = "0.0.0"
 dependencies = [
+ "askpass",
  "gix",
  "invoke-core",
  "proptest",
