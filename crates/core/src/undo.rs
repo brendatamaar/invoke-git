@@ -50,6 +50,8 @@ pub enum Reversible {
 pub enum Irreversible {
     /// It changed the remote.
     Push,
+    /// It rewrote working-tree files, which an undo never does (task 17).
+    Pull,
 }
 
 /// Where the point of the operation in flight is in its life.
@@ -63,7 +65,13 @@ pub enum UndoPending {
     Taken { point: UndoPoint, tree: Oid },
     /// The operation succeeded; the point waits for a fresh read to learn
     /// what the operation left behind.
-    Settling { point: UndoPoint, tree: Oid },
+    Settling {
+        point: UndoPoint,
+        tree: Oid,
+        /// `No(..)` for a push or pull: the point only marks where an undo
+        /// must stop (task 17).
+        reversible: Reversible,
+    },
     /// An undo is running with this entry taken off the stack.
     Replaying { entry: UndoEntry },
     /// An undo succeeded; the next fresh read re-bases the new top entry's

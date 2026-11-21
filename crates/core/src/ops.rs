@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::ids::RepoPath;
+use crate::ids::{BranchName, Oid, RefName, RepoPath};
 
 /// A write the user asked for, waiting in or running from the op queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,13 +13,104 @@ pub enum WriteRequest {
     },
     /// Reverse the newest undo point.
     Undo,
+    // Task 17: network and branch-config writes.
+    /// Moves remote-tracking refs only (law 9); never a local branch.
+    Fetch {
+        remote: String,
+    },
+    /// Fetch, then merge or rebase the current branch onto `from`.
+    Pull {
+        /// The branch checked out when the user asked.
+        local: BranchName,
+        from: RemoteBranch,
+        mode: PullMode,
+    },
+    Push {
+        /// The branch checked out when the user asked; it is what is pushed.
+        local: BranchName,
+        to: RemoteBranch,
+        /// `Some` makes it a force push, leased against the remote value the
+        /// user reviewed (law 10). There is no force push without one.
+        lease: Option<Lease>,
+        set_upstream: bool,
+    },
+    SetUpstream {
+        local: BranchName,
+        upstream: RemoteBranch,
+    },
+}
+
+/// A branch on a remote, such as `origin` and `main`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteBranch {
+    pub remote: String,
+    pub branch: BranchName,
+}
+
+impl RemoteBranch {
+    /// Our last-known copy: `refs/remotes/<remote>/<branch>`.
+    pub fn tracking_ref(&self) -> RefName {
+        RefName(format!("refs/remotes/{}/{}", self.remote, self.branch.0))
+    }
+
+    /// The branch as the remote names it: `refs/heads/<branch>`.
+    pub fn remote_ref(&self) -> RefName {
+        self.branch.to_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullMode {
+    Merge,
+    Rebase,
+}
+
+/// `--force-with-lease=<ref>:<expected>`: the push is refused by the remote
+/// unless `remote_ref` still holds `expected`. Both parts are mandatory, so
+/// a bare `--force-with-lease` (which trusts whatever was fetched last) and
+/// a plain `--force` cannot be expressed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lease {
+    pub remote_ref: RefName,
+    pub expected: Oid,
 }
 
 /// Typed git invocation. The shell turns it into argv (task 4); keeping it
 /// typed here lets tests check what the core asked for without parsing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitArgs {
-    Commit { message: String, amend: bool },
+    Commit {
+        message: String,
+        amend: bool,
+    },
+    // Task 17.
+    Fetch {
+        remote: String,
+    },
+    Pull {
+        from: RemoteBranch,
+        mode: PullMode,
+    },
+    Push {
+        local: BranchName,
+        to: RemoteBranch,
+        lease: Option<Lease>,
+        set_upstream: bool,
+    },
+    SetUpstream {
+        local: BranchName,
+        upstream: RemoteBranch,
+    },
+}
+
+impl GitArgs {
+    /// Talks to a remote, so it may ask for credentials and shows progress.
+    pub fn is_network(&self) -> bool {
+        matches!(
+            self,
+            GitArgs::Fetch { .. } | GitArgs::Pull { .. } | GitArgs::Push { .. }
+        )
+    }
 }
 
 /// Progress parsed from git's stderr, e.g. `Receiving objects: 45% (9/20)`.

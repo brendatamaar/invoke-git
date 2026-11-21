@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -12,8 +13,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use invoke_core::{ErrorClass, Event, Expect, Failure, GitArgs, OpId, OpOutcome, Progress};
+use invoke_core::{
+    AuthAnswer, ErrorClass, Event, Expect, Failure, GitArgs, OpId, OpOutcome, Progress,
+};
 
+use crate::askpass::AskpassServer;
 use crate::classify::classify;
 use crate::git::{Git, invocation};
 use crate::precondition::{self, RepoPaths};
@@ -34,6 +38,9 @@ pub struct GitRunner {
     git: Git,
     paths: RepoPaths,
     env: Vec<(OsString, OsString)>,
+    /// The `askpass` helper binary; set, network operations can prompt
+    /// (task 17, reusing task 16's server).
+    askpass_program: Option<PathBuf>,
     ops: Arc<Mutex<HashMap<OpId, Arc<Control>>>>,
 }
 
@@ -41,6 +48,8 @@ pub struct GitRunner {
 #[derive(Default)]
 pub(crate) struct Control {
     cancelled: AtomicBool,
+    /// The credential prompt server of a running network operation.
+    askpass: Mutex<Option<Arc<AskpassServer>>>,
 }
 
 impl Control {
@@ -71,6 +80,7 @@ impl GitRunner {
             git,
             paths,
             env: Vec::new(),
+            askpass_program: None,
             ops: Arc::default(),
         }
     }
@@ -79,6 +89,25 @@ impl GitRunner {
     pub fn with_env(mut self, env: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
         self.env.extend(env);
         self
+    }
+
+    /// Lets fetch, pull and push ask for credentials in the app: the helper
+    /// at `program` is registered as the askpass program, and each prompt
+    /// becomes `Event::AuthNeeded`.
+    pub fn with_askpass(mut self, program: impl Into<PathBuf>) -> Self {
+        self.askpass_program = Some(program.into());
+        self
+    }
+
+    /// Passes the user's answer to the helper waiting for it
+    /// (`Command::AnswerAuth`).
+    pub fn answer(&self, op: OpId, answer: AuthAnswer) {
+        let control = lock(&self.ops).get(&op).cloned();
+        if let Some(control) = control
+            && let Some(server) = lock(&control.askpass).as_ref()
+        {
+            server.answer(answer);
+        }
     }
 
     /// Starts one operation in the background. Events go to `events`; the
@@ -93,6 +122,7 @@ impl GitRunner {
             git: self.git.clone(),
             paths: self.paths.clone(),
             env: self.env.clone(),
+            askpass_program: self.askpass_program.clone(),
             control,
             events: events.clone(),
         };
@@ -130,6 +160,7 @@ struct Job {
     git: Git,
     paths: RepoPaths,
     env: Vec<(OsString, OsString)>,
+    askpass_program: Option<PathBuf>,
     control: Arc<Control>,
     events: Sender<Event>,
 }
@@ -155,13 +186,42 @@ impl Job {
         let sink: ProgressSink = Box::new(move |update| {
             let _ = events.send(Event::OpProgress(op, update));
         });
-        match run_child(command, run.stdin, Some(sink), &self.control) {
+        let mut server = None;
+        if let Some(program) = self
+            .askpass_program
+            .as_ref()
+            .filter(|_| self.args.is_network())
+        {
+            let events = self.events.clone();
+            match AskpassServer::start(
+                op,
+                Arc::new(move |prompt| {
+                    let _ = events.send(Event::AuthNeeded(op, prompt));
+                }),
+            ) {
+                Ok(started) => {
+                    let started = Arc::new(started);
+                    command.envs(started.env(program));
+                    *lock(&self.control.askpass) = Some(Arc::clone(&started));
+                    server = Some(started);
+                }
+                Err(error) => {
+                    return failed(ErrorClass::Environment, format!("start askpass: {error}"));
+                }
+            }
+        }
+        let outcome = match run_child(command, run.stdin, Some(sink), &self.control) {
             Ok(done) if done.killed && !done.success => OpOutcome::Cancelled,
             // A cancel that lost the race to a finished git reports what
             // really happened.
             Ok(done) => classify(done.success, &done.output),
             Err(error) => failed(ErrorClass::Environment, format!("start git: {error}")),
+        };
+        if let Some(server) = server {
+            server.shutdown();
+            lock(&self.control.askpass).take();
         }
+        outcome
     }
 }
 

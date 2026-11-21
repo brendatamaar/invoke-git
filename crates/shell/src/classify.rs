@@ -50,7 +50,14 @@ const MARKERS: [(ErrorClass, &[&str]); 4] = [
             "nothing added to commit",
             "Aborting commit due to empty commit message",
             "[rejected]",
+            "[remote rejected]",
             "non-fast-forward",
+            // Task 17: pull and push.
+            "stale info",
+            "couldn't find remote ref",
+            "cannot pull with rebase",
+            "would be overwritten by merge",
+            "Not possible to fast-forward",
             "CONFLICT",
             "Automatic merge failed",
         ],
@@ -124,6 +131,16 @@ mod tests {
                 Expected,
             ),
             ("fatal: repository '/nope' does not exist", Expected),
+            (" ! [rejected]        main -> main (stale info)", Expected),
+            (
+                " ! [remote rejected] main -> main (protected branch hook declined)",
+                Expected,
+            ),
+            ("fatal: couldn't find remote ref nope", Expected),
+            (
+                "error: cannot pull with rebase: You have unstaged changes.",
+                Expected,
+            ),
             ("fatal: something nobody expected", Bug),
         ];
         for (output, expected) in cases {

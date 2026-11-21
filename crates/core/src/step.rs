@@ -3,13 +3,15 @@
 use std::mem;
 
 use crate::event::{ChangeSet, Command, Event, Expect, HeadTarget, ReadScope, RefValue, UndoPoint};
-use crate::ids::{OpId, ReadId, RefName, RepoId};
-use crate::ops::{GitArgs, OpOutcome, WriteRequest};
-use crate::state::{
-    Action, DiskState, Freshness, Head, LockState, Notice, OpPhase, QueuedOp, Refusal, RepoState,
-    RunningOp, Snapshot,
+use crate::ids::{BranchName, OpId, ReadId, RefName, RepoId};
+use crate::ops::{
+    ErrorClass, Failure, GitArgs, Lease, OpOutcome, PullMode, RemoteBranch, WriteRequest,
 };
-use crate::undo::{self, Reversible, UndoEntry, UndoPending};
+use crate::state::{
+    Action, DiskState, Freshness, Head, LockState, Notice, OpPhase, Phase, QueuedOp, Refusal,
+    RepoState, RunningOp, Snapshot,
+};
+use crate::undo::{self, Irreversible, Reversible, UndoEntry, UndoPending};
 
 /// Opens a repo: the initial state plus the first full read.
 pub fn open(id: RepoId) -> (RepoState, Vec<Command>) {
@@ -27,7 +29,15 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
     match event {
         Event::StageRequested(_) => refuse(&mut state, Action::Stage, 11),
         Event::UnstageRequested(_) => refuse(&mut state, Action::Unstage, 11),
-        Event::PushRequested { .. } => refuse(&mut state, Action::Push, 17),
+        // Task 17.
+        Event::PushRequested {
+            to,
+            force_with_lease,
+            set_upstream,
+        } => request_push(&mut state, to, force_with_lease, set_upstream),
+        Event::FetchRequested { remote } => enqueue(&mut state, WriteRequest::Fetch { remote }),
+        Event::PullRequested { from, mode } => request_pull(&mut state, from, mode),
+        Event::SetUpstreamRequested { upstream } => request_set_upstream(&mut state, upstream),
         Event::UndoRequested => match state.undo.top() {
             Ok(_) => enqueue(&mut state, WriteRequest::Undo),
             Err(reason) => refuse_because(&mut state, Action::Undo, reason),
@@ -92,7 +102,19 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
                     outcome == OpOutcome::Succeeded,
                     &mut commands,
                 );
-                state.notice = Some(Notice::OpEnded { op, outcome });
+                state.notice = Some(match (&running.request, outcome) {
+                    // A rejected push is a state change, not an error.
+                    (
+                        WriteRequest::Push { .. },
+                        OpOutcome::Failed(
+                            failure @ Failure {
+                                class: ErrorClass::Expected,
+                                ..
+                            },
+                        ),
+                    ) => Notice::PushRejected { op, failure },
+                    (_, outcome) => Notice::OpEnded { op, outcome },
+                });
                 // Law 13: whatever happened, the next write starts from disk.
                 request_read(&mut state, ReadScope::full(), &mut commands);
             }
@@ -114,6 +136,10 @@ fn enqueue(state: &mut RepoState, request: WriteRequest) {
     let id = state.ops.next;
     state.ops.next = OpId(id.0.saturating_add(1));
     state.ops.queued.push_back(QueuedOp { id, request });
+    // An earlier refusal is stale once a request is accepted.
+    if matches!(state.notice, Some(Notice::Refused { .. })) {
+        state.notice = None;
+    }
 }
 
 fn running_mut(state: &mut RepoState, op: OpId) -> Option<&mut RunningOp> {
@@ -176,7 +202,11 @@ fn settle_undo(state: &mut RepoState, commands: &mut Vec<Command>) {
         return;
     };
     match mem::take(&mut state.undo.pending) {
-        UndoPending::Settling { point, tree } => {
+        UndoPending::Settling {
+            point,
+            tree,
+            reversible,
+        } => {
             let after_refs = point
                 .refs
                 .iter()
@@ -185,13 +215,17 @@ fn settle_undo(state: &mut RepoState, commands: &mut Vec<Command>) {
                     oid: undo::current_value(&disk, &before.name),
                 })
                 .collect();
-            let pruned = state.undo.push(UndoEntry {
+            let entry = UndoEntry {
                 point,
                 tree,
                 after_refs,
                 after_index: disk.index,
-                reversible: Reversible::Yes,
-            });
+                reversible,
+            };
+            let pruned = match reversible {
+                Reversible::Yes => state.undo.push(entry),
+                Reversible::No(_) => state.undo.push_irreversible(entry),
+            };
             prune(pruned, commands);
         }
         UndoPending::Rewinding => {
@@ -220,7 +254,26 @@ fn finish_undo(
     let pending = mem::take(&mut state.undo.pending);
     state.undo.pending = match (pending, request, succeeded) {
         (UndoPending::Taken { point, tree }, WriteRequest::Commit { .. }, true) => {
-            UndoPending::Settling { point, tree }
+            UndoPending::Settling {
+                point,
+                tree,
+                reversible: Reversible::Yes,
+            }
+        }
+        // Task 17: a push or pull leaves a marker an undo stops at.
+        (UndoPending::Taken { point, tree }, WriteRequest::Push { .. }, true) => {
+            UndoPending::Settling {
+                point,
+                tree,
+                reversible: Reversible::No(Irreversible::Push),
+            }
+        }
+        (UndoPending::Taken { point, tree }, WriteRequest::Pull { .. }, true) => {
+            UndoPending::Settling {
+                point,
+                tree,
+                reversible: Reversible::No(Irreversible::Pull),
+            }
         }
         (UndoPending::Replaying { entry }, WriteRequest::Undo, true) => {
             prune(vec![entry.point.op], commands);
@@ -282,6 +335,57 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                 });
                 state.undo.pending = UndoPending::Recording { point };
             }
+            // Task 17. Fetch and set-upstream move nothing an undo restores.
+            WriteRequest::Fetch { remote } => commands.push(Command::RunGit {
+                op: id,
+                args: GitArgs::Fetch {
+                    remote: remote.clone(),
+                },
+                expect,
+            }),
+            WriteRequest::SetUpstream { local, upstream } => commands.push(Command::RunGit {
+                op: id,
+                args: GitArgs::SetUpstream {
+                    local: local.clone(),
+                    upstream: upstream.clone(),
+                },
+                expect,
+            }),
+            WriteRequest::Pull { local, from, mode } => {
+                if let Err(reason) = still_on(&disk, local) {
+                    refuse_because(state, Action::Pull, reason);
+                    continue;
+                }
+                if disk.phase != Phase::Clean {
+                    refuse_because(state, Action::Pull, Refusal::RepoBusy);
+                    continue;
+                }
+                let label = format!("Pull '{}' from {}/{}", local.0, from.remote, from.branch.0);
+                let args = GitArgs::Pull {
+                    from: from.clone(),
+                    mode: *mode,
+                };
+                run_with_point(state, commands, id, label, &disk, expect, args);
+            }
+            WriteRequest::Push {
+                local,
+                to,
+                lease,
+                set_upstream,
+            } => {
+                if let Err(reason) = still_on(&disk, local) {
+                    refuse_because(state, Action::Push, reason);
+                    continue;
+                }
+                let label = format!("Push '{}' to {}/{}", local.0, to.remote, to.branch.0);
+                let args = GitArgs::Push {
+                    local: local.clone(),
+                    to: to.clone(),
+                    lease: lease.clone(),
+                    set_upstream: *set_upstream,
+                };
+                run_with_point(state, commands, id, label, &disk, expect, args);
+            }
             WriteRequest::Undo => match undo::plan(&state.undo, &disk, id) {
                 Ok(replay) => {
                     if let Some(entry) = state.undo.entries.pop_back() {
@@ -326,4 +430,90 @@ fn commit_label(message: &str, amend: bool) -> String {
     let subject = message.lines().next().unwrap_or("").trim();
     let verb = if amend { "Amend" } else { "Commit" };
     format!("{verb} '{subject}'")
+}
+
+// Task 17: network and branch-config requests.
+
+/// The branch checked out in the snapshot the user is looking at, or why
+/// there is none.
+fn checked_out(state: &RepoState) -> Result<(BranchName, &DiskState), Refusal> {
+    let disk = state.snapshot.disk().ok_or(Refusal::NotRead)?;
+    match &disk.head {
+        Head::Branch { name, .. } => Ok((name.clone(), disk)),
+        Head::Detached(_) | Head::Unborn(_) => Err(Refusal::NoBranch),
+    }
+}
+
+fn still_on(disk: &DiskState, local: &BranchName) -> Result<(), Refusal> {
+    match &disk.head {
+        Head::Branch { name, .. } if name == local => Ok(()),
+        _ => Err(Refusal::BranchChanged),
+    }
+}
+
+fn request_push(state: &mut RepoState, to: RemoteBranch, force: bool, set_upstream: bool) {
+    let (local, disk) = match checked_out(state) {
+        Ok(found) => found,
+        Err(reason) => return refuse_because(state, Action::Push, reason),
+    };
+    // Law 10: the lease is the remote value the user is looking at, taken
+    // from the snapshot now. If a fetch moves it before the push runs, the
+    // remote refuses the push (stale info) instead of overwriting.
+    let lease = if force {
+        let tracking = to.tracking_ref();
+        match disk.refs.refs.get(&tracking) {
+            Some(oid) => Some(Lease {
+                remote_ref: to.remote_ref(),
+                expected: oid.clone(),
+            }),
+            None => return refuse_because(state, Action::Push, Refusal::NoRemoteValue(tracking)),
+        }
+    } else {
+        None
+    };
+    enqueue(
+        state,
+        WriteRequest::Push {
+            local,
+            to,
+            lease,
+            set_upstream,
+        },
+    );
+}
+
+fn request_pull(state: &mut RepoState, from: RemoteBranch, mode: PullMode) {
+    match checked_out(state) {
+        Ok((local, _)) => enqueue(state, WriteRequest::Pull { local, from, mode }),
+        Err(reason) => refuse_because(state, Action::Pull, reason),
+    }
+}
+
+fn request_set_upstream(state: &mut RepoState, upstream: RemoteBranch) {
+    match checked_out(state) {
+        Ok((local, _)) => enqueue(state, WriteRequest::SetUpstream { local, upstream }),
+        Err(reason) => refuse_because(state, Action::SetUpstream, reason),
+    }
+}
+
+/// Starts a write that takes an undo point (a marker, for push and pull).
+fn run_with_point(
+    state: &mut RepoState,
+    commands: &mut Vec<Command>,
+    op: OpId,
+    label: String,
+    disk: &DiskState,
+    expect: Expect,
+    args: GitArgs,
+) {
+    let point = UndoPoint {
+        op,
+        label,
+        head: HeadTarget::of(&disk.head),
+        refs: vec![head_ref(&disk.head)],
+        index: expect.index.clone(),
+    };
+    commands.push(Command::SnapshotForUndo(point.clone()));
+    commands.push(Command::RunGit { op, args, expect });
+    state.undo.pending = UndoPending::Recording { point };
 }
