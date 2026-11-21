@@ -2,12 +2,15 @@
 
 use std::mem;
 
-use crate::event::{ChangeSet, Command, Event, Expect, HeadTarget, ReadScope, RefValue, UndoPoint};
-use crate::ids::{OpId, ReadId, RefName, RepoId};
+use crate::branch;
+use crate::event::{
+    ChangeSet, Command, Event, Expect, HeadTarget, IndexEffect, ReadScope, RefValue, UndoPoint,
+};
+use crate::ids::{BranchName, OpId, ReadId, RefName, RepoId};
 use crate::ops::{GitArgs, OpOutcome, WriteRequest};
 use crate::state::{
-    Action, DiskState, Freshness, Head, LockState, Notice, OpPhase, QueuedOp, Refusal, RepoState,
-    RunningOp, Snapshot,
+    Action, BranchRefusal, DiskState, Freshness, Head, LockState, Notice, OpPhase, QueuedOp,
+    Refusal, RepoState, RunningOp, Snapshot,
 };
 use crate::undo::{self, Reversible, UndoEntry, UndoPending};
 
@@ -42,6 +45,30 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         }
         Event::CommitRequested { message, amend } => {
             enqueue(&mut state, WriteRequest::Commit { message, amend });
+        }
+        // Task 15: branches. Names are parsed here; everything that depends
+        // on the disk is checked when the request is dispatched.
+        Event::BranchCreateRequested { name, at, switch } => match BranchName::parse(&name) {
+            Ok(name) => enqueue(&mut state, WriteRequest::CreateBranch { name, at, switch }),
+            Err(problem) => refuse_because(
+                &mut state,
+                Action::CreateBranch,
+                Refusal::Branch(BranchRefusal::InvalidName(problem)),
+            ),
+        },
+        Event::BranchSwitchRequested(name) => {
+            enqueue(&mut state, WriteRequest::SwitchBranch { name });
+        }
+        Event::BranchRenameRequested { from, to } => match BranchName::parse(&to) {
+            Ok(to) => enqueue(&mut state, WriteRequest::RenameBranch { from, to }),
+            Err(problem) => refuse_because(
+                &mut state,
+                Action::RenameBranch,
+                Refusal::Branch(BranchRefusal::InvalidName(problem)),
+            ),
+        },
+        Event::BranchDeleteRequested { name, force } => {
+            enqueue(&mut state, WriteRequest::DeleteBranch { name, force });
         }
         Event::OpCancelRequested(op) => cancel(&mut state, op, &mut commands),
         Event::AuthAnswered(op, answer) => {
@@ -190,6 +217,7 @@ fn settle_undo(state: &mut RepoState, commands: &mut Vec<Command>) {
                 tree,
                 after_refs,
                 after_index: disk.index,
+                after_head: HeadTarget::of(&disk.head),
                 reversible: Reversible::Yes,
             });
             prune(pruned, commands);
@@ -219,7 +247,7 @@ fn finish_undo(
 ) {
     let pending = mem::take(&mut state.undo.pending);
     state.undo.pending = match (pending, request, succeeded) {
-        (UndoPending::Taken { point, tree }, WriteRequest::Commit { .. }, true) => {
+        (UndoPending::Taken { point, tree }, request, true) if request.takes_undo_point() => {
             UndoPending::Settling { point, tree }
         }
         (UndoPending::Replaying { entry }, WriteRequest::Undo, true) => {
@@ -270,6 +298,7 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     head: HeadTarget::of(&disk.head),
                     refs: vec![head_ref(&disk.head)],
                     index: expect.index.clone(),
+                    index_effect: IndexEffect::Rewrites,
                 };
                 commands.push(Command::SnapshotForUndo(point.clone()));
                 commands.push(Command::RunGit {
@@ -293,6 +322,24 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     refuse_because(state, Action::Undo, reason);
                     continue;
                 }
+            },
+            branch_request => match branch::plan(branch_request, &disk, id) {
+                Some(Ok((args, point))) => {
+                    commands.push(Command::SnapshotForUndo(point.clone()));
+                    commands.push(Command::RunGit {
+                        op: id,
+                        args,
+                        expect,
+                    });
+                    state.undo.pending = UndoPending::Recording { point };
+                }
+                Some(Err(reason)) => {
+                    if let Some(action) = branch::action_of(branch_request) {
+                        refuse_because(state, action, reason);
+                    }
+                    continue;
+                }
+                None => continue,
             },
         }
         state.ops.running = Some(RunningOp {

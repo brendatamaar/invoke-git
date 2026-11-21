@@ -128,6 +128,49 @@ pub fn invocation(args: &GitArgs) -> Invocation {
                 stdin: Some(message.as_bytes().to_vec()),
             }
         }
+        // Task 15. Names were parsed by the core (no leading dash, no
+        // spaces), starting points are object ids, so nothing here can be
+        // read as an option. `--no-guess` keeps `switch` from inventing a
+        // tracking branch out of a remote one: the core named a local one.
+        GitArgs::CreateBranch { name, at, switch } => {
+            if *switch {
+                argv.extend(["switch", "-c"].map(OsString::from));
+            } else {
+                argv.extend(["branch", "--no-track"].map(OsString::from));
+            }
+            argv.push(name.0.clone().into());
+            argv.push(at.to_string().into());
+            Invocation {
+                args: argv,
+                stdin: None,
+            }
+        }
+        GitArgs::SwitchBranch { name, .. } => {
+            argv.extend(["switch", "--no-guess"].map(OsString::from));
+            argv.push(name.0.clone().into());
+            Invocation {
+                args: argv,
+                stdin: None,
+            }
+        }
+        GitArgs::RenameBranch { from, to, .. } => {
+            argv.extend(["branch", "-m"].map(OsString::from));
+            argv.push(from.0.clone().into());
+            argv.push(to.0.clone().into());
+            Invocation {
+                args: argv,
+                stdin: None,
+            }
+        }
+        GitArgs::DeleteBranch { name, force, .. } => {
+            argv.push("branch".into());
+            argv.push(if *force { "-D" } else { "-d" }.into());
+            argv.push(name.0.clone().into());
+            Invocation {
+                args: argv,
+                stdin: None,
+            }
+        }
     }
 }
 
@@ -194,7 +237,89 @@ mod tests {
         assert_eq!(amend.args.last().unwrap(), "--amend");
     }
 
+    fn argv(args: &GitArgs) -> Vec<String> {
+        invocation(args)
+            .args
+            .iter()
+            .skip(GLOBAL_ARGS.len())
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn branch_operations_map_to_git_argv() {
+        use invoke_core::BranchName;
+        let name = |n: &str| BranchName(n.into());
+        let at = invoke_core::Oid::from_hex(&"a".repeat(40)).unwrap();
+        let line = |text: &str| text.replace("<oid>", &"a".repeat(40));
+        let cases = [
+            (
+                GitArgs::CreateBranch {
+                    name: name("x"),
+                    at: at.clone(),
+                    switch: false,
+                },
+                line("branch --no-track x <oid>"),
+            ),
+            (
+                GitArgs::CreateBranch {
+                    name: name("x"),
+                    at: at.clone(),
+                    switch: true,
+                },
+                line("switch -c x <oid>"),
+            ),
+            (
+                GitArgs::SwitchBranch {
+                    name: name("x"),
+                    tip: at.clone(),
+                },
+                "switch --no-guess x".to_owned(),
+            ),
+            (
+                GitArgs::RenameBranch {
+                    from: name("x"),
+                    tip: at.clone(),
+                    to: name("y"),
+                },
+                "branch -m x y".to_owned(),
+            ),
+            (
+                GitArgs::DeleteBranch {
+                    name: name("x"),
+                    tip: at.clone(),
+                    force: false,
+                },
+                "branch -d x".to_owned(),
+            ),
+            (
+                GitArgs::DeleteBranch {
+                    name: name("x"),
+                    tip: at,
+                    force: true,
+                },
+                "branch -D x".to_owned(),
+            ),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(argv(&args).join(" "), expected);
+            assert_eq!(invocation(&args).stdin, None);
+        }
+    }
+
     proptest! {
+        /// A name the core accepted never starts with a dash, so it is never
+        /// read as an option.
+        #[test]
+        fn parsed_branch_names_are_never_options(text in "\\PC{0,12}") {
+            use invoke_core::BranchName;
+            if let Ok(name) = BranchName::parse(&text) {
+                let at = invoke_core::Oid::from_hex(&"b".repeat(40)).unwrap();
+                let run = argv(&GitArgs::RenameBranch { from: name.clone(), tip: at, to: name });
+                prop_assert!(!run[2].starts_with('-') && !run[3].starts_with('-'));
+            }
+        }
+
         /// No message, however odd, ever reaches argv.
         #[test]
         fn messages_never_reach_argv(message in "\\PC*", amend in any::<bool>()) {

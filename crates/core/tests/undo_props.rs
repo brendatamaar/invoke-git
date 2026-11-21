@@ -40,6 +40,7 @@ impl World {
             status: StatusSnapshot::default(),
             refs: RefsSnapshot {
                 refs: self.refs.clone(),
+                ..RefsSnapshot::default()
             },
             lock: self.lock,
         }

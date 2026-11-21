@@ -74,8 +74,12 @@ fn disk() -> impl Strategy<Value = DiskState> {
             })
             .collect(),
     });
-    let refs = btree_map("refs/heads/[a-c]".prop_map(RefName), oid(), 0..3)
-        .prop_map(|refs| RefsSnapshot { refs });
+    let refs = btree_map("refs/heads/[a-c]".prop_map(RefName), oid(), 0..3).prop_map(|refs| {
+        RefsSnapshot {
+            refs,
+            ..RefsSnapshot::default()
+        }
+    });
     let index = prop_oneof![Just(IndexId::Absent), oid().prop_map(IndexId::Checksum)];
     // Weighted towards Free so writes get dispatched often.
     let lock = prop_oneof![
@@ -168,6 +172,19 @@ fn event() -> impl Strategy<Value = Event> {
         1 => op_id().prop_map(Event::OpCancelRequested),
         1 => op_id().prop_map(|op| Event::AuthAnswered(op, AuthAnswer("secret".into()))),
         1 => Just(Event::UndoRequested),
+        // Task 15: branches (some names are not valid on purpose).
+        2 => ("[a-c/ ]{0,3}", any::<bool>(), any::<bool>(), oid()).prop_map(
+            |(name, switch, here, commit)| Event::BranchCreateRequested {
+                name,
+                at: if here { BranchStart::Head } else { BranchStart::Commit(commit) },
+                switch,
+            }
+        ),
+        1 => branch().prop_map(Event::BranchSwitchRequested),
+        1 => (branch(), "[a-c/ ]{0,3}")
+            .prop_map(|(from, to)| Event::BranchRenameRequested { from, to }),
+        1 => (branch(), any::<bool>())
+            .prop_map(|(name, force)| Event::BranchDeleteRequested { name, force }),
         1 => Just(Event::RefreshRequested),
         1 => Just(Event::NoticeDismissed),
         2 => areas.prop_map(|areas| Event::DiskChanged(ChangeSet(areas))),
@@ -291,10 +308,15 @@ proptest! {
             let running = running.unwrap();
             for write in writes {
                 match write {
-                    Command::RunGit { op, expect, .. } => {
+                    Command::RunGit { op, expect, args } => {
                         prop_assert_eq!(*op, running.id);
                         prop_assert_eq!(&expect.head, &disk.head);
                         prop_assert_eq!(&expect.index, &disk.index);
+                        // Rule 5 for refs: every ref the run names is
+                        // expected at the value the snapshot holds.
+                        for item in args.expected_refs() {
+                            prop_assert_eq!(disk.refs.refs.get(&item.name), item.oid.as_ref());
+                        }
                     }
                     Command::SnapshotForUndo(point) => {
                         prop_assert_eq!(point.op, running.id);
@@ -343,17 +365,23 @@ proptest! {
                 Event::CommitRequested { .. } => Action::Commit,
                 Event::PushRequested { .. } => Action::Push,
                 Event::UndoRequested => Action::Undo,
+                Event::BranchCreateRequested { .. } => Action::CreateBranch,
+                Event::BranchSwitchRequested(_) => Action::SwitchBranch,
+                Event::BranchRenameRequested { .. } => Action::RenameBranch,
+                Event::BranchDeleteRequested { .. } => Action::DeleteBranch,
                 _ => return Ok(()),
             };
-            let refused = matches!(
-                after.notice,
-                Some(Notice::Refused { action: refused, .. }) if refused == action
-            );
             let accepted = after.ops.next.0 == before.ops.next.0 + 1
                 && (after.ops.queued.back().map(|queued| queued.id)
                     == Some(before.ops.next)
                     || after.ops.running.as_ref().map(|running| running.id)
                         == Some(before.ops.next));
+            // A refusal notice left over from an earlier request does not
+            // count against an accepted one.
+            let refused = matches!(
+                after.notice,
+                Some(Notice::Refused { action: refused, .. }) if refused == action
+            ) && !(accepted && before.notice == after.notice);
             prop_assert!(refused != accepted, "{event:?}: refused={refused} accepted={accepted}");
             Ok(())
         })?;
@@ -447,6 +475,7 @@ fn commit_round_trip() {
                     oid: Some(oid.clone()),
                 }],
                 index: index.clone(),
+                index_effect: IndexEffect::Rewrites,
             }),
             Command::RunGit {
                 op,
@@ -498,6 +527,7 @@ fn commit_round_trip() {
         index: new_index.clone(),
         refs: RefsSnapshot {
             refs: [(RefName("refs/heads/main".into()), new_oid.clone())].into(),
+            ..RefsSnapshot::default()
         },
         lock: LockState::Free,
         ..free

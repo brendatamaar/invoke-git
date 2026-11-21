@@ -11,8 +11,12 @@ use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use invoke_core::{ErrorClass, Event, Failure, Oid, OpId, OpOutcome, UndoPoint, UndoReplay};
+use invoke_core::{
+    ErrorClass, Event, Failure, Head, HeadRestore, IndexEffect, Oid, OpId, OpOutcome, UndoPoint,
+    UndoReplay,
+};
 
+use crate::classify::classify;
 use crate::git::{GLOBAL_ARGS, Git};
 use crate::precondition::{self, RepoPaths};
 
@@ -146,11 +150,41 @@ impl UndoRunner {
                 Some(transaction(restore).as_bytes()),
             )
         };
-        if let Err(details) = refs(true) {
-            // Nothing was changed: the transaction is all or nothing.
-            return failed(ErrorClass::PreconditionChanged, details);
+        if let Some(restore) = &replay.head {
+            // Check every ref first, so a stale one is found before `HEAD`
+            // moves (a checkout cannot be undone without side effects).
+            let mut script = String::from("start\n");
+            for item in &replay.refs {
+                let expect = item.expect.as_ref().map_or(zero.clone(), |o| o.to_string());
+                script.push_str(&format!("verify {} {expect}\n", item.name.0));
+            }
+            script.push_str("prepare\nabort\n");
+            if let Err(details) = self.run(
+                &["update-ref", "--no-deref", "--stdin"],
+                &[],
+                Some(script.as_bytes()),
+            ) {
+                return failed(ErrorClass::PreconditionChanged, details);
+            }
+            if let Err(details) = self.move_head(restore) {
+                // git refuses a checkout before changing anything.
+                return classify(false, &details);
+            }
         }
-        if let Err(details) = self.run(&["read-tree", replay.tree.as_hex()], &[], None) {
+        if let Err(details) = refs(true) {
+            // The ref transaction is all or nothing; only `HEAD` may have
+            // moved, and that is put back.
+            let back = replay.head.as_ref().map_or(String::new(), |restore| {
+                match self.rollback_head(restore, &replay.expect.head) {
+                    Ok(()) => "\nHEAD put back".to_owned(),
+                    Err(error) => format!("\nHEAD could NOT be put back: {error}"),
+                }
+            });
+            return failed(ErrorClass::PreconditionChanged, format!("{details}{back}"));
+        }
+        if replay.index_effect == IndexEffect::Rewrites
+            && let Err(details) = self.run(&["read-tree", replay.tree.as_hex()], &[], None)
+        {
             let rollback = match refs(false) {
                 Ok(_) => "refs rolled back".to_owned(),
                 Err(error) => format!("refs could NOT be rolled back: {error}"),
@@ -158,6 +192,34 @@ impl UndoRunner {
             return failed(ErrorClass::Bug, format!("{details}\n{rollback}"));
         }
         OpOutcome::Succeeded
+    }
+
+    /// Puts `HEAD` where the operation found it.
+    fn move_head(&self, restore: &HeadRestore) -> Result<(), String> {
+        match restore {
+            HeadRestore::Symbolic(name) => {
+                self.run(&["symbolic-ref", "HEAD", &name.to_ref().0], &[], None)
+            }
+            HeadRestore::Branch(name) => self.run(&["switch", "--no-guess", &name.0], &[], None),
+            HeadRestore::Detached(oid) => {
+                self.run(&["switch", "--detach", oid.as_hex()], &[], None)
+            }
+        }
+        .map(|_| ())
+    }
+
+    /// Undoes `move_head`: back to `now`, as read before the replay.
+    fn rollback_head(&self, restore: &HeadRestore, now: &Head) -> Result<(), String> {
+        let result = match (restore, now) {
+            (HeadRestore::Symbolic(_), Head::Branch { name, .. } | Head::Unborn(name)) => {
+                self.run(&["symbolic-ref", "HEAD", &name.to_ref().0], &[], None)
+            }
+            (_, Head::Branch { name, .. } | Head::Unborn(name)) => {
+                self.run(&["switch", "--no-guess", &name.0], &[], None)
+            }
+            (_, Head::Detached(oid)) => self.run(&["switch", "--detach", oid.as_hex()], &[], None),
+        };
+        result.map(|_| ())
     }
 
     /// Deletes the saved trees of points that left the stack. Best effort:

@@ -146,6 +146,11 @@ impl Job {
         if let Err(failure) = precondition::check(&self.paths, &self.expect) {
             return OpOutcome::Failed(failure);
         }
+        // Rule 5 for refs: the branches the run names must still be where
+        // the core saw them (task 15).
+        if let Err(failure) = precondition::check_refs(&self.paths, &self.args.expected_refs()) {
+            return OpOutcome::Failed(failure);
+        }
         let run = invocation(&self.args);
         let mut command = self.git.command(&self.paths.workdir);
         command

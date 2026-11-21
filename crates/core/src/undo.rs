@@ -6,8 +6,8 @@
 
 use std::collections::VecDeque;
 
-use crate::event::{Expect, HeadTarget, RefValue, UndoPoint};
-use crate::ids::{IndexId, Oid, OpId, RefName};
+use crate::event::{Expect, HeadTarget, IndexEffect, RefValue, UndoPoint};
+use crate::ids::{BranchName, IndexId, Oid, OpId, RefName};
 use crate::state::{DiskState, Head, Phase, Refusal, UndoMoved};
 
 /// Undo points kept per repo; the oldest is dropped (and pruned on disk)
@@ -34,6 +34,10 @@ pub struct UndoEntry {
     pub after_refs: Vec<RefValue>,
     /// The index as the operation left it.
     pub after_index: IndexId,
+    /// Which kind of `HEAD` the operation left (task 15: a switch or a
+    /// rename of the current branch changes it). Undo refuses when `HEAD`
+    /// is not as the operation left it.
+    pub after_head: HeadTarget,
     pub reversible: Reversible,
 }
 
@@ -79,9 +83,28 @@ pub struct UndoReplay {
     pub refs: Vec<RestoreRef>,
     /// Saved index tree to read back.
     pub tree: Oid,
+    /// Whether `tree` is read back into the index. `Untouched` for
+    /// operations that never changed it.
+    pub index_effect: IndexEffect,
+    /// Where `HEAD` must go back to, when the operation moved it (task 15).
+    pub head: Option<HeadRestore>,
     /// Head and index as read just now; the shell refuses if they moved.
     pub expect: Expect,
     // Task 13 adds the discarded blobs to write back to their paths here.
+}
+
+/// How `HEAD` goes back. It happens before the refs are restored, because a
+/// branch cannot be deleted while checked out and a branch to switch back to
+/// may have to be made first (rename).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadRestore {
+    /// Point `HEAD` at the branch without touching files: the commit is the
+    /// same one `HEAD` is on now (`git symbolic-ref`).
+    Symbolic(BranchName),
+    /// Check the branch out again (`git switch`).
+    Branch(BranchName),
+    /// Check the commit out, detached (`git switch --detach`).
+    Detached(Oid),
 }
 
 /// One ref to restore, atomically: only if it still holds `expect`.
@@ -133,7 +156,12 @@ pub fn plan(undo: &UndoStack, disk: &DiskState, op: OpId) -> Result<UndoReplay, 
     if disk.phase != Phase::Clean {
         return Err(Refusal::RepoBusy);
     }
-    if HeadTarget::of(&disk.head) != entry.point.head {
+    if HeadTarget::of(&disk.head) != entry.after_head {
+        return Err(Refusal::Changed(UndoMoved::Head));
+    }
+    let head = head_restore(entry, disk);
+    if head.is_none() && entry.after_head != entry.point.head {
+        // The operation moved `HEAD` but the old place was not recorded.
         return Err(Refusal::Changed(UndoMoved::Head));
     }
     let mut refs = Vec::with_capacity(entry.point.refs.len());
@@ -142,24 +170,62 @@ pub fn plan(undo: &UndoStack, disk: &DiskState, op: OpId) -> Result<UndoReplay, 
         if now != after.oid {
             return Err(Refusal::Changed(UndoMoved::Ref(before.name.clone())));
         }
+        // `HEAD` itself is put back by `head`, not as a ref.
+        if head.is_some() && before.name.0 == "HEAD" {
+            continue;
+        }
         refs.push(RestoreRef {
             name: before.name.clone(),
             expect: now,
             restore: before.oid.clone(),
         });
     }
-    if disk.index != entry.after_index {
+    if entry.point.index_effect == IndexEffect::Rewrites && disk.index != entry.after_index {
         return Err(Refusal::Changed(UndoMoved::Index));
     }
     Ok(UndoReplay {
         op,
         refs,
         tree: entry.tree.clone(),
+        index_effect: entry.point.index_effect,
+        head,
         expect: Expect {
             head: disk.head.clone(),
             index: disk.index.clone(),
         },
     })
+}
+
+/// What puts `HEAD` back, when the operation moved it to another branch.
+/// The old commit is the recorded value of the old branch (or of `HEAD`
+/// itself when it was detached).
+fn head_restore(entry: &UndoEntry, disk: &DiskState) -> Option<HeadRestore> {
+    if entry.after_head == entry.point.head {
+        return None;
+    }
+    let recorded = |name: &RefName| {
+        entry
+            .point
+            .refs
+            .iter()
+            .find(|item| &item.name == name)
+            .and_then(|item| item.oid.clone())
+    };
+    match &entry.point.head {
+        HeadTarget::Detached => recorded(&RefName("HEAD".into())).map(HeadRestore::Detached),
+        HeadTarget::Branch(name) => {
+            let before = recorded(&name.to_ref());
+            let now = match &disk.head {
+                Head::Branch { oid, .. } | Head::Detached(oid) => Some(oid),
+                Head::Unborn(_) => None,
+            };
+            if before.as_ref() == now {
+                Some(HeadRestore::Symbolic(name.clone()))
+            } else {
+                Some(HeadRestore::Branch(name.clone()))
+            }
+        }
+    }
 }
 
 /// The value a recorded ref has on disk. `HEAD` is the detached head.

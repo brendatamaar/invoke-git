@@ -4,6 +4,7 @@
 //! randomness. The shell runs the [`Command`]s and reports back with
 //! [`Event`]s. See `docs/spec/core-design.md`.
 
+pub mod branch;
 pub mod clone;
 pub mod detect;
 pub mod event;
@@ -15,19 +16,23 @@ pub mod undo;
 pub mod watch;
 
 pub use event::{
-    Area, ChangeSet, Command, Event, Expect, HeadTarget, ReadScope, RefValue, UndoPoint,
+    Area, ChangeSet, Command, Event, Expect, HeadTarget, IndexEffect, ReadScope, RefValue,
+    UndoPoint,
 };
-pub use ids::{BranchName, IndexId, Oid, OidError, OpId, ReadId, RefName, RepoId, RepoPath};
+pub use ids::{
+    BranchName, IndexId, NameProblem, Oid, OidError, OpId, ReadId, RefName, RepoId, RepoPath,
+};
 pub use ops::{
-    AuthAnswer, AuthKind, AuthPrompt, ErrorClass, Failure, GitArgs, OpOutcome, Patch, Progress,
-    Selection, WriteRequest,
+    AuthAnswer, AuthKind, AuthPrompt, BranchStart, ErrorClass, Failure, GitArgs, OpOutcome, Patch,
+    Progress, Selection, WriteRequest,
 };
 pub use state::{
-    Action, Conflicts, DiskState, FileChange, Freshness, Head, LockState, Notice, OpPhase, OpQueue,
-    Phase, QueuedOp, Reads, RefsSnapshot, Refusal, RepoState, RunningOp, Snapshot, StatusEntry,
-    StatusSnapshot, UndoMoved,
+    Action, BranchRefusal, Conflicts, DiskState, FileChange, Freshness, Head, LockState, Notice,
+    OpPhase, OpQueue, Phase, QueuedOp, Reads, RefsSnapshot, Refusal, RepoState, RunningOp,
+    Snapshot, StatusEntry, StatusSnapshot, Tracking, UndoMoved, Upstream,
 };
 pub use step::{open, step};
 pub use undo::{
-    Irreversible, MAX_POINTS, RestoreRef, Reversible, UndoEntry, UndoPending, UndoReplay, UndoStack,
+    HeadRestore, Irreversible, MAX_POINTS, RestoreRef, Reversible, UndoEntry, UndoPending,
+    UndoReplay, UndoStack,
 };
