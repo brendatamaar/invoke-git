@@ -39,7 +39,9 @@ impl TempRepo {
         let dir = root.join("repo");
         fs::create_dir_all(&dir).unwrap();
         // Canonical: macOS temp folders are symlinks, and events carry the
-        // real path.
+        // real path. Not on Windows: canonical paths there are `\\?\` paths,
+        // which Git for Windows rejects in `GIT_CONFIG_GLOBAL`.
+        #[cfg(not(windows))]
         let root = fs::canonicalize(&root).unwrap();
         let dir = root.join("repo");
         let global = root.join("gitconfig");
