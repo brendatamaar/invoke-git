@@ -7,7 +7,7 @@ description = "IO for Invoke Git: runs the core's commands through gix and the g
 
 [dependencies]
 invoke-core = { path = "../core" }
-gix.workspace = true
+gix = { workspace = true, features = ["index"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

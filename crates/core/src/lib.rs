@@ -4,6 +4,7 @@
 //! randomness. The shell runs the [`Command`]s and reports back with
 //! [`Event`]s. See `docs/spec/core-design.md`.
 
+pub mod detect;
 pub mod event;
 pub mod ids;
 pub mod ops;

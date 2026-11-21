@@ -4,12 +4,16 @@
 //! the boundary between git's text and the core's types.
 
 pub mod classify;
+pub mod discover;
 pub mod git;
 pub mod precondition;
 pub mod progress;
+pub mod read;
 pub mod runner;
 mod tree;
 
+pub use discover::{DiscoverError, Discovered, discover};
 pub use git::{Git, GitVersion, SetupError};
 pub use precondition::RepoPaths;
+pub use read::{execute as execute_read, read_state};
 pub use runner::GitRunner;

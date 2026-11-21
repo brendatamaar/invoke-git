@@ -1320,6 +1320,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1255e7a9f1902190d4c10a75f2f7f495d3d3ce13e9ba26e6c48683a0f4dbed7"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1652,6 +1662,7 @@ dependencies = [
  "gix-glob",
  "gix-hash",
  "gix-hashtable",
+ "gix-index",
  "gix-lock",
  "gix-note",
  "gix-object",
@@ -1705,6 +1716,15 @@ dependencies = [
  "gix-trace",
  "smallvec",
  "unicode-bom",
+]
+
+[[package]]
+name = "gix-bitmap"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "422cd23418fd80e9e965595323975d72abd6364a66ff8f0daade5c105a7f35d2"
+dependencies = [
+ "gix-error",
 ]
 
 [[package]]
@@ -1896,6 +1916,35 @@ dependencies = [
  "gix-hash",
  "hashbrown 0.17.1",
  "parking_lot",
+]
+
+[[package]]
+name = "gix-index"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06bfc736774a623307eda890c918d308ef5acd37402bde2d6768fccb1f6ecb5d"
+dependencies = [
+ "bitflags 2.13.2",
+ "bstr",
+ "filetime",
+ "fnv",
+ "gix-bitmap",
+ "gix-error",
+ "gix-fs",
+ "gix-hash",
+ "gix-lock",
+ "gix-object",
+ "gix-parallel",
+ "gix-trace",
+ "gix-traverse",
+ "gix-utils",
+ "gix-validate",
+ "hashbrown 0.17.1",
+ "itoa",
+ "libc",
+ "memmap2",
+ "rustix",
+ "smallvec",
 ]
 
 [[package]]
@@ -2702,6 +2751,8 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.2.0",
 ]
 
