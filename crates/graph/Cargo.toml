@@ -1,0 +1,9 @@
+[package]
+name = "graph"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description = "Pure commit-graph lane layout and paging for Invoke Git. No IO."
+
+[dev-dependencies]
+proptest.workspace = true
