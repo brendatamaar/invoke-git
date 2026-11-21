@@ -7,7 +7,8 @@ description = "IO for Invoke Git: runs the core's commands through gix and the g
 
 [dependencies]
 invoke-core = { path = "../core" }
-gix = { workspace = true, features = ["index"] }
+gix = { workspace = true, features = ["index", "excludes"] }
+notify = "8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

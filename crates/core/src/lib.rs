@@ -10,6 +10,7 @@ pub mod ids;
 pub mod ops;
 pub mod state;
 mod step;
+pub mod watch;
 
 pub use event::{Area, ChangeSet, Command, Event, Expect, ReadScope, RefValue, UndoPoint};
 pub use ids::{BranchName, IndexId, Oid, OidError, OpId, ReadId, RefName, RepoId, RepoPath};
