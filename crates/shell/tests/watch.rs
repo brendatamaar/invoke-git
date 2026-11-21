@@ -86,6 +86,10 @@ impl TempRepo {
         let found = discover(&self.dir).unwrap();
         let (tx, rx) = mpsc::channel();
         let watcher = RepoWatcher::start(&found, tx).unwrap();
+        // macOS FSEvents can deliver changes made just before the stream
+        // started (the fixture's own `git commit`) a moment late. Let those
+        // pass, so a test only ever sees what it does itself.
+        while rx.recv_timeout(SETTLE).is_ok() {}
         (watcher, rx)
     }
 }
