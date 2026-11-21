@@ -37,7 +37,6 @@ impl Sandbox {
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
         fs::create_dir_all(&root).unwrap();
-        let root = fs::canonicalize(&root).unwrap();
         let global = root.join("gitconfig");
         fs::write(&global, "").unwrap();
         let env = [
@@ -144,6 +143,14 @@ impl Repo<'_> {
         self.git(&["checkout", "-q", "main"]);
         self.commit_file("a.txt", "main\n", "main change");
     }
+}
+
+/// Same folder, whatever the spelling (`\\?\` prefixes, short names, symlinks).
+fn assert_same_dir(found: &Path, expected: &Path) {
+    assert_eq!(
+        fs::canonicalize(found).unwrap(),
+        fs::canonicalize(expected).unwrap()
+    );
 }
 
 fn conflict_paths(names: &[&str]) -> Conflicts {
@@ -445,16 +452,9 @@ fn discovery_works_from_the_root_and_from_a_subdirectory() {
         repo.dir.join(".git"),
     ] {
         let found = discover(&start).unwrap();
-        assert_eq!(
-            fs::canonicalize(&found.paths.workdir).unwrap(),
-            repo.dir,
-            "{start:?}"
-        );
-        assert_eq!(
-            fs::canonicalize(&found.paths.git_dir).unwrap(),
-            repo.dir.join(".git")
-        );
-        assert_eq!(found.common_dir, found.paths.git_dir);
+        assert_same_dir(&found.paths.workdir, &repo.dir);
+        assert_same_dir(&found.paths.git_dir, &repo.dir.join(".git"));
+        assert_same_dir(&found.common_dir, &found.paths.git_dir);
         assert_eq!(read_state(&found.paths).unwrap(), repo.read());
     }
 }
@@ -506,8 +506,8 @@ fn git_file_pointing_elsewhere_is_followed() {
     fs::create_dir_all(work.join("sub")).unwrap();
 
     let found = discover(&work.join("sub")).unwrap();
-    assert_eq!(fs::canonicalize(&found.paths.workdir).unwrap(), work);
-    assert_eq!(fs::canonicalize(&found.paths.git_dir).unwrap(), separate);
+    assert_same_dir(&found.paths.workdir, &work);
+    assert_same_dir(&found.paths.git_dir, &separate);
     let disk = read_state(&found.paths).unwrap();
     assert!(matches!(disk.head, Head::Branch { .. }));
     assert_eq!(disk.phase, Phase::Clean);
@@ -537,14 +537,13 @@ fn linked_worktree_has_its_own_markers_and_shares_refs() {
 
     fs::create_dir_all(linked.join("sub")).unwrap();
     let found = discover(&linked.join("sub")).unwrap();
-    let git_dir = fs::canonicalize(&found.paths.git_dir).unwrap();
-    assert_eq!(fs::canonicalize(&found.paths.workdir).unwrap(), linked);
-    assert_eq!(git_dir, repo.dir.join(".git/worktrees/linked"));
-    assert_eq!(
-        fs::canonicalize(&found.common_dir).unwrap(),
-        repo.dir.join(".git")
+    assert_same_dir(&found.paths.workdir, &linked);
+    assert_same_dir(
+        &found.paths.git_dir,
+        &repo.dir.join(".git/worktrees/linked"),
     );
-    assert!(git_dir.join("MERGE_HEAD").exists());
+    assert_same_dir(&found.common_dir, &repo.dir.join(".git"));
+    assert!(found.paths.git_dir.join("MERGE_HEAD").exists());
 
     let in_linked = read_state(&found.paths).unwrap();
     assert_eq!(
