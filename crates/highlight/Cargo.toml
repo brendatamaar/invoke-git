@@ -1,0 +1,28 @@
+[package]
+name = "highlight"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description = "Pure syntax highlighting layer on tree-sitter: text and path in, styled byte ranges out. No IO."
+
+[dependencies]
+tokens = { path = "../tokens" }
+tree-sitter = "0.27.2"
+tree-sitter-bash = "0.25.1"
+tree-sitter-css = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-html = "0.23.2"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-kotlin-ng = "1.1.0"
+tree-sitter-md = "0.5.4"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-sequel = "0.3.13"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-yaml = "0.7.2"
+
+[dev-dependencies]
+proptest.workspace = true

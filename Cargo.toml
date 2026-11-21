@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask", "crates/core", "crates/diff", "crates/graph", "crates/shell", "crates/tokens", "crates/spike-diff", "crates/spike-graph"]
+members = ["xtask", "crates/core", "crates/diff", "crates/graph", "crates/highlight", "crates/shell", "crates/tokens", "crates/spike-diff", "crates/spike-graph"]
 resolver = "3"
 
 [workspace.package]
