@@ -117,7 +117,7 @@ Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are 
 | 14 | Commit, amend, commit message editor | Core + UI | 11 | Not started |
 | 15 | Branches: create, switch, rename, delete, detached HEAD | Core + UI | 5 | Core done |
 | 16 | Clone with progress, cancel and in-app auth prompt (`GIT_ASKPASS`) | Shell + UI | 4 | Core done |
-| 17 | Fetch, pull (merge or rebase), push with `--force-with-lease`, set upstream | Shell + UI | 4, 16 | Not started |
+| 17 | Fetch, pull (merge or rebase), push with `--force-with-lease`, set upstream | Shell + UI | 4, 16 | Core done |
 | 18 | Commit graph: lane layout, paging, renderer | Graph | 2 | Core done |
 | 19 | Commit detail view with its diff | UI | 10, 18 | Not started |
 | 20 | Stash: save (incl. untracked), apply, pop, drop | Core + UI | 5 | Core done |

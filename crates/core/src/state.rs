@@ -251,9 +251,25 @@ pub enum OpPhase {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
-    Refused { action: Action, reason: Refusal },
-    OpEnded { op: OpId, outcome: OpOutcome },
-    ReadFailed { read: ReadId, failure: Failure },
+    Refused {
+        action: Action,
+        reason: Refusal,
+    },
+    OpEnded {
+        op: OpId,
+        outcome: OpOutcome,
+    },
+    ReadFailed {
+        read: ReadId,
+        failure: Failure,
+    },
+    /// A push the remote turned down (non-fast-forward, or a lease that no
+    /// longer held). An expected outcome, not an error: the UI offers
+    /// `FetchRequested` and then `PullRequested` with `PullMode::Rebase`.
+    PushRejected {
+        op: OpId,
+        failure: Failure,
+    },
 }
 
 /// A user request, named for notices.
@@ -274,6 +290,10 @@ pub enum Action {
     StashApply,
     StashPop,
     StashDrop,
+    // Task 17.
+    Fetch,
+    Pull,
+    SetUpstream,
 }
 
 /// Why a request was turned down. Every refusal states one.
@@ -303,6 +323,16 @@ pub enum Refusal {
     /// A branch request that cannot run on the snapshot it was checked
     /// against (task 15).
     Branch(BranchRefusal),
+    // Task 17.
+    /// Nothing has been read from disk yet, so there is nothing to act on.
+    NotRead,
+    /// The request needs a checked-out branch; `HEAD` is detached or unborn.
+    NoBranch,
+    /// A force push needs the remote value the user reviewed; there is no
+    /// remote-tracking ref for the target, so it is refused (law 10).
+    NoRemoteValue(RefName),
+    /// The branch checked out is not the one the request was made for.
+    BranchChanged,
 }
 
 /// Why a branch request was turned down (task 15).

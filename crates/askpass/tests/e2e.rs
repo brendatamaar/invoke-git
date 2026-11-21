@@ -227,3 +227,117 @@ fn cancelling_the_prompt_cancels_the_clone() {
     assert!(!target.exists());
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Task 17: fetch and push prompt through the same server as a clone.
+fn network_op_prompts(args: invoke_core::GitArgs) -> (Vec<AuthKind>, OpOutcome) {
+    use invoke_core::Event;
+    use shell::GitRunner;
+    use shell::precondition::{self, RepoPaths};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/repo.git",
+        listener.local_addr().unwrap().port()
+    );
+    thread::spawn(move || serve_401(listener));
+    let root = scratch("sync");
+    let global = root.join("gitconfig");
+    std::fs::write(&global, "").unwrap();
+    let env: Vec<(OsString, OsString)> = [
+        ("GIT_CONFIG_NOSYSTEM", OsString::from("1")),
+        ("GIT_CONFIG_GLOBAL", global.into_os_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (OsString::from(key), value))
+    .collect();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for setup in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["remote", "add", "origin", url.as_str()],
+        // A push needs something to push.
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(&setup)
+            .current_dir(&repo)
+            .envs(env.iter().map(|(key, value)| (key, value)))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let paths = RepoPaths {
+        workdir: repo.clone(),
+        git_dir: repo.join(".git"),
+    };
+    let runner = GitRunner::new(Git::detect("git").unwrap(), paths.clone())
+        .with_env(env)
+        .with_askpass(HELPER);
+    let (sender, receiver) = mpsc::channel();
+    let op = OpId(3);
+    runner.run(op, args, precondition::current(&paths).unwrap(), sender);
+    let mut asked = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let outcome = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the operation did not finish");
+        match event {
+            Event::AuthNeeded(id, prompt) => {
+                assert_eq!(id, op);
+                asked.push(prompt.kind);
+                let answer = match prompt.kind {
+                    AuthKind::Username => "someone",
+                    _ => "hunter2",
+                };
+                runner.answer(op, AuthAnswer(answer.into()));
+            }
+            Event::OpFinished(id, outcome) => {
+                assert_eq!(id, op);
+                break outcome;
+            }
+            _ => {}
+        }
+    };
+    let _ = std::fs::remove_dir_all(root);
+    (asked, outcome)
+}
+
+#[test]
+fn a_fetch_prompts_in_app_then_fails_as_auth() {
+    let (asked, outcome) = network_op_prompts(invoke_core::GitArgs::Fetch {
+        remote: "origin".into(),
+    });
+    assert_eq!(asked, [AuthKind::Username, AuthKind::Password]);
+    let OpOutcome::Failed(failure) = outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(failure.class, ErrorClass::Auth, "{}", failure.details);
+    assert!(!failure.details.contains("hunter2"));
+}
+
+#[test]
+fn a_push_prompts_in_app_then_fails_as_auth() {
+    use invoke_core::{BranchName, GitArgs, RemoteBranch};
+    let (asked, outcome) = network_op_prompts(GitArgs::Push {
+        local: BranchName("main".into()),
+        to: RemoteBranch {
+            remote: "origin".into(),
+            branch: BranchName("main".into()),
+        },
+        lease: None,
+        set_upstream: false,
+    });
+    assert_eq!(asked, [AuthKind::Username, AuthKind::Password]);
+    assert!(matches!(outcome, OpOutcome::Failed(ref f) if f.class == ErrorClass::Auth));
+}

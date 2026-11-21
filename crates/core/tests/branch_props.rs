@@ -383,7 +383,13 @@ impl Sim {
             | GitArgs::StashSave { .. }
             | GitArgs::StashApply { .. }
             | GitArgs::StashPop { .. }
-            | GitArgs::StashDrop { .. } => panic!("no commits or stashes in this simulation"),
+            | GitArgs::StashDrop { .. }
+            | GitArgs::Fetch { .. }
+            | GitArgs::Pull { .. }
+            | GitArgs::Push { .. }
+            | GitArgs::SetUpstream { .. } => {
+                panic!("no commits, stashes or remotes in this simulation")
+            }
         }
         if rewrites {
             self.world.index = IndexId::Checksum(oid(self.next()));

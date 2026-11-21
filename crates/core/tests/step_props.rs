@@ -14,6 +14,13 @@ fn branch() -> impl Strategy<Value = BranchName> {
         .prop_map(|name| BranchName(name.into()))
 }
 
+fn remote_branch() -> impl Strategy<Value = RemoteBranch> {
+    branch().prop_map(|branch| RemoteBranch {
+        remote: "origin".into(),
+        branch,
+    })
+}
+
 fn path() -> impl Strategy<Value = RepoPath> {
     "[a-z]{1,3}(/[a-z]{1,3})?".prop_map(RepoPath)
 }
@@ -74,11 +81,14 @@ fn disk() -> impl Strategy<Value = DiskState> {
             })
             .collect(),
     });
-    let refs = btree_map("refs/heads/[a-c]".prop_map(RefName), oid(), 0..3).prop_map(|refs| {
-        RefsSnapshot {
-            refs,
-            ..RefsSnapshot::default()
-        }
+    let refs = btree_map(
+        "refs/(heads/[a-c]|remotes/origin/(main|dev))".prop_map(RefName),
+        oid(),
+        0..4,
+    )
+    .prop_map(|refs| RefsSnapshot {
+        refs,
+        ..RefsSnapshot::default()
     });
     let index = prop_oneof![3 => Just(IndexId::Absent), 1 => oid().prop_map(IndexId::Checksum)];
     // Weighted towards Free so writes get dispatched often.
@@ -199,7 +209,19 @@ fn event() -> impl Strategy<Value = Event> {
         1 => stage_request().prop_map(Event::UnstageRequested),
         3 => ("[a-z ]{0,8}", any::<bool>())
             .prop_map(|(message, amend)| Event::CommitRequested { message, amend }),
-        1 => any::<bool>().prop_map(|force_with_lease| Event::PushRequested { force_with_lease }),
+        2 => (remote_branch(), any::<bool>(), any::<bool>()).prop_map(
+            |(to, force_with_lease, set_upstream)| Event::PushRequested {
+                to,
+                force_with_lease,
+                set_upstream
+            }
+        ),
+        1 => Just(Event::FetchRequested { remote: "origin".into() }),
+        1 => (remote_branch(), any::<bool>()).prop_map(|(from, rebase)| Event::PullRequested {
+            from,
+            mode: if rebase { PullMode::Rebase } else { PullMode::Merge },
+        }),
+        1 => remote_branch().prop_map(|upstream| Event::SetUpstreamRequested { upstream }),
         1 => op_id().prop_map(Event::OpCancelRequested),
         1 => op_id().prop_map(|op| Event::AuthAnswered(op, AuthAnswer("secret".into()))),
         1 => Just(Event::UndoRequested),
@@ -401,6 +423,9 @@ proptest! {
                 Event::UnstageRequested(_) => Action::Unstage,
                 Event::CommitRequested { .. } => Action::Commit,
                 Event::PushRequested { .. } => Action::Push,
+                Event::FetchRequested { .. } => Action::Fetch,
+                Event::PullRequested { .. } => Action::Pull,
+                Event::SetUpstreamRequested { .. } => Action::SetUpstream,
                 Event::UndoRequested => Action::Undo,
                 Event::BranchCreateRequested { .. } => Action::CreateBranch,
                 Event::BranchSwitchRequested(_) => Action::SwitchBranch,
@@ -606,4 +631,408 @@ fn commit_round_trip() {
 fn auth_answer_is_redacted_in_debug_output() {
     let event = Event::AuthAnswered(OpId(0), AuthAnswer("hunter2".into()));
     assert!(!format!("{event:?}").contains("hunter2"));
+}
+
+// Task 17: fetch, pull, push and set-upstream (laws 9, 10, 13).
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Law 10 (core half): a force push is only ever started with a lease
+    /// whose expected value is the remote-tracking value in the snapshot
+    /// the request was made against; a force push without a known remote
+    /// value is refused, and a plain push never carries a lease.
+    #[test]
+    fn force_push_is_leased_against_the_reviewed_value(events in vec(event(), 0..60)) {
+        run(events, |before, event, after, _| {
+            let Event::PushRequested { to, force_with_lease, set_upstream } = event else {
+                return Ok(());
+            };
+            let known = before
+                .snapshot
+                .disk()
+                .and_then(|disk| disk.refs.refs.get(&to.tracking_ref()).cloned());
+            let on_branch = matches!(
+                before.snapshot.disk().map(|disk| &disk.head),
+                Some(Head::Branch { .. })
+            );
+            let queued = after.ops.next.0 == before.ops.next.0 + 1;
+            if !on_branch {
+                prop_assert!(!queued, "pushed without a branch");
+            } else if *force_with_lease && known.is_none() {
+                prop_assert!(!queued, "forced without a remote value");
+                let refused = matches!(
+                    &after.notice,
+                    Some(Notice::Refused { reason: Refusal::NoRemoteValue(_), .. })
+                );
+                prop_assert!(refused);
+            } else {
+                prop_assert!(queued);
+                let request = after
+                    .ops
+                    .queued
+                    .iter()
+                    .map(|op| (op.id, &op.request))
+                    .chain(after.ops.running.iter().map(|op| (op.id, &op.request)))
+                    .find(|(id, _)| *id == before.ops.next)
+                    .map(|(_, request)| request.clone());
+                // Dispatch may already have refused it (lock, branch moved).
+                let Some(request) = request else { return Ok(()) };
+                let WriteRequest::Push { lease, to: pushed, set_upstream: up, .. } = request
+                else {
+                    return Err(TestCaseError::fail("not a push request"));
+                };
+                prop_assert_eq!(&pushed, to);
+                prop_assert_eq!(up, *set_upstream);
+                match (*force_with_lease, lease) {
+                    (true, Some(lease)) => {
+                        prop_assert_eq!(Some(lease.expected), known);
+                        prop_assert_eq!(lease.remote_ref, to.remote_ref());
+                    }
+                    (false, None) => {}
+                    other => return Err(TestCaseError::fail(format!("{other:?}"))),
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    /// Push and pull take an undo marker; fetch and set-upstream do not (they
+    /// move nothing an undo could restore). Pull and push only start on
+    /// the branch they were asked on, and pull only on a clean repo.
+    #[test]
+    fn network_commands_are_well_formed(events in vec(event(), 0..80)) {
+        run(events, |before, _, _, commands| {
+            let points = commands
+                .iter()
+                .filter(|command| matches!(command, Command::SnapshotForUndo(_)))
+                .count();
+            for command in commands {
+                let Command::RunGit { op, args, expect } = command else { continue };
+                match args {
+                    GitArgs::Fetch { .. } | GitArgs::SetUpstream { .. } => {
+                        prop_assert_eq!(points, 0)
+                    }
+                    GitArgs::Push { .. } | GitArgs::Pull { .. } => prop_assert_eq!(points, 1),
+                    _ => {}
+                }
+                let Some(queued) = before.ops.queued.iter().find(|queued| queued.id == *op) else {
+                    continue;
+                };
+                if let (WriteRequest::Pull { local, .. }, GitArgs::Pull { .. })
+                | (WriteRequest::Push { local, .. }, GitArgs::Push { .. }) =
+                    (&queued.request, args)
+                {
+                    let on = matches!(&expect.head, Head::Branch { name, .. } if name == local);
+                    prop_assert!(on, "{expect:?} vs {local:?}");
+                }
+                if matches!(args, GitArgs::Pull { .. }) {
+                    let clean = before
+                        .snapshot
+                        .disk()
+                        .is_some_and(|disk| disk.phase == Phase::Clean);
+                    prop_assert!(clean);
+                }
+            }
+            Ok(())
+        })?;
+    }
+}
+
+fn oid_of(c: char) -> Oid {
+    Oid::from_hex(&c.to_string().repeat(40)).unwrap()
+}
+
+fn read_disk(refs: &[(&str, char)], phase: Phase, head_oid: char) -> DiskState {
+    DiskState {
+        head: Head::Branch {
+            name: BranchName("main".into()),
+            oid: oid_of(head_oid),
+        },
+        phase,
+        index: IndexId::Absent,
+        status: StatusSnapshot::default(),
+        refs: RefsSnapshot {
+            refs: refs
+                .iter()
+                .map(|(name, c)| (RefName((*name).into()), oid_of(*c)))
+                .collect(),
+            ..RefsSnapshot::default()
+        },
+        lock: LockState::Free,
+        stashes: Vec::new(),
+    }
+}
+
+fn opened(disk: DiskState) -> RepoState {
+    let (state, commands) = open(repo_id());
+    let [Command::ReadState { read, .. }] = commands.as_slice() else {
+        panic!("{commands:?}");
+    };
+    step(state, Event::StateRead { read: *read, disk }).0
+}
+
+fn origin_main() -> RemoteBranch {
+    RemoteBranch {
+        remote: "origin".into(),
+        branch: BranchName("main".into()),
+    }
+}
+
+fn push(force_with_lease: bool, set_upstream: bool) -> Event {
+    Event::PushRequested {
+        to: origin_main(),
+        force_with_lease,
+        set_upstream,
+    }
+}
+
+#[test]
+fn force_push_leases_the_snapshot_value() {
+    let state = opened(read_disk(
+        &[("refs/remotes/origin/main", 'b')],
+        Phase::Clean,
+        'a',
+    ));
+    let (state, commands) = step(state, push(true, false));
+    let Some(Command::RunGit { args, .. }) = commands.last() else {
+        panic!("{commands:?}");
+    };
+    assert_eq!(
+        *args,
+        GitArgs::Push {
+            local: BranchName("main".into()),
+            to: origin_main(),
+            lease: Some(Lease {
+                remote_ref: RefName("refs/heads/main".into()),
+                expected: oid_of('b'),
+            }),
+            set_upstream: false,
+        }
+    );
+    assert!(matches!(
+        commands.first(),
+        Some(Command::SnapshotForUndo(_))
+    ));
+    assert!(state.ops.running.is_some());
+}
+
+#[test]
+fn force_push_without_a_known_remote_value_is_refused() {
+    let state = opened(read_disk(&[], Phase::Clean, 'a'));
+    let (state, commands) = step(state, push(true, false));
+    assert!(commands.is_empty());
+    assert_eq!(
+        state.notice,
+        Some(Notice::Refused {
+            action: Action::Push,
+            reason: Refusal::NoRemoteValue(RefName("refs/remotes/origin/main".into()))
+        })
+    );
+    // A plain push of a new branch does not need one.
+    let (_, commands) = step(state, push(false, true));
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        Command::RunGit {
+            args: GitArgs::Push {
+                lease: None,
+                set_upstream: true,
+                ..
+            },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn network_ops_need_a_branch_and_a_read() {
+    let (state, _) = open(repo_id());
+    let (state, _) = step(
+        state,
+        Event::PullRequested {
+            from: origin_main(),
+            mode: PullMode::Merge,
+        },
+    );
+    assert_eq!(
+        state.notice,
+        Some(Notice::Refused {
+            action: Action::Pull,
+            reason: Refusal::NotRead
+        })
+    );
+    // Fetch needs no branch: it is queued and waits for the first read.
+    let (state, commands) = step(
+        state,
+        Event::FetchRequested {
+            remote: "origin".into(),
+        },
+    );
+    assert!(commands.is_empty());
+    assert_eq!(state.ops.queued.len(), 1);
+
+    let mut disk = read_disk(&[], Phase::Clean, 'a');
+    disk.head = Head::Detached(oid_of('a'));
+    let state = opened(disk);
+    let (state, _) = step(state, push(false, false));
+    assert_eq!(
+        state.notice,
+        Some(Notice::Refused {
+            action: Action::Push,
+            reason: Refusal::NoBranch
+        })
+    );
+}
+
+#[test]
+fn pull_is_refused_mid_merge_and_leaves_a_marker_when_done() {
+    let busy = opened(read_disk(
+        &[],
+        Phase::Merging {
+            conflicts: Conflicts::default(),
+        },
+        'a',
+    ));
+    let (busy, commands) = step(
+        busy,
+        Event::PullRequested {
+            from: origin_main(),
+            mode: PullMode::Rebase,
+        },
+    );
+    assert!(commands.is_empty());
+    assert_eq!(
+        busy.notice,
+        Some(Notice::Refused {
+            action: Action::Pull,
+            reason: Refusal::RepoBusy
+        })
+    );
+
+    // On a clean repo the pull runs, and once it succeeds the undo stack
+    // holds a marker an undo stops at.
+    let state = opened(read_disk(&[], Phase::Clean, 'a'));
+    let (state, commands) = step(
+        state,
+        Event::PullRequested {
+            from: origin_main(),
+            mode: PullMode::Merge,
+        },
+    );
+    let op = state.ops.running.as_ref().unwrap().id;
+    assert!(matches!(commands[0], Command::SnapshotForUndo(_)));
+    let (state, _) = step(
+        state,
+        Event::UndoSnapshotTaken {
+            op,
+            tree: oid_of('c'),
+        },
+    );
+    let (state, commands) = step(state, Event::OpFinished(op, OpOutcome::Succeeded));
+    let [Command::ReadState { read, .. }] = commands.as_slice() else {
+        panic!("{commands:?}");
+    };
+    let after = read_disk(&[], Phase::Clean, 'd');
+    let (state, _) = step(
+        state,
+        Event::StateRead {
+            read: *read,
+            disk: after,
+        },
+    );
+    let entry = state.undo.entries.back().expect("a marker");
+    assert_eq!(entry.reversible, Reversible::No(Irreversible::Pull));
+    let (state, _) = step(state, Event::UndoRequested);
+    assert_eq!(
+        state.notice,
+        Some(Notice::Refused {
+            action: Action::Undo,
+            reason: Refusal::NotUndoable(Irreversible::Pull)
+        })
+    );
+}
+
+#[test]
+fn a_rejected_push_is_an_expected_outcome_not_an_error() {
+    let state = opened(read_disk(&[], Phase::Clean, 'a'));
+    let (state, _) = step(state, push(false, false));
+    let op = state.ops.running.as_ref().unwrap().id;
+    let failure = Failure {
+        class: ErrorClass::Expected,
+        details: "[rejected]".into(),
+    };
+    let (state, _) = step(
+        state,
+        Event::OpFinished(op, OpOutcome::Failed(failure.clone())),
+    );
+    assert_eq!(state.notice, Some(Notice::PushRejected { op, failure }));
+    // The failed push left no undo marker.
+    assert!(state.undo.entries.is_empty());
+    assert_eq!(state.undo.pending, UndoPending::Idle);
+}
+
+#[test]
+fn a_queued_push_is_refused_when_the_branch_changed_meanwhile() {
+    // The lock holds the push back; by the time it is free HEAD is elsewhere.
+    let mut locked = read_disk(&[], Phase::Clean, 'a');
+    locked.lock = LockState::HeldByOther;
+    let state = opened(locked.clone());
+    let (state, commands) = step(state, push(false, false));
+    assert!(commands.is_empty());
+    let (state, commands) = step(state, Event::DiskChanged(ChangeSet([Area::Head].into())));
+    let [Command::ReadState { read, .. }] = commands.as_slice() else {
+        panic!("{commands:?}");
+    };
+    let moved = DiskState {
+        head: Head::Branch {
+            name: BranchName("dev".into()),
+            oid: oid_of('a'),
+        },
+        lock: LockState::Free,
+        ..locked
+    };
+    let (state, commands) = step(
+        state,
+        Event::StateRead {
+            read: *read,
+            disk: moved,
+        },
+    );
+    assert!(commands.is_empty(), "{commands:?}");
+    assert_eq!(
+        state.notice,
+        Some(Notice::Refused {
+            action: Action::Push,
+            reason: Refusal::BranchChanged
+        })
+    );
+}
+
+#[test]
+fn a_pushed_branch_leaves_a_marker() {
+    let state = opened(read_disk(&[], Phase::Clean, 'a'));
+    let (state, _) = step(state, push(false, false));
+    let op = state.ops.running.as_ref().unwrap().id;
+    let (state, _) = step(
+        state,
+        Event::UndoSnapshotTaken {
+            op,
+            tree: oid_of('c'),
+        },
+    );
+    let (state, commands) = step(state, Event::OpFinished(op, OpOutcome::Succeeded));
+    let [Command::ReadState { read, .. }] = commands.as_slice() else {
+        panic!("{commands:?}");
+    };
+    let (state, _) = step(
+        state,
+        Event::StateRead {
+            read: *read,
+            disk: read_disk(&[], Phase::Clean, 'a'),
+        },
+    );
+    assert_eq!(
+        state.undo.entries.back().map(|entry| entry.reversible),
+        Some(Reversible::No(Irreversible::Push))
+    );
 }
