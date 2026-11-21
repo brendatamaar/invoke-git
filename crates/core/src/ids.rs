@@ -68,6 +68,67 @@ impl BranchName {
     pub fn to_ref(&self) -> RefName {
         RefName(format!("refs/heads/{}", self.0))
     }
+
+    /// Parses a name typed by the user (task 15). The rules are those of
+    /// `git check-ref-format --branch`, made a little stricter where git
+    /// would accept something nobody means (a leading `-`, the name `HEAD`).
+    /// Anything accepted here is accepted by git.
+    pub fn parse(text: &str) -> Result<Self, NameProblem> {
+        check_branch_name(text)?;
+        Ok(Self(text.to_owned()))
+    }
+}
+
+/// Why a string is not a usable branch name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameProblem {
+    Empty,
+    /// `HEAD` is git's own name for the current commit.
+    Reserved,
+    /// Starts with `-`: it would be read as an option.
+    LeadingDash,
+    /// Starts or ends with `/`, or has an empty part (`a//b`).
+    BadSlash,
+    /// A part starts with `.` or ends with `.lock`, or the name has `..`
+    /// or ends with `.`.
+    BadDot,
+    /// Has `@{`, or is just `@`.
+    BadAt,
+    /// A control character, space, or one of `~ ^ : ? * [ \\`.
+    BadCharacter,
+}
+
+fn check_branch_name(text: &str) -> Result<(), NameProblem> {
+    if text.is_empty() {
+        return Err(NameProblem::Empty);
+    }
+    if text == "HEAD" {
+        return Err(NameProblem::Reserved);
+    }
+    if text.starts_with('-') {
+        return Err(NameProblem::LeadingDash);
+    }
+    if text
+        .chars()
+        .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        return Err(NameProblem::BadCharacter);
+    }
+    if text == "@" || text.contains("@{") {
+        return Err(NameProblem::BadAt);
+    }
+    if text.split('/').any(str::is_empty) {
+        return Err(NameProblem::BadSlash);
+    }
+    if text.contains("..")
+        || text.ends_with('.')
+        || text
+            .split('/')
+            .any(|part| part.starts_with('.') || part.ends_with(".lock"))
+    {
+        return Err(NameProblem::BadDot);
+    }
+    Ok(())
 }
 
 /// A path relative to the worktree root, with `/` separators on every
@@ -96,7 +157,48 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// An independent statement of what makes a name unusable.
+    fn forbidden(text: &str) -> bool {
+        text.is_empty()
+            || text == "HEAD"
+            || text == "@"
+            || text.starts_with('-')
+            || text.starts_with('/')
+            || text.ends_with('/')
+            || text.ends_with('.')
+            || text.contains("//")
+            || text.contains("..")
+            || text.contains("@{")
+            || text
+                .chars()
+                .any(|c| c.is_control() || " ~^:?*[\\".contains(c))
+            || text
+                .split('/')
+                .any(|part| part.starts_with('.') || part.ends_with(".lock"))
+    }
+
     proptest! {
+        /// Names drawn from the awkward characters: accepted exactly when
+        /// none of git's rules is broken.
+        #[test]
+        fn branch_names_follow_the_ref_format_rules(
+            text in "[a-c./@{}~^:?*\\[ \\-]{0,8}(\\.lock)?"
+        ) {
+            prop_assert_eq!(BranchName::parse(&text).is_err(), forbidden(&text));
+        }
+
+        /// The same, over letters, dots, slashes and dashes only, where most
+        /// names are valid and the dot and slash rules decide.
+        #[test]
+        fn dotted_and_slashed_names_follow_the_rules(text in "[a-c./-]{0,8}(\\.lock)?") {
+            prop_assert_eq!(BranchName::parse(&text).is_err(), forbidden(&text));
+        }
+
+        #[test]
+        fn plain_names_always_parse(text in "[a-z0-9]{1,8}(/[a-z0-9_-]{1,8}){0,3}") {
+            prop_assert_eq!(BranchName::parse(&text).unwrap().0, text);
+        }
+
         #[test]
         fn hex_ids_of_valid_length_parse_and_round_trip(
             hex in "[0-9a-fA-F]{40}|[0-9a-fA-F]{64}"

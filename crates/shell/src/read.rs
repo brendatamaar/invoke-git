@@ -8,8 +8,8 @@ use std::path::Path;
 
 use invoke_core::detect::{Markers, RebaseFiles, detect_phase};
 use invoke_core::{
-    Command, Conflicts, DiskState, ErrorClass, Event, Failure, LockState, ReadId, RefName,
-    RefsSnapshot, RepoPath,
+    BranchName, Command, Conflicts, DiskState, ErrorClass, Event, Failure, LockState, ReadId,
+    RefName, RefsSnapshot, RepoPath, Tracking, Upstream,
 };
 
 use crate::precondition::{self, RepoPaths};
@@ -126,5 +126,73 @@ fn read_refs(repo: &gix::Repository) -> Result<RefsSnapshot, String> {
         };
         refs.insert(RefName(name), precondition::oid(&id)?);
     }
-    Ok(RefsSnapshot { refs })
+    let upstreams = read_upstreams(repo, &refs)?;
+    Ok(RefsSnapshot { refs, upstreams })
+}
+
+/// Each local branch's configured upstream and how far apart the two are.
+/// Branches without one are left out. The counts are commits only on the
+/// branch (ahead) and only on the upstream (behind).
+fn read_upstreams(
+    repo: &gix::Repository,
+    refs: &BTreeMap<RefName, invoke_core::Oid>,
+) -> Result<BTreeMap<BranchName, Upstream>, String> {
+    let mut upstreams = BTreeMap::new();
+    for (name, tip) in refs {
+        let Some(short) = name.0.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        let Ok(full) = gix::refs::FullName::try_from(name.0.as_str()) else {
+            continue;
+        };
+        let Some(Ok(tracking)) =
+            repo.branch_remote_tracking_ref_name(full.as_ref(), gix::remote::Direction::Fetch)
+        else {
+            continue;
+        };
+        let upstream_ref = RefName(tracking.as_bstr().to_string());
+        let counts = match refs.get(&upstream_ref) {
+            None => Tracking::Gone,
+            Some(up) => {
+                let tip = gix::ObjectId::from_hex(tip.as_hex().as_bytes())
+                    .map_err(|error| format!("{name:?}: {error}"))?;
+                let up = gix::ObjectId::from_hex(up.as_hex().as_bytes())
+                    .map_err(|error| format!("{upstream_ref:?}: {error}"))?;
+                Tracking::Apart {
+                    ahead: count_only_on(repo, tip, up)?,
+                    behind: count_only_on(repo, up, tip)?,
+                }
+            }
+        };
+        upstreams.insert(
+            BranchName(short.to_owned()),
+            Upstream {
+                name: upstream_ref,
+                tracking: counts,
+            },
+        );
+    }
+    Ok(upstreams)
+}
+
+/// Commits reachable from `tip` but not from `other`.
+fn count_only_on(
+    repo: &gix::Repository,
+    tip: gix::ObjectId,
+    other: gix::ObjectId,
+) -> Result<u32, String> {
+    if tip == other {
+        return Ok(0);
+    }
+    let walk = repo
+        .rev_walk([tip])
+        .with_hidden([other])
+        .all()
+        .map_err(|error| format!("walk history: {error}"))?;
+    let mut count = 0u32;
+    for commit in walk {
+        commit.map_err(|error| format!("walk history: {error}"))?;
+        count = count.saturating_add(1);
+    }
+    Ok(count)
 }

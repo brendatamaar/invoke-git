@@ -13,6 +13,8 @@ const MARKERS: [(ErrorClass, &[&str]); 4] = [
             "index.lock': File exists",
             "Unable to create '",
             "cannot lock ref",
+            // The core checked the name was free; someone took it since.
+            "a branch named '",
         ],
     ),
     (
@@ -53,9 +55,29 @@ const MARKERS: [(ErrorClass, &[&str]); 4] = [
             "non-fast-forward",
             "CONFLICT",
             "Automatic merge failed",
+            // Branches (task 15): git refuses before it changes anything.
+            "is not fully merged",
+            "would be overwritten",
+            "Please commit your changes or stash them",
+            "resolve your current index first",
+            "used by worktree at",
+            "checked out at",
+            "is already checked out",
+            "not a valid object name",
+            "not a commit",
+            "not a valid branch point",
+            "reference is not a tree",
+            "invalid reference",
         ],
     ),
 ];
+
+/// Whether a failed `git branch -d` was refused because the branch holds
+/// commits that are not merged anywhere else. The UI then offers a forced
+/// delete (`DeleteBranch { force: true }`).
+pub fn is_unmerged_refusal(details: &str) -> bool {
+    details.contains("is not fully merged")
+}
 
 /// git's stdout and stderr together: some messages (`nothing to commit`)
 /// go to stdout.
@@ -124,6 +146,22 @@ mod tests {
                 Expected,
             ),
             ("fatal: repository '/nope' does not exist", Expected),
+            (
+                "error: the branch 'x' is not fully merged.\nIf you are sure you want to delete it, run 'git branch -D x'",
+                Expected,
+            ),
+            (
+                "error: Your local changes to the following files would be overwritten by checkout:\n\ta.txt",
+                Expected,
+            ),
+            (
+                "fatal: a branch named 'x' already exists",
+                PreconditionChanged,
+            ),
+            (
+                "error: cannot delete branch 'x' used by worktree at '/w'",
+                Expected,
+            ),
             ("fatal: something nobody expected", Bug),
         ];
         for (output, expected) in cases {

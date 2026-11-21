@@ -480,6 +480,7 @@ fn snapshot_keeps_a_tree_alive_without_touching_the_index() {
         head: invoke_core::HeadTarget::Branch(invoke_core::BranchName("main".into())),
         refs: vec![],
         index: disk_before.index.clone(),
+        index_effect: invoke_core::IndexEffect::Rewrites,
     };
 
     let Snapshotted::Taken(Event::UndoSnapshotTaken { op, tree }) = driver.undo.snapshot(&point)
@@ -532,6 +533,8 @@ fn replay_refuses_when_a_ref_is_not_where_planned() {
             restore: Some(oid(&first)),
         }],
         tree: oid(&tree),
+        index_effect: invoke_core::IndexEffect::Rewrites,
+        head: None,
         expect: precondition::current(&repo.paths).unwrap(),
     };
 
@@ -574,6 +577,8 @@ fn replay_refuses_a_stale_expect() {
             restore: Some(Oid::from_hex(&head).unwrap()),
         }],
         tree: Oid::from_hex(&tree).unwrap(),
+        index_effect: invoke_core::IndexEffect::Rewrites,
+        head: None,
         expect: stale,
     });
     assert!(matches!(

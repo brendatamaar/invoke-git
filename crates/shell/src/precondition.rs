@@ -6,7 +6,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use invoke_core::{BranchName, ErrorClass, Expect, Failure, Head, IndexId, Oid};
+use invoke_core::{BranchName, ErrorClass, Expect, Failure, Head, IndexId, Oid, RefValue};
 
 /// Where a repo lives. For a linked worktree `git_dir` is the worktree's own
 /// git dir, which holds its `HEAD`, `index` and `index.lock`.
@@ -133,6 +133,41 @@ pub fn check(paths: &RepoPaths, expect: &Expect) -> Result<(), Failure> {
             "index changed: expected {:?}, found {:?}",
             expect.index, found.index
         )));
+    }
+    Ok(())
+}
+
+/// Refuses a write when a ref it names is not where the core saw it (`None`:
+/// not there at all). Read through gix, fresh.
+pub fn check_refs(paths: &RepoPaths, expected: &[RefValue]) -> Result<(), Failure> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let bug = |details: String| Failure {
+        class: ErrorClass::Bug,
+        details,
+    };
+    let repo = open(paths).map_err(bug)?;
+    for item in expected {
+        let found = match repo.try_find_reference(item.name.0.as_str()) {
+            Ok(Some(mut reference)) => {
+                let id = reference
+                    .peel_to_id()
+                    .map_err(|error| bug(format!("read {}: {error}", item.name.0)))?;
+                Some(oid(&id).map_err(bug)?)
+            }
+            Ok(None) => None,
+            Err(error) => return Err(bug(format!("read {}: {error}", item.name.0))),
+        };
+        if found != item.oid {
+            return Err(Failure {
+                class: ErrorClass::PreconditionChanged,
+                details: format!(
+                    "{} moved: expected {:?}, found {:?}",
+                    item.name.0, item.oid, found
+                ),
+            });
+        }
     }
     Ok(())
 }

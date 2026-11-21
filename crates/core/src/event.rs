@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName};
 use crate::ops::{
-    AuthAnswer, AuthPrompt, Failure, GitArgs, OpOutcome, Patch, Progress, StageRequest,
+    AuthAnswer, AuthPrompt, BranchStart, Failure, GitArgs, OpOutcome, Patch, Progress, StageRequest,
 };
 use crate::state::{DiskState, Head};
 use crate::undo::UndoReplay;
@@ -24,6 +24,22 @@ pub enum Event {
     OpCancelRequested(OpId),
     AuthAnswered(OpId, AuthAnswer),
     UndoRequested,
+    // Task 15: branches. Names typed by the user are parsed here, in the
+    // core; a bad one is refused at once.
+    BranchCreateRequested {
+        name: String,
+        at: BranchStart,
+        switch: bool,
+    },
+    BranchSwitchRequested(BranchName),
+    BranchRenameRequested {
+        from: BranchName,
+        to: String,
+    },
+    BranchDeleteRequested {
+        name: BranchName,
+        force: bool,
+    },
     RefreshRequested,
     NoticeDismissed,
     // From the shell.
@@ -127,6 +143,18 @@ pub struct UndoPoint {
     pub head: HeadTarget,
     pub refs: Vec<RefValue>,
     pub index: IndexId,
+    /// Whether the operation rewrites the index (task 15: creating,
+    /// renaming and deleting a branch do not).
+    pub index_effect: IndexEffect,
+}
+
+/// Whether an operation changes the index, and so whether undoing it must
+/// put the saved index back. An undo that leaves the index alone never
+/// clobbers staging done since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexEffect {
+    Rewrites,
+    Untouched,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

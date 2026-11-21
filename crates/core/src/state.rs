@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName, RepoId, RepoPath};
+use crate::ids::{BranchName, IndexId, NameProblem, Oid, OpId, ReadId, RefName, RepoId, RepoPath};
 use crate::ops::{AuthPrompt, Failure, OpOutcome, Progress, WriteRequest};
 use crate::undo::{Irreversible, UndoStack};
 
@@ -177,11 +177,30 @@ pub enum FileChange {
     Untracked,
 }
 
-/// Every ref and the object it points at. Task 15 adds upstreams and
-/// ahead/behind counts.
+/// Every ref and the object it points at, and each local branch's upstream
+/// with how far apart they are.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RefsSnapshot {
     pub refs: BTreeMap<RefName, Oid>,
+    /// Only branches that have an upstream configured (task 15).
+    pub upstreams: BTreeMap<BranchName, Upstream>,
+}
+
+/// The branch a local branch tracks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Upstream {
+    /// For example `refs/remotes/origin/main`.
+    pub name: RefName,
+    pub tracking: Tracking,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tracking {
+    /// The upstream is configured but its ref does not exist (deleted on
+    /// the remote and pruned, or never fetched).
+    Gone,
+    /// Commits only on the branch, and only on the upstream.
+    Apart { ahead: u32, behind: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +261,11 @@ pub enum Action {
     Commit,
     Push,
     Undo,
+    // Task 15.
+    CreateBranch,
+    SwitchBranch,
+    RenameBranch,
+    DeleteBranch,
 }
 
 /// Why a request was turned down. Every refusal states one.
@@ -264,6 +288,27 @@ pub enum Refusal {
     Changed(UndoMoved),
     /// A merge, rebase, cherry-pick or revert is in progress.
     RepoBusy,
+    /// A branch request that cannot run on the snapshot it was checked
+    /// against (task 15).
+    Branch(BranchRefusal),
+}
+
+/// Why a branch request was turned down (task 15).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchRefusal {
+    InvalidName(NameProblem),
+    /// `HEAD` names a branch with no commits: nothing to start from, switch
+    /// to or rename.
+    NoCommitsYet,
+    AlreadyExists(BranchName),
+    /// A branch whose name is a folder of the new one or the other way
+    /// round (`a` and `a/b` cannot both exist).
+    NameConflict(BranchName),
+    NoSuchBranch(BranchName),
+    /// Switching to, or deleting, the branch that is checked out.
+    IsCurrent(BranchName),
+    /// Renaming a branch to its own name.
+    SameName,
 }
 
 /// What moved since the operation, as found when an undo was planned.

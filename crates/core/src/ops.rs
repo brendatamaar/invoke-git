@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-use crate::ids::{IndexId, RepoPath};
+use crate::event::RefValue;
+use crate::ids::{BranchName, IndexId, Oid, RepoPath};
 
 /// A write the user asked for, waiting in or running from the op queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,13 +17,96 @@ pub enum WriteRequest {
     // Task 11: index writes from the status tree.
     Stage(StageRequest),
     Unstage(StageRequest),
+    // Task 15: branches. Checked against the fresh snapshot at dispatch.
+    CreateBranch {
+        name: BranchName,
+        at: BranchStart,
+        /// Also make it the current branch (`git switch -c`).
+        switch: bool,
+    },
+    SwitchBranch {
+        name: BranchName,
+    },
+    RenameBranch {
+        from: BranchName,
+        to: BranchName,
+    },
+    DeleteBranch {
+        name: BranchName,
+        /// Delete even if the branch is not fully merged.
+        force: bool,
+    },
+}
+
+impl WriteRequest {
+    /// Writes that take an undo point before they run.
+    pub fn takes_undo_point(&self) -> bool {
+        !matches!(self, WriteRequest::Undo)
+    }
+}
+
+/// Where a new branch starts (task 15).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchStart {
+    /// The commit `HEAD` is on now, which is also how a detached `HEAD` is
+    /// left by creating a branch.
+    Head,
+    Commit(Oid),
 }
 
 /// Typed git invocation. The shell turns it into argv (task 4); keeping it
 /// typed here lets tests check what the core asked for without parsing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitArgs {
-    Commit { message: String, amend: bool },
+    Commit {
+        message: String,
+        amend: bool,
+    },
+    // Task 15: branches. Each carries the ref values it expects; the shell
+    // refuses the run when disk differs (see `GitArgs::expected_refs`).
+    CreateBranch {
+        name: BranchName,
+        at: Oid,
+        switch: bool,
+    },
+    SwitchBranch {
+        name: BranchName,
+        /// Where the branch is now.
+        tip: Oid,
+    },
+    RenameBranch {
+        from: BranchName,
+        /// Where `from` is now.
+        tip: Oid,
+        to: BranchName,
+    },
+    DeleteBranch {
+        name: BranchName,
+        /// Where the branch is now.
+        tip: Oid,
+        force: bool,
+    },
+}
+
+impl GitArgs {
+    /// The refs this run expects to find, besides `HEAD` and the index
+    /// (rule 5). `oid: None` means the ref must not exist.
+    pub fn expected_refs(&self) -> Vec<RefValue> {
+        let at = |name: &BranchName, oid: Option<&Oid>| RefValue {
+            name: name.to_ref(),
+            oid: oid.cloned(),
+        };
+        match self {
+            GitArgs::Commit { .. } => Vec::new(),
+            GitArgs::CreateBranch { name, .. } => vec![at(name, None)],
+            GitArgs::SwitchBranch { name, tip } | GitArgs::DeleteBranch { name, tip, .. } => {
+                vec![at(name, Some(tip))]
+            }
+            GitArgs::RenameBranch { from, tip, to } => {
+                vec![at(from, Some(tip)), at(to, None)]
+            }
+        }
+    }
 }
 
 /// Progress parsed from git's stderr, e.g. `Receiving objects: 45% (9/20)`.
