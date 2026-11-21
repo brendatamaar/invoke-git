@@ -86,6 +86,19 @@ The spike answers one question in 1–2 weekends: can GPUI render a huge diff an
 
 Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are in dependency order, so working top to bottom never blocks.
 
+**Early start (decided 2026-11-21):** the Phase 0 gate's manual runs are on hold, and v0.1 core work starts before the gate closes. A failed gate keeps the same Rust core (see Gate rules), so that work is safe either way.
+
+- **May start now, on the VPS:**
+  - pure tasks 3, 4, 5, 6, 8, 9, 12 and 24
+  - the core (non-GPUI) halves of tasks 11, 13, 14, 15, 16, 17, 20 and 23
+  - the lane layout and paging in 18
+  - the `tokens` crate in 2
+  - the diff and graph benchmarks in 25
+- **Waits for the gate to pass:**
+  - every GPUI crate and screen: task 2's component layer, tasks 7, 10, 19 and 21, and the UI halves of the mixed tasks
+  - task 26
+- **Status of a split task:** mark it "Core done" until its UI half lands.
+
 | # | Task | Area | Depends on | Status |
 | --- | --- | --- | --- | --- |
 | 1 | Cargo workspace, CI (Windows build; core tests on Linux and macOS), license, README | Foundation | — | Done |
