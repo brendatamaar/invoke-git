@@ -1,0 +1,10 @@
+[package]
+name = "tokens"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description = "Design tokens generated from docs/design/tokens.json. Plain Rust consts, no GPUI."
+build = "build.rs"
+
+[dev-dependencies]
+proptest.workspace = true
