@@ -1,0 +1,22 @@
+[package]
+name = "askpass"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description = "The GIT_ASKPASS / SSH_ASKPASS helper: asks the app for an answer over a local pipe. std only."
+
+[lib]
+name = "askpass"
+
+[[bin]]
+name = "askpass"
+path = "src/main.rs"
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
+# git runs the helper, so the end-to-end tests need the shell and the core.
+# Cargo allows a dev-dependency cycle: shell depends on this crate's library.
+shell = { path = "../shell" }
+invoke-core = { path = "../core" }

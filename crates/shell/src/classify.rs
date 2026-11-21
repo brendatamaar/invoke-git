@@ -41,6 +41,10 @@ const MARKERS: [(ErrorClass, &[&str]); 4] = [
     (
         ErrorClass::Expected,
         &[
+            "already exists and is not an empty directory",
+            "does not appear to be a git repository",
+            "does not exist",
+            "Repository not found",
             "nothing to commit",
             "no changes added to commit",
             "nothing added to commit",
@@ -115,6 +119,11 @@ mod tests {
                 Expected,
             ),
             ("CONFLICT (content): Merge conflict in a.txt", Expected),
+            (
+                "fatal: destination path '/w/r' already exists and is not an empty directory.",
+                Expected,
+            ),
+            ("fatal: repository '/nope' does not exist", Expected),
             ("fatal: something nobody expected", Bug),
         ];
         for (output, expected) in cases {

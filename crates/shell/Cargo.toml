@@ -7,6 +7,7 @@ description = "IO for Invoke Git: runs the core's commands through gix and the g
 
 [dependencies]
 invoke-core = { path = "../core" }
+askpass = { path = "../askpass" }
 gix = { workspace = true, features = ["index", "excludes"] }
 notify = "8"
 
@@ -14,6 +15,9 @@ notify = "8"
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
     "Win32_System_JobObjects",
 ] }
 
