@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask", "crates/spike-diff", "crates/spike-graph"]
+members = ["xtask", "crates/core", "crates/spike-diff", "crates/spike-graph"]
 resolver = "3"
 
 [workspace.package]
@@ -9,6 +9,7 @@ publish = false
 # GPUI is pinned to one Zed commit; README.md records the revision and why.
 # Update it only when asked, in its own commit (AGENTS.md rule 8).
 [workspace.dependencies]
+proptest = "1.9"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "2de9e435a5d98657f35c260b5f4dd0979df659e6" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "2de9e435a5d98657f35c260b5f4dd0979df659e6" }
 
