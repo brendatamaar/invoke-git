@@ -7,7 +7,12 @@ use crate::ids::RepoPath;
 /// A write the user asked for, waiting in or running from the op queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteRequest {
-    Commit { message: String, amend: bool },
+    Commit {
+        message: String,
+        amend: bool,
+    },
+    /// Reverse the newest undo point.
+    Undo,
 }
 
 /// Typed git invocation. The shell turns it into argv (task 4); keeping it

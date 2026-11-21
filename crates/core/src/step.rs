@@ -1,12 +1,15 @@
 //! The pure transition function.
 
-use crate::event::{ChangeSet, Command, Event, Expect, ReadScope, RefValue, UndoPoint};
+use std::mem;
+
+use crate::event::{ChangeSet, Command, Event, Expect, HeadTarget, ReadScope, RefValue, UndoPoint};
 use crate::ids::{OpId, ReadId, RefName, RepoId};
 use crate::ops::{GitArgs, OpOutcome, WriteRequest};
 use crate::state::{
     Action, DiskState, Freshness, Head, LockState, Notice, OpPhase, QueuedOp, Refusal, RepoState,
     RunningOp, Snapshot,
 };
+use crate::undo::{self, Reversible, UndoEntry, UndoPending};
 
 /// Opens a repo: the initial state plus the first full read.
 pub fn open(id: RepoId) -> (RepoState, Vec<Command>) {
@@ -25,7 +28,18 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         Event::StageRequested(_) => refuse(&mut state, Action::Stage, 11),
         Event::UnstageRequested(_) => refuse(&mut state, Action::Unstage, 11),
         Event::PushRequested { .. } => refuse(&mut state, Action::Push, 17),
-        Event::UndoRequested => refuse(&mut state, Action::Undo, 12),
+        Event::UndoRequested => match state.undo.top() {
+            Ok(_) => enqueue(&mut state, WriteRequest::Undo),
+            Err(reason) => refuse_because(&mut state, Action::Undo, reason),
+        },
+        Event::UndoSnapshotTaken { op, tree } => {
+            if let UndoPending::Recording { point } = &state.undo.pending
+                && point.op == op
+            {
+                let point = point.clone();
+                state.undo.pending = UndoPending::Taken { point, tree };
+            }
+        }
         Event::CommitRequested { message, amend } => {
             enqueue(&mut state, WriteRequest::Commit { message, amend });
         }
@@ -46,7 +60,7 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
                 request_read(&mut state, ReadScope(areas), &mut commands);
             }
         }
-        Event::StateRead { read, disk } => apply_read(&mut state, read, disk),
+        Event::StateRead { read, disk } => apply_read(&mut state, read, disk, &mut commands),
         Event::ReadFailed { read, failure } => {
             if let Freshness::Pending { latest } = state.reads.freshness
                 && latest == read
@@ -70,8 +84,14 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
             }
         }
         Event::OpFinished(op, outcome) => {
-            if running_mut(&mut state, op).is_some() {
-                state.ops.running = None;
+            if let Some(running) = state.ops.running.take_if(|running| running.id == op) {
+                finish_undo(
+                    &mut state,
+                    op,
+                    &running.request,
+                    outcome == OpOutcome::Succeeded,
+                    &mut commands,
+                );
                 state.notice = Some(Notice::OpEnded { op, outcome });
                 // Law 13: whatever happened, the next write starts from disk.
                 request_read(&mut state, ReadScope::full(), &mut commands);
@@ -83,10 +103,11 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
 }
 
 fn refuse(state: &mut RepoState, action: Action, task: u8) {
-    state.notice = Some(Notice::Refused {
-        action,
-        reason: Refusal::NotYetSupported { task },
-    });
+    refuse_because(state, action, Refusal::NotYetSupported { task });
+}
+
+fn refuse_because(state: &mut RepoState, action: Action, reason: Refusal) {
+    state.notice = Some(Notice::Refused { action, reason });
 }
 
 fn enqueue(state: &mut RepoState, request: WriteRequest) {
@@ -127,7 +148,7 @@ fn request_read(state: &mut RepoState, scope: ReadScope, commands: &mut Vec<Comm
 
 /// Reads are numbered in request order, so a read that lands after a newer
 /// one has already been applied is older than the snapshot: drop it.
-fn apply_read(state: &mut RepoState, read: ReadId, disk: DiskState) {
+fn apply_read(state: &mut RepoState, read: ReadId, disk: DiskState, commands: &mut Vec<Command>) {
     if read >= state.reads.next {
         return; // never requested
     }
@@ -144,52 +165,142 @@ fn apply_read(state: &mut RepoState, read: ReadId, disk: DiskState) {
     };
     if read >= latest {
         state.reads.freshness = Freshness::Fresh;
+        settle_undo(state, commands);
     }
+}
+
+/// An operation or an undo finished and the read that follows it has landed:
+/// now the stack can learn what the operation left behind.
+fn settle_undo(state: &mut RepoState, commands: &mut Vec<Command>) {
+    let Some(disk) = state.snapshot.disk().cloned() else {
+        return;
+    };
+    match mem::take(&mut state.undo.pending) {
+        UndoPending::Settling { point, tree } => {
+            let after_refs = point
+                .refs
+                .iter()
+                .map(|before| RefValue {
+                    name: before.name.clone(),
+                    oid: undo::current_value(&disk, &before.name),
+                })
+                .collect();
+            let pruned = state.undo.push(UndoEntry {
+                point,
+                tree,
+                after_refs,
+                after_index: disk.index,
+                reversible: Reversible::Yes,
+            });
+            prune(pruned, commands);
+        }
+        UndoPending::Rewinding => {
+            if let Some(top) = state.undo.entries.back_mut() {
+                top.after_index = disk.index;
+            }
+        }
+        other => state.undo.pending = other,
+    }
+}
+
+fn prune(ops: Vec<OpId>, commands: &mut Vec<Command>) {
+    if !ops.is_empty() {
+        commands.push(Command::PruneUndo(ops));
+    }
+}
+
+/// The running operation ended: decide what its undo point becomes.
+fn finish_undo(
+    state: &mut RepoState,
+    op: OpId,
+    request: &WriteRequest,
+    succeeded: bool,
+    commands: &mut Vec<Command>,
+) {
+    let pending = mem::take(&mut state.undo.pending);
+    state.undo.pending = match (pending, request, succeeded) {
+        (UndoPending::Taken { point, tree }, WriteRequest::Commit { .. }, true) => {
+            UndoPending::Settling { point, tree }
+        }
+        (UndoPending::Replaying { entry }, WriteRequest::Undo, true) => {
+            prune(vec![entry.point.op], commands);
+            UndoPending::Rewinding
+        }
+        (UndoPending::Replaying { entry }, WriteRequest::Undo, false) => {
+            state.undo.entries.push_back(entry);
+            UndoPending::Idle
+        }
+        // Failed or cancelled, or the shell never reported the snapshot:
+        // there is nothing to undo, and whatever was saved is dropped.
+        (UndoPending::Recording { .. } | UndoPending::Taken { .. }, _, _) => {
+            prune(vec![op], commands);
+            UndoPending::Idle
+        }
+        (other, _, _) => other,
+    };
 }
 
 /// Starts the next queued write when nothing else is writing, the snapshot
 /// is fresh and nobody else holds `index.lock` (law 12).
+///
+/// An undo is planned here, against the snapshot the write will run on, so
+/// it is refused when anything moved since the operation it reverses.
 fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
-    if state.ops.running.is_some() || state.ops.queued.is_empty() {
-        return;
-    }
-    let Some(disk) = state.fresh_disk() else {
-        return;
-    };
-    if disk.lock != LockState::Free {
-        return;
-    }
-    let expect = Expect {
-        head: disk.head.clone(),
-        index: disk.index.clone(),
-    };
-    let head_ref = head_ref(&disk.head);
-    let Some(QueuedOp { id, request }) = state.ops.queued.pop_front() else {
-        return;
-    };
-    match &request {
-        WriteRequest::Commit { message, amend } => {
-            commands.push(Command::SnapshotForUndo(UndoPoint {
-                op: id,
-                label: commit_label(message, *amend),
-                refs: vec![head_ref],
-                index: expect.index.clone(),
-            }));
-            commands.push(Command::RunGit {
-                op: id,
-                args: GitArgs::Commit {
-                    message: message.clone(),
-                    amend: *amend,
-                },
-                expect,
-            });
+    // A refused undo ends right here, so the next queued write may start.
+    while state.ops.running.is_none() && !state.ops.queued.is_empty() {
+        let Some(disk) = state.fresh_disk() else {
+            return;
+        };
+        if disk.lock != LockState::Free {
+            return;
         }
+        let expect = Expect {
+            head: disk.head.clone(),
+            index: disk.index.clone(),
+        };
+        let disk = disk.clone();
+        let Some(QueuedOp { id, request }) = state.ops.queued.pop_front() else {
+            return;
+        };
+        match &request {
+            WriteRequest::Commit { message, amend } => {
+                let point = UndoPoint {
+                    op: id,
+                    label: commit_label(message, *amend),
+                    head: HeadTarget::of(&disk.head),
+                    refs: vec![head_ref(&disk.head)],
+                    index: expect.index.clone(),
+                };
+                commands.push(Command::SnapshotForUndo(point.clone()));
+                commands.push(Command::RunGit {
+                    op: id,
+                    args: GitArgs::Commit {
+                        message: message.clone(),
+                        amend: *amend,
+                    },
+                    expect,
+                });
+                state.undo.pending = UndoPending::Recording { point };
+            }
+            WriteRequest::Undo => match undo::plan(&state.undo, &disk, id) {
+                Ok(replay) => {
+                    if let Some(entry) = state.undo.entries.pop_back() {
+                        state.undo.pending = UndoPending::Replaying { entry };
+                    }
+                    commands.push(Command::ReplayUndo(replay));
+                }
+                Err(reason) => {
+                    refuse_because(state, Action::Undo, reason);
+                    continue;
+                }
+            },
+        }
+        state.ops.running = Some(RunningOp {
+            id,
+            request,
+            phase: OpPhase::Running { progress: None },
+        });
     }
-    state.ops.running = Some(RunningOp {
-        id,
-        request,
-        phase: OpPhase::Running { progress: None },
-    });
 }
 
 /// The ref a commit moves: the current branch, or `HEAD` itself when

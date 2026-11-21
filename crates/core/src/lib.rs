@@ -11,9 +11,12 @@ pub mod ids;
 pub mod ops;
 pub mod state;
 mod step;
+pub mod undo;
 pub mod watch;
 
-pub use event::{Area, ChangeSet, Command, Event, Expect, ReadScope, RefValue, UndoPoint};
+pub use event::{
+    Area, ChangeSet, Command, Event, Expect, HeadTarget, ReadScope, RefValue, UndoPoint,
+};
 pub use ids::{BranchName, IndexId, Oid, OidError, OpId, ReadId, RefName, RepoId, RepoPath};
 pub use ops::{
     AuthAnswer, AuthKind, AuthPrompt, ErrorClass, Failure, GitArgs, OpOutcome, Patch, Progress,
@@ -22,6 +25,9 @@ pub use ops::{
 pub use state::{
     Action, Conflicts, DiskState, FileChange, Freshness, Head, LockState, Notice, OpPhase, OpQueue,
     Phase, QueuedOp, Reads, RefsSnapshot, Refusal, RepoState, RunningOp, Snapshot, StatusEntry,
-    StatusSnapshot,
+    StatusSnapshot, UndoMoved,
 };
 pub use step::{open, step};
+pub use undo::{
+    Irreversible, MAX_POINTS, RestoreRef, Reversible, UndoEntry, UndoPending, UndoReplay, UndoStack,
+};

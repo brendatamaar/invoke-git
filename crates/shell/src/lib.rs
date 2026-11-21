@@ -13,6 +13,7 @@ pub mod progress;
 pub mod read;
 pub mod runner;
 mod tree;
+pub mod undo;
 pub mod watch;
 
 pub use clone::CloneRunner;
@@ -21,4 +22,5 @@ pub use git::{Git, GitVersion, SetupError};
 pub use precondition::RepoPaths;
 pub use read::{execute as execute_read, read_state};
 pub use runner::GitRunner;
+pub use undo::UndoRunner;
 pub use watch::{RepoWatcher, WatchError};

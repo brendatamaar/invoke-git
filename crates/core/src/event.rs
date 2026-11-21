@@ -2,9 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::ids::{IndexId, Oid, OpId, ReadId, RefName};
+use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName};
 use crate::ops::{AuthAnswer, AuthPrompt, Failure, GitArgs, OpOutcome, Patch, Progress, Selection};
 use crate::state::{DiskState, Head};
+use crate::undo::UndoReplay;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -38,6 +39,13 @@ pub enum Event {
     OpProgress(OpId, Progress),
     AuthNeeded(OpId, AuthPrompt),
     OpFinished(OpId, OpOutcome),
+    /// The shell saved the index tree for the point of `op`
+    /// (`Command::SnapshotForUndo`). A failed snapshot is reported as
+    /// `OpFinished(op, Failed(..))` and the write is not run.
+    UndoSnapshotTaken {
+        op: OpId,
+        tree: Oid,
+    },
 }
 
 /// Part of the repo a change touched. The watcher (task 6) maps paths to
@@ -90,11 +98,31 @@ pub struct RefValue {
     pub oid: Option<Oid>,
 }
 
-/// Everything needed to undo one operation (task 12 replays these).
+/// Which kind of `HEAD` the operation started from. Undo refuses when the
+/// user has switched branches since, so it never rewrites another branch's
+/// index. An unborn branch counts as its branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadTarget {
+    Branch(BranchName),
+    Detached,
+}
+
+impl HeadTarget {
+    pub fn of(head: &Head) -> Self {
+        match head {
+            Head::Branch { name, .. } | Head::Unborn(name) => HeadTarget::Branch(name.clone()),
+            Head::Detached(_) => HeadTarget::Detached,
+        }
+    }
+}
+
+/// Everything recorded before an operation runs, to undo it later (task 12).
+/// Task 13 adds the discarded content here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UndoPoint {
     pub op: OpId,
     pub label: String,
+    pub head: HeadTarget,
     pub refs: Vec<RefValue>,
     pub index: IndexId,
 }
@@ -117,7 +145,15 @@ pub enum Command {
     },
     CancelOp(OpId),
     AnswerAuth(OpId, AuthAnswer),
+    /// Save the index tree and keep it alive under
+    /// `refs/invoke-git/undo/<op>`; answered by `UndoSnapshotTaken`.
     SnapshotForUndo(UndoPoint),
+    /// Put refs and the index back (an undo).
+    ReplayUndo(UndoReplay),
+    /// Delete the saved trees of points that left the stack. Touches only
+    /// our own `refs/invoke-git/undo/*`, so it is not a write in the sense
+    /// of law 12.
+    PruneUndo(Vec<OpId>),
 }
 
 impl Command {
@@ -128,6 +164,7 @@ impl Command {
             Command::ApplyPatchToIndex { .. }
                 | Command::RunGit { .. }
                 | Command::SnapshotForUndo(_)
+                | Command::ReplayUndo(_)
         )
     }
 }
