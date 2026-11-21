@@ -277,6 +277,7 @@ impl Sim {
                         item.name
                     );
                 }
+                let head_before_replay = self.world.head.clone();
                 // Checkouts first, then the refs, as the shell does.
                 match &replay.head {
                     Some(HeadRestore::Symbolic(n) | HeadRestore::Branch(n)) => {
@@ -302,7 +303,14 @@ impl Sim {
                 for (n, before, _) in &top.recorded {
                     assert_eq!(&self.world.value(n), before, "{n:?} not restored");
                 }
-                assert_eq!(self.world.head, top.before_head, "HEAD not restored");
+                // HEAD is put back when the operation moved it; otherwise the
+                // undo leaves it alone, even if someone detached it at another
+                // commit meanwhile.
+                if replay.head.is_some() {
+                    assert_eq!(self.world.head, top.before_head, "HEAD not restored");
+                } else {
+                    assert_eq!(self.world.head, head_before_replay, "HEAD was moved");
+                }
                 if replay.index_effect == IndexEffect::Rewrites {
                     self.world.index = IndexId::Checksum(oid(self.next()));
                 }
