@@ -124,7 +124,7 @@ Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are 
 | 21 | Pre-push review screen: outgoing commits, combined and per-commit diffs | UI | 10, 17 | Not started |
 | 22 | Notes and annotations: SQLite store, anchoring, to-do warning on push | Core + UI | 21 | Not started |
 | 23 | Conflict resolution UI with continue and abort | Core + UI | 10, 17 | Not started |
-| 24 | Laws as `proptest` tests and the model-based test harness, in CI | Verification | 3, 11, 12 | Not started |
+| 24 | Laws as `proptest` tests and the model-based test harness, in CI | Verification | 3, 11, 12 | Done |
 | 25 | Benchmarks with performance budgets, failing CI on regression | Verification | 10, 11, 18 | Not started |
 | 26 | Two-week dogfood: all git work in Invoke Git (the v0.1 gate) | Release | 1–25 | Not started |
 

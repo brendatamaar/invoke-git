@@ -1,0 +1,43 @@
+# Quint specs (docs/spec/verification.md, "Quint spec scope"): the three
+# concurrency models are type-checked and run against their invariants
+# whenever a spec or the shell changes.
+#
+# `quint run` simulates many random executions; it needs no Java. Exhaustive
+# `quint verify` needs Java and the Apalache download, and is not wired in
+# yet (see tasks/024.DONE.md, question 4).
+name: Quint
+
+on:
+  push:
+    paths:
+      - "specs/quint/**"
+      - "crates/shell/**"
+      - ".github/workflows/quint.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quint:
+    name: Quint specs 1-3
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Quint
+        run: npm install --global @informalsystems/quint@0.25.1
+
+      - name: Type-check and simulate each spec
+        run: |
+          for spec in specs/quint/*.qnt; do
+            echo "::group::$spec"
+            quint typecheck "$spec"
+            quint run --invariant allInvariants --max-samples 10000 --max-steps 30 "$spec"
+            echo "::endgroup::"
+          done
