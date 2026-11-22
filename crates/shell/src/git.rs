@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use invoke_core::{GitArgs, PullMode};
+use invoke_core::{GitArgs, Operation, PullMode, RepoPath, Side};
 
 /// The oldest git Invoke Git supports (PRD → "Decisions").
 pub const MIN_VERSION: GitVersion = GitVersion {
@@ -253,7 +253,73 @@ pub fn invocation(args: &GitArgs) -> Invocation {
             argv.push((&local.0).into());
             plain(argv)
         }
+        // Task 23. `--literal-pathspecs` makes the path one literal file, so
+        // a name with `*`, `?` or `:(` is never read as a pattern. Taking a
+        // side is two runs (see `invocations`); this is the first.
+        GitArgs::ResolveTakeSide { path, side } => {
+            argv.push("--literal-pathspecs".into());
+            argv.extend(["checkout"].map(OsString::from));
+            argv.push(
+                match side {
+                    Side::Ours => "--ours",
+                    Side::Theirs => "--theirs",
+                }
+                .into(),
+            );
+            argv.push("--".into());
+            argv.push((&path.0).into());
+            plain(argv)
+        }
+        // `--force`: the file may have local edits (the conflict markers);
+        // the user chose to delete it.
+        GitArgs::ResolveRemove { path } => {
+            argv.extend(
+                ["--literal-pathspecs", "rm", "--force", "--quiet", "--"].map(OsString::from),
+            );
+            argv.push((&path.0).into());
+            plain(argv)
+        }
+        GitArgs::ResolveStage { path } => stage_path(argv, path),
+        GitArgs::Continue { operation } => sequencer(argv, *operation, "--continue"),
+        GitArgs::Skip { operation } => sequencer(argv, *operation, "--skip"),
+        GitArgs::Abort { operation } => sequencer(argv, *operation, "--abort"),
     }
+}
+
+/// Task 23: every git run of one request, in order; the request stops at the
+/// first one that fails. Almost every request is one run. Taking a side
+/// whole is two: write the side's file, then stage it.
+pub fn invocations(args: &GitArgs) -> Vec<Invocation> {
+    match args {
+        GitArgs::ResolveTakeSide { path, .. } => {
+            let argv = GLOBAL_ARGS.iter().map(OsString::from).collect();
+            vec![invocation(args), stage_path(argv, path)]
+        }
+        _ => vec![invocation(args)],
+    }
+}
+
+/// `git add -- <path>`. It also stages a deletion when the user removed the
+/// file by hand (git 2.x stages removals named explicitly).
+fn stage_path(mut argv: Vec<OsString>, path: &RepoPath) -> Invocation {
+    argv.extend(["--literal-pathspecs", "add", "--"].map(OsString::from));
+    argv.push((&path.0).into());
+    plain(argv)
+}
+
+/// `git <merge|rebase|cherry-pick|revert> <--continue|--skip|--abort>`.
+fn sequencer(mut argv: Vec<OsString>, operation: Operation, flag: &str) -> Invocation {
+    argv.push(
+        match operation {
+            Operation::Merge => "merge",
+            Operation::Rebase { .. } => "rebase",
+            Operation::CherryPick => "cherry-pick",
+            Operation::Revert => "revert",
+        }
+        .into(),
+    );
+    argv.push(flag.into());
+    plain(argv)
 }
 
 fn plain(args: Vec<OsString>) -> Invocation {
@@ -676,6 +742,130 @@ mod tests {
             let argv = strings(&invocation(&args));
             let has = argv.contains(&"--progress".to_owned());
             prop_assert_eq!(has, args.is_network());
+        }
+    }
+
+    // Task 23: the conflict flow.
+
+    fn all_runs(args: &GitArgs) -> Vec<Vec<String>> {
+        invocations(args).iter().map(after_globals).collect()
+    }
+
+    fn rel(name: &str) -> RepoPath {
+        RepoPath(name.into())
+    }
+
+    #[test]
+    fn conflict_commands_have_the_expected_argv() {
+        let rebase = Operation::Rebase { step: 2, total: 3 };
+        let line = |runs: Vec<Vec<String>>| -> Vec<String> {
+            runs.into_iter().map(|run| run.join(" ")).collect()
+        };
+        for (operation, verb) in [
+            (Operation::Merge, "merge"),
+            (rebase, "rebase"),
+            (Operation::CherryPick, "cherry-pick"),
+            (Operation::Revert, "revert"),
+        ] {
+            assert_eq!(
+                line(all_runs(&GitArgs::Continue { operation })),
+                [format!("{verb} --continue")]
+            );
+            assert_eq!(
+                line(all_runs(&GitArgs::Abort { operation })),
+                [format!("{verb} --abort")]
+            );
+        }
+        assert_eq!(
+            line(all_runs(&GitArgs::Skip { operation: rebase })),
+            ["rebase --skip"]
+        );
+        assert_eq!(
+            line(all_runs(&GitArgs::ResolveTakeSide {
+                path: rel("a b.txt"),
+                side: Side::Ours
+            })),
+            [
+                "--literal-pathspecs checkout --ours -- a b.txt",
+                "--literal-pathspecs add -- a b.txt"
+            ]
+        );
+        assert_eq!(
+            line(all_runs(&GitArgs::ResolveTakeSide {
+                path: rel("a.txt"),
+                side: Side::Theirs
+            })),
+            [
+                "--literal-pathspecs checkout --theirs -- a.txt",
+                "--literal-pathspecs add -- a.txt"
+            ]
+        );
+        assert_eq!(
+            line(all_runs(&GitArgs::ResolveRemove { path: rel("a.txt") })),
+            ["--literal-pathspecs rm --force --quiet -- a.txt"]
+        );
+        assert_eq!(
+            line(all_runs(&GitArgs::ResolveStage { path: rel("a.txt") })),
+            ["--literal-pathspecs add -- a.txt"]
+        );
+    }
+
+    fn arb_operation() -> impl Strategy<Value = Operation> {
+        prop_oneof![
+            Just(Operation::Merge),
+            (0..9u32, 0..9u32).prop_map(|(step, total)| Operation::Rebase { step, total }),
+            Just(Operation::CherryPick),
+            Just(Operation::Revert),
+        ]
+    }
+
+    proptest! {
+        /// A path, however odd (a leading dash, a glob, a magic pathspec),
+        /// is only ever a literal path after `--`, in every run.
+        #[test]
+        fn resolve_paths_are_always_literal_after_the_separator(
+            name in prop_oneof![
+                "[a-z*?\\[\\]:()!-][a-z0-9 *?\\[\\]:()./!-]{0,10}",
+                Just("-f".to_owned()),
+                Just(":(top)x".to_owned()),
+                Just("*.txt".to_owned()),
+            ],
+            side in prop_oneof![Just(Side::Ours), Just(Side::Theirs)],
+        ) {
+            for args in [
+                GitArgs::ResolveTakeSide { path: rel(&name), side },
+                GitArgs::ResolveRemove { path: rel(&name) },
+                GitArgs::ResolveStage { path: rel(&name) },
+            ] {
+                for run in invocations(&args) {
+                    let argv = strings(&run);
+                    prop_assert!(argv.contains(&"--literal-pathspecs".to_owned()));
+                    let separator = argv.iter().position(|arg| arg == "--").unwrap();
+                    prop_assert_eq!(&argv[separator + 1..], std::slice::from_ref(&name));
+                    // The only options come before the separator.
+                    prop_assert_eq!(argv.len(), separator + 2);
+                    prop_assert!(run.stdin.is_none());
+                }
+            }
+        }
+
+        /// Only continuing, skipping and aborting may open an editor, and
+        /// they take no message or path on the command line.
+        #[test]
+        fn sequencer_runs_take_no_free_text(operation in arb_operation()) {
+            for args in [
+                GitArgs::Continue { operation },
+                GitArgs::Skip { operation },
+                GitArgs::Abort { operation },
+            ] {
+                prop_assert!(args.may_open_editor());
+                let runs = invocations(&args);
+                prop_assert_eq!(runs.len(), 1);
+                prop_assert_eq!(after_globals(&runs[0]).len(), 2);
+                prop_assert!(runs[0].stdin.is_none());
+            }
+            let stage = GitArgs::ResolveStage { path: rel("a") };
+            prop_assert!(!stage.may_open_editor());
         }
     }
 }

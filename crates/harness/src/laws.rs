@@ -144,6 +144,15 @@ pub const LAWS: [Law; 14] = [
                 "undo_commit_restores_head_branch_and_index",
             ),
             test("crates/core/tests/undo_props.rs", "undo_matches_the_oracle"),
+            // Task 23: an abort puts everything back exactly.
+            test(
+                "crates/shell/tests/conflicts.rs",
+                "aborting_a_merge_restores_head_branch_and_index_exactly",
+            ),
+            test(
+                "crates/shell/tests/conflicts.rs",
+                "aborting_a_rebase_restores_the_branch_head_and_index_exactly",
+            ),
         ],
         markers: &[marker("law 8/9:")],
     },
@@ -156,6 +165,15 @@ pub const LAWS: [Law; 14] = [
             test(
                 "crates/core/tests/branch_props.rs",
                 "branches_match_the_oracle",
+            ),
+            // Task 23: finishing a merge or rebase moves only its branch.
+            test(
+                "crates/shell/tests/conflicts.rs",
+                "rebase_advances_step_by_step_with_continue_and_skip",
+            ),
+            test(
+                "crates/core/tests/conflict_props.rs",
+                "conflict_runs_name_no_branch_and_expect_the_snapshot",
             ),
         ],
         markers: &[marker("law 8/9:")],
@@ -208,6 +226,15 @@ pub const LAWS: [Law; 14] = [
                 "crates/core/tests/step_props.rs",
                 "writes_need_a_fresh_unlocked_snapshot",
             ),
+            // Task 23: the conflict flow waits for the lock too.
+            test(
+                "crates/core/tests/conflict_props.rs",
+                "conflict_writes_wait_for_a_fresh_unlocked_snapshot",
+            ),
+            test(
+                "crates/shell/tests/conflicts.rs",
+                "a_lock_held_by_another_process_holds_the_abort_back",
+            ),
         ],
         markers: &[marker("law 12:")],
     },
@@ -218,10 +245,17 @@ pub const LAWS: [Law; 14] = [
             "crates/shell/tests/runner.rs",
             "cancel_kills_the_hook_and_leaves_head_alone",
         )),
-        also: &[test(
-            "crates/shell/tests/runner.rs",
-            "cancel_right_after_start_is_cancelled",
-        )],
+        also: &[
+            test(
+                "crates/shell/tests/runner.rs",
+                "cancel_right_after_start_is_cancelled",
+            ),
+            // Task 23: a running abort or continue is never killed half way.
+            test(
+                "crates/core/tests/conflict_props.rs",
+                "a_running_conflict_operation_cannot_be_cancelled",
+            ),
+        ],
         markers: &[],
     },
     Law {

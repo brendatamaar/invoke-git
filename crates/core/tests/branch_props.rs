@@ -387,7 +387,14 @@ impl Sim {
             | GitArgs::Fetch { .. }
             | GitArgs::Pull { .. }
             | GitArgs::Push { .. }
-            | GitArgs::SetUpstream { .. } => {
+            | GitArgs::SetUpstream { .. }
+            // Task 23.
+            | GitArgs::ResolveTakeSide { .. }
+            | GitArgs::ResolveRemove { .. }
+            | GitArgs::ResolveStage { .. }
+            | GitArgs::Continue { .. }
+            | GitArgs::Skip { .. }
+            | GitArgs::Abort { .. } => {
                 panic!("no commits, stashes or remotes in this simulation")
             }
         }

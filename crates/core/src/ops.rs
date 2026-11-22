@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::conflict::{Operation, ResolveChoice, Side};
 use crate::event::RefValue;
 use crate::ids::{BranchName, IndexId, Oid, RefName, RepoPath};
 
@@ -75,16 +76,39 @@ pub enum WriteRequest {
         local: BranchName,
         upstream: RemoteBranch,
     },
+    // Task 23: the conflict flow. Each names the operation the user saw
+    // paused; it is checked against the fresh snapshot when it runs.
+    ResolveFile {
+        path: RepoPath,
+        choice: ResolveChoice,
+    },
+    Continue {
+        operation: Operation,
+    },
+    Skip {
+        operation: Operation,
+    },
+    Abort {
+        operation: Operation,
+    },
 }
 
 impl WriteRequest {
     /// Writes that take an undo point before they run. Fetch moves only
     /// remote-tracking refs and set-upstream only config: nothing an undo
-    /// could restore (task 17).
+    /// could restore (task 17). Task 23: only Continue leaves a marker.
+    /// While files are conflicted the index cannot be written out as a tree,
+    /// so resolving, skipping and aborting have nothing to save; abort is
+    /// itself git's exact way back.
     pub fn takes_undo_point(&self) -> bool {
         !matches!(
             self,
-            WriteRequest::Undo | WriteRequest::Fetch { .. } | WriteRequest::SetUpstream { .. }
+            WriteRequest::Undo
+                | WriteRequest::Fetch { .. }
+                | WriteRequest::SetUpstream { .. }
+                | WriteRequest::ResolveFile { .. }
+                | WriteRequest::Skip { .. }
+                | WriteRequest::Abort { .. }
         )
     }
 }
@@ -202,6 +226,30 @@ pub enum GitArgs {
         local: BranchName,
         upstream: RemoteBranch,
     },
+    // Task 23. `path` is always one literal path (no globbing). Take one
+    // side whole: check it out of the index stage, then stage it.
+    ResolveTakeSide {
+        path: RepoPath,
+        side: Side,
+    },
+    /// Resolve by deleting the file (the side chosen has none).
+    ResolveRemove {
+        path: RepoPath,
+    },
+    /// Stage the worktree file as it is.
+    ResolveStage {
+        path: RepoPath,
+    },
+    Continue {
+        operation: Operation,
+    },
+    /// Skip the commit a rebase stopped on; `operation` is always a rebase.
+    Skip {
+        operation: Operation,
+    },
+    Abort {
+        operation: Operation,
+    },
 }
 
 impl GitArgs {
@@ -232,7 +280,15 @@ impl GitArgs {
             | GitArgs::Fetch { .. }
             | GitArgs::Pull { .. }
             | GitArgs::Push { .. }
-            | GitArgs::SetUpstream { .. } => Vec::new(),
+            | GitArgs::SetUpstream { .. }
+            // Task 23: the paused operation and the index are what these
+            // expect (`Expect`), checked by the shell.
+            | GitArgs::ResolveTakeSide { .. }
+            | GitArgs::ResolveRemove { .. }
+            | GitArgs::ResolveStage { .. }
+            | GitArgs::Continue { .. }
+            | GitArgs::Skip { .. }
+            | GitArgs::Abort { .. } => Vec::new(),
             GitArgs::CreateBranch { name, .. } => vec![at(name, None)],
             GitArgs::SwitchBranch { name, tip } | GitArgs::DeleteBranch { name, tip, .. } => {
                 vec![at(name, Some(tip))]
@@ -241,6 +297,16 @@ impl GitArgs {
                 vec![at(from, Some(tip)), at(to, None)]
             }
         }
+    }
+
+    /// Task 23: runs git in a way that may open the commit message editor
+    /// (continuing commits with the prepared message). The shell sets
+    /// `GIT_EDITOR=true` for these so git never waits for an editor.
+    pub fn may_open_editor(&self) -> bool {
+        matches!(
+            self,
+            GitArgs::Continue { .. } | GitArgs::Skip { .. } | GitArgs::Abort { .. }
+        )
     }
 
     /// Talks to a remote, so it may ask for credentials and shows progress.

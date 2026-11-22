@@ -65,6 +65,10 @@ pub enum Irreversible {
     StashNotOnTop,
     /// A pull rewrote working-tree files, which an undo never does (task 17).
     Pull,
+    /// Task 23: continuing a merge, rebase, cherry-pick or revert made
+    /// commits out of a resolution. Undo stops here; abort is the way back
+    /// while the operation is paused.
+    Continued,
 }
 
 /// How an operation is reversed (task 20; recorded in its [`UndoPoint`]).

@@ -6,11 +6,13 @@
 pub mod askpass;
 pub mod classify;
 pub mod clone;
+pub mod conflict;
 pub mod discover;
 pub mod git;
 pub mod precondition;
 pub mod progress;
 pub mod read;
+mod resolve_undo;
 pub mod runner;
 pub mod staging;
 mod status;
@@ -19,6 +21,7 @@ pub mod undo;
 pub mod watch;
 
 pub use clone::CloneRunner;
+pub use conflict::read_conflict_content;
 pub use discover::{DiscoverError, Discovered, discover};
 pub use git::{Git, GitVersion, SetupError};
 pub use precondition::RepoPaths;

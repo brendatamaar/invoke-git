@@ -98,8 +98,13 @@ mod tests {
     }
 
     fn conflicts() -> impl Strategy<Value = Conflicts> {
-        proptest::collection::vec("[a-z/]{1,8}", 0..4).prop_map(|paths| Conflicts {
-            paths: paths.into_iter().map(RepoPath).collect(),
+        proptest::collection::vec("[a-z/]{1,8}", 0..4).prop_map(|paths| {
+            Conflicts::from_parts(
+                paths
+                    .into_iter()
+                    .map(|path| (RepoPath(path), crate::conflict::ConflictKind::BothModified)),
+                [],
+            )
         })
     }
 

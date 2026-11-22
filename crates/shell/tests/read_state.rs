@@ -154,9 +154,15 @@ fn assert_same_dir(found: &Path, expected: &Path) {
 }
 
 fn conflict_paths(names: &[&str]) -> Conflicts {
-    Conflicts {
-        paths: names.iter().map(|name| RepoPath((*name).into())).collect(),
-    }
+    Conflicts::from_parts(
+        names.iter().map(|name| {
+            (
+                RepoPath((*name).into()),
+                invoke_core::ConflictKind::BothModified,
+            )
+        }),
+        [],
+    )
 }
 
 /// `git for-each-ref` as the oracle for the refs snapshot.
@@ -277,14 +283,27 @@ fn merge_with_conflicts_reports_the_conflicted_paths() {
     );
     assert_eq!(
         conflicts_of(&disk.phase),
-        &conflict_paths(&["a.txt", "b.txt"])
+        &Conflicts::from_parts(
+            [
+                (
+                    RepoPath("a.txt".into()),
+                    invoke_core::ConflictKind::BothModified
+                ),
+                (
+                    RepoPath("b.txt".into()),
+                    invoke_core::ConflictKind::BothAdded
+                ),
+            ],
+            []
+        )
     );
     assert_eq!(
         oracle_conflicts(&repo),
         BTreeSet::from(["a.txt".to_owned(), "b.txt".to_owned()])
     );
 
-    // Resolved but not yet committed: still merging, no conflicts left.
+    // Resolved but not yet committed: still merging, every file Resolved
+    // (task 23: git remembers them in the index's resolve-undo record).
     repo.write("a.txt", "resolved\n");
     repo.write("b.txt", "resolved\n");
     repo.git(&["add", "a.txt", "b.txt"]);
@@ -292,9 +311,13 @@ fn merge_with_conflicts_reports_the_conflicted_paths() {
     assert_eq!(
         disk.phase,
         Phase::Merging {
-            conflicts: Conflicts::default()
+            conflicts: Conflicts::from_parts(
+                [],
+                [RepoPath("a.txt".into()), RepoPath("b.txt".into())]
+            )
         }
     );
+    assert!(conflicts_of(&disk.phase).all_resolved());
 
     repo.git(&["commit", "-q", "--no-edit"]);
     assert_eq!(repo.read().phase, Phase::Clean);

@@ -31,7 +31,12 @@ pub fn action_of(request: &WriteRequest) -> Option<Action> {
         | WriteRequest::Fetch { .. }
         | WriteRequest::Pull { .. }
         | WriteRequest::Push { .. }
-        | WriteRequest::SetUpstream { .. } => None,
+        | WriteRequest::SetUpstream { .. }
+        // Task 23.
+        | WriteRequest::ResolveFile { .. }
+        | WriteRequest::Continue { .. }
+        | WriteRequest::Skip { .. }
+        | WriteRequest::Abort { .. } => None,
     }
 }
 
@@ -198,7 +203,12 @@ fn check(
         | WriteRequest::Fetch { .. }
         | WriteRequest::Pull { .. }
         | WriteRequest::Push { .. }
-        | WriteRequest::SetUpstream { .. } => Err(Refusal::NotYetSupported { task: 15 }),
+        | WriteRequest::SetUpstream { .. }
+        // Task 23.
+        | WriteRequest::ResolveFile { .. }
+        | WriteRequest::Continue { .. }
+        | WriteRequest::Skip { .. }
+        | WriteRequest::Abort { .. } => Err(Refusal::NotYetSupported { task: 15 }),
     }
 }
 

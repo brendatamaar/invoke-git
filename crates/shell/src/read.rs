@@ -2,17 +2,18 @@
 //! lives in `.git`, through gix and plain file reads (never the git CLI,
 //! never `index.lock`). The decisions are the core's; this only gathers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use invoke_core::detect::{Markers, RebaseFiles, detect_phase};
 use invoke_core::{
-    BranchName, Command, Conflicts, DiskState, ErrorClass, Event, Failure, LockState, Oid, ReadId,
-    RefName, RefsSnapshot, RepoPath, StashEntry, Tracking, Upstream,
+    BranchName, Command, ConflictKind, Conflicts, DiskState, ErrorClass, Event, Failure, LockState,
+    Oid, Phase, ReadId, RefName, RefsSnapshot, RepoPath, StashEntry, Tracking, Upstream,
 };
 
 use crate::precondition::{self, RepoPaths};
+use crate::resolve_undo;
 use crate::status::read_status;
 
 /// Runs a `ReadState` command and returns the event that answers it. Other
@@ -45,8 +46,12 @@ pub fn read_state(paths: &RepoPaths) -> Result<DiskState, Failure> {
     let index_path = paths.git_dir.join("index");
     let index = precondition::index_id(&index_path, repo.object_hash().len_in_bytes())
         .map_err(|error| fail(format!("read index: {error}")))?;
-    let conflicts = read_conflicts(&repo, &index_path).map_err(fail)?;
-    let phase = detect_phase(&read_markers(&paths.git_dir), conflicts);
+    let markers = read_markers(&paths.git_dir);
+    // Task 23: the resolved files are only looked up while a merge, rebase,
+    // cherry-pick or revert is in progress.
+    let in_progress = detect_phase(&markers, Conflicts::default()) != Phase::Clean;
+    let conflicts = read_conflicts(&repo, &index_path, in_progress).map_err(fail)?;
+    let phase = detect_phase(&markers, conflicts);
     let refs = read_refs(&repo).map_err(fail)?;
     let status = precondition::open_with_worktree(paths)
         .and_then(|worktree| read_status(&worktree))
@@ -86,23 +91,51 @@ fn read_markers(git_dir: &Path) -> Markers {
     }
 }
 
-/// Paths with an index entry at stage 1, 2 or 3, sorted and unique.
-fn read_conflicts(repo: &gix::Repository, index_path: &Path) -> Result<Conflicts, String> {
+/// The conflicted files (task 23). Paths with an index entry at stage 1, 2
+/// or 3 are Unresolved, and the stages present give the kind. Paths git
+/// remembers as resolved (the index's resolve-undo record) are Resolved. The
+/// record is read only while something is in progress: with nothing paused
+/// the core drops the list anyway.
+fn read_conflicts(
+    repo: &gix::Repository,
+    index_path: &Path,
+    in_progress: bool,
+) -> Result<Conflicts, String> {
     if !index_path.exists() {
         return Ok(Conflicts::default());
     }
     let index = repo
         .open_index()
         .map_err(|error| format!("read index entries: {error}"))?;
-    let paths: BTreeSet<RepoPath> = index
-        .entries()
-        .iter()
-        .filter(|entry| entry.stage_raw() != 0)
-        .map(|entry| RepoPath(entry.path(&index).to_string()))
-        .collect();
-    Ok(Conflicts {
-        paths: paths.into_iter().collect(),
-    })
+    // Per path: which of stages 1, 2 and 3 exist.
+    let mut stages: BTreeMap<RepoPath, [bool; 3]> = BTreeMap::new();
+    for entry in index.entries() {
+        let stage = entry.stage_raw();
+        if stage == 0 {
+            continue;
+        }
+        let seen = stages
+            .entry(RepoPath(entry.path(&index).to_string()))
+            .or_default();
+        if let Some(slot) = seen.get_mut(usize::try_from(stage - 1).unwrap_or(usize::MAX)) {
+            *slot = true;
+        }
+    }
+    let unresolved = stages
+        .into_iter()
+        .filter_map(|(path, [base, ours, theirs])| {
+            ConflictKind::from_stages(base, ours, theirs).map(|kind| (path, kind))
+        });
+    let resolved = if in_progress {
+        let bytes = fs::read(index_path).map_err(|error| format!("read index: {error}"))?;
+        resolve_undo::resolved_paths(&bytes, repo.object_hash().len_in_bytes())
+    } else {
+        Vec::new()
+    };
+    Ok(Conflicts::from_parts(
+        unresolved,
+        resolved.into_iter().map(RepoPath),
+    ))
 }
 
 /// The stash list: the reflog of `refs/stash`, newest first, so index 0 is
