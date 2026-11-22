@@ -80,7 +80,7 @@ On AC power at 60 Hz, with no human input. The kernel clone is described above; 
 
 ## Gate run (P0-4)
 
-Release builds from branch `p0-4-gate`, laptop plugged in (battery status "AC"), display at 60 Hz. Automated parts were run by the agent on 2026-11-20; the manual parts are waiting for the user's runs (see the runbook in `tasks/P0-4.md`).
+Release builds, laptop plugged in (battery status "AC"), display at 60 Hz. The automated sweeps were run by the agent on 2026-11-20. The "agent-driven input" runs below were done on 2026-11-22 from `main` at 7c52a88. The IME and text-input checks, the 90 Hz run and the verdict still need the user (runbook in `tasks/P0-4.md`).
 
 ### Automated sweeps (agent)
 
@@ -93,25 +93,57 @@ Release builds from branch `p0-4-gate`, laptop plugged in (battery status "AC"),
 
 Peak memory was sampled every 0.5 s from the process's peak working set. Unstyled rows in the diff sweeps (43) are rows shown before their highlight chunk arrived, all in the first frames.
 
+### Agent-driven input runs (2026-11-22)
+
+The agent drove the real release windows with synthetic Windows mouse input (`mouse_event`): a click on the readout to reset the stats, 10 s of wheel events (616 and 626 events of 8 notches each; the diff run scrolls back up every 4th second, the graph run only goes down), then three scrollbar drags from the top of the track to the bottom (150 mouse moves each, about 2.4 s per drag). Then a 6 s idle tail. The console stats were read from stdout. This is **not** a human run: no one watched the window, so stutter, flashes or half-drawn rows that the counters cannot see are not covered. Setup: laptop on AC (battery status 2, 9 % charge), 60 Hz, window 2800×1704 physical pixels (200 % scaling), `spike-diff` and `spike-graph` release builds from `main` at 7c52a88.
+
+Every stats line after the reset (each is a 5 s window of about 300 frames; peak memory is the process peak working set, read at the end of the run):
+
+| Run | Window | fps | Interval p95 / max (ms) | Build p95 / max (ms) | Unstyled rows (cumulative) |
+| --- | --- | --- | --- | --- | --- |
+| A. Diff | 1 (wheel) | 60.0 | 18.0 / 20.7 | 3.7 / 4.3 | 0 |
+| A. Diff | 2 (wheel) | 60.0 | 17.8 / 19.9 | 3.7 / 4.7 | 0 |
+| A. Diff | 3 (drags) | 60.0 | 18.3 / 23.5 | 5.2 / 11.2 | 8,667 |
+| A. Diff | 4 (drags) | 60.0 | 18.4 / 20.0 | 5.8 / 7.1 | 9,075 |
+| A. Diff | 5 (idle tail) | 60.0 | 17.2 / 18.2 | 2.0 / 2.6 | 9,075 |
+| B. Graph | 1 (wheel) | 59.9 | 17.6 / 28.1 | 2.9 / 13.4 | n/a |
+| B. Graph | 2 (wheel, drags) | 60.0 | 18.1 / 20.9 | 4.4 / 6.5 | n/a |
+| B. Graph | 3 (drags) | 60.0 | 18.0 / 22.7 | 4.7 / 8.7 | n/a |
+| B. Graph | 4 (drags) | 60.0 | 17.5 / 18.6 | 3.1 / 4.1 | n/a |
+| B. Graph | 5 (idle tail) | 60.0 | 17.5 / 18.7 | 1.7 / 2.5 | n/a |
+
+| Run | Since reset: worst frame | Frames > 50 ms | Blank rows | First paint | Peak memory |
+| --- | --- | --- | --- | --- | --- |
+| A. Diff | 23.5 ms | 0 | 0 | 47.1 ms after data ready | 203 MB |
+| B. Graph (200,000 commits walked in 0.79 s, 100k+ deep reached by the drags) | 28.1 ms | 0 | 0 | 37.9 ms after the first page | 626 MB |
+
+Reading these numbers:
+
+- **fps, blank rows and >50 ms frames pass in every window.** The worst frame is 23.5 ms (diff) and 28.1 ms (graph).
+- **Interval p95 is 17.2–18.4 ms**, so the literal "≤ 16.7 ms" fails in every window, as in the earlier sweeps. Under the proposed reading (≤ 18 ms) three of the ten windows miss by a little: diff 18.3 and 18.4 ms, graph 18.1 ms. Build p95 (the CPU time per frame) is at most 5.8 ms in every window. Which of these counts is the open decision below.
+- **Unstyled rows appear during the scrollbar drags, not during the wheel:** 0 during 10 s of wheel, then about 9,000 rows (roughly 200 frames of about 45 rows) while the thumb jumped through the 50k rows in about 2.4 s per drag (about 360 rows per frame). Rows were painted in plain ink until the highlight chunk arrived. These are not blank rows (blank stayed 0), but they are visible as colours popping in, and the earlier constant-speed sweeps hid the problem (43 unstyled rows in all). Whether "painted without their data" in the protocol covers unstyled rows is a call for the user. It is a likely retry item if it does: prefetch highlight chunks around the thumb or shape the first frame from the chunk nearest in the cache.
+- Graph peak memory was 626 MB, above the 506 MB of the earlier sweeps, because the drags touched more rows' metadata. It is not a gate box.
+- The reset click landed (`stats reset` was printed), so the numbers cover only the scroll phases. The first printed window of each run, taken before the reset, is not included. That window also held the first frames (diff: interval max 37.5 ms and 2,440 unstyled rows while parsing; graph: interval max 46.4 ms).
+
 ### Manual runs (user)
 
 | Run | Result |
 | --- | --- |
-| A. Diff: wheel 10 s + scrollbar drag ×3 | _pending_ |
-| B. Graph: wheel 10 s + scrollbar drag ×3, 100k+ deep | _pending_ |
-| C. Text input: typing, Shift+arrows, drag, double-click, Ctrl+A/C/V | _pending_ |
-| C. Microsoft Japanese IME inline composition | _pending_ |
+| A. Diff: human wheel 10 s + scrollbar drag ×3 | _pending_ (agent-driven run above) |
+| B. Graph: human wheel 10 s + scrollbar drag ×3, 100k+ deep | _pending_ (agent-driven run above) |
+| C. Text input: typing, Shift+arrows, drag, double-click, Ctrl+A/C/V | _pending_ (needs hands) |
+| C. Microsoft Japanese IME inline composition | _pending_ (needs hands and eyes) |
 | C. Microsoft Pinyin (optional) | _pending_ |
-| D. 90 Hz (information) | _pending_ |
-| Peak memory from Task Manager | _pending_ |
-| E. "API felt workable" | _pending_ |
+| D. 90 Hz (information) | _not run_ (changing the display refresh rate was left to the user) |
+| Peak memory from Task Manager | Process peak working set: 203 MB (diff), 626 MB (graph); see above |
+| E. "API felt workable" | _pending_ (the user's call) |
 
 ### Checklist
 
 | Box | Kind | Status | Evidence |
 | --- | --- | --- | --- |
-| Diff view scrolls at 60 fps or better, no blank rows, release build | Must pass | **Automated: pass.** Manual: pending | 60.0 fps in every window, 0 blank rows, worst frame 23.8 ms |
-| Graph scrolls 100k commits deep at 60 fps or better, no blank rows | Must pass | **Automated: pass.** Manual: pending | 60.0 fps in every window, 0 blank rows, worst frame 21.9 ms |
+| Diff view scrolls at 60 fps or better, no blank rows, release build | Must pass | **60 fps and blank rows: pass.** p95: depends on the reading (see below). Human run: pending | Automated sweeps: 60.0 fps, 0 blank rows, worst 23.8 ms. Agent-driven wheel and drags: 60.0 fps, 0 blank, 0 frames > 50 ms, worst 23.5 ms, interval p95 17.2–18.4 ms. About 9,000 unstyled rows during the drags |
+| Graph scrolls 100k commits deep at 60 fps or better, no blank rows | Must pass | **60 fps and blank rows: pass.** p95: depends on the reading (see below). Human run: pending | Automated sweeps: 60.0 fps, 0 blank rows, worst 21.9 ms. Agent-driven wheel and drags: 59.9–60.0 fps, 0 blank, 0 frames > 50 ms, worst 28.1 ms, interval p95 17.5–18.1 ms |
 | First paint under 100 ms for the diff view once files are in memory | Soft | **Pass** | 37.7 and 54.2 ms (diff); 35–37 ms (graph, for information) |
 | Text input works for a commit message box (IME and selection behave) | Soft | Pending | `spike-diff --commit-box` |
 | Custom drawing (lanes, highlight backgrounds) was doable without forking GPUI | Soft | **Pass** | Lanes, curves and dots with `canvas`, `paint_quad` and `PathBuilder`; diff backgrounds and syntax colours with divs and `StyledText` highlights. GPUI is used unmodified; the only change is mirroring Zed's own `async-task` patch, which is not a fork. |
@@ -121,7 +153,16 @@ Peak memory was sampled every 0.5 s from the process's peak working set. Unstyle
 
 ### Gate outcome
 
-_Pending the manual runs and the user's verdict._
+**Not decided.** Three inputs are still the user's, and the agent does not decide them. By the rules in [the plan](PLAN.md#gate-rules), nothing here counts as a failed box yet, and Phase 0 does not end until all three must-pass boxes pass.
+
+1. **How to read "p95 ≤ 16.7 ms".**
+   - *Literal reading* (frame-interval p95 ≤ 16.7 ms): diff scroll and graph scroll both fail in every run so far (17.2–18.4 ms at a steady 60.0 fps). Two must-pass boxes failing means a retry weekend, and two still failing after it means Tauri + React. This reading would fail any vsync-paced app measured this way (paint timestamps jitter about ±1 ms around 16.67 ms).
+   - *Proposed reading* (60 fps in every window, interval p95 ≤ 18 ms, no frame over 50 ms): the 2026-11-20 automated sweeps pass. The 2026-11-22 agent-driven run is within 0.1–0.4 ms of it in three of ten windows (diff 18.3 and 18.4 ms, graph 18.1 ms). That is a marginal miss at the edge of the measurement noise, not a clear pass.
+   - *Build p95 reading* (CPU time of the frame, at most 5.8 ms here) passes by a wide margin, but it is not what the protocol measures.
+2. **Unstyled rows during scrollbar drags** (about 9,000 rows, none blank): does "visible rows painted without their data" include rows painted without syntax colours? If yes, the diff box fails on the drag, and it is the only real, fixable finding of this run.
+3. **"API felt workable"** (must pass) and the soft text-input box (IME, selection): human checks, still pending.
+
+No fallback has been chosen. If the user rules for the literal reading, or for counting unstyled rows, the apply step is one retry weekend (the plan's rule), not an immediate switch to Tauri.
 
 ## Risks and GPUI notes
 
