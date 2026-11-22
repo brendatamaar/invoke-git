@@ -65,6 +65,10 @@ pub enum Irreversible {
     StashNotOnTop,
     /// A pull rewrote working-tree files, which an undo never does (task 17).
     Pull,
+    /// The commit concluded a merge. Putting the refs and the index back
+    /// would leave the merge's changes staged with `MERGE_HEAD` gone, and a
+    /// plain commit of them would silently drop the second parent (task 14).
+    MergeConcluded,
 }
 
 /// How an operation is reversed (task 20; recorded in its [`UndoPoint`]).

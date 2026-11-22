@@ -119,7 +119,11 @@ pub fn invocation(args: &GitArgs) -> Invocation {
         GitArgs::Commit { message, amend } => {
             // The message goes through stdin: no argv quoting or length limits
             // on Windows, and no message text can be mistaken for an option.
-            argv.extend(["commit", "--file=-"].map(OsString::from));
+            // Task 14: the core already cleaned the message. Asking for the
+            // same cleanup keeps git from doing its own (`commit.cleanup=
+            // strip` would delete lines that start with `#`) and the
+            // editor's text is exactly what is committed.
+            argv.extend(["commit", "--file=-", "--cleanup=whitespace"].map(OsString::from));
             if *amend {
                 argv.push("--amend".into());
             }
@@ -319,7 +323,8 @@ mod tests {
                 "-c",
                 "color.ui=false",
                 "commit",
-                "--file=-"
+                "--file=-",
+                "--cleanup=whitespace"
             ]
         );
         assert_eq!(run.stdin.as_deref(), Some(&b"--amend\n\nbody"[..]));
@@ -475,7 +480,7 @@ mod tests {
         fn messages_never_reach_argv(message in "\\PC*", amend in any::<bool>()) {
             let run = invocation(&GitArgs::Commit { message: message.clone(), amend });
             prop_assert_eq!(run.stdin, Some(message.into_bytes()));
-            prop_assert_eq!(run.args.len(), GLOBAL_ARGS.len() + 2 + usize::from(amend));
+            prop_assert_eq!(run.args.len(), GLOBAL_ARGS.len() + 3 + usize::from(amend));
         }
     }
 

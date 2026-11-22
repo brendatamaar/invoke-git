@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::ids::{BranchName, IndexId, NameProblem, Oid, OpId, ReadId, RefName, RepoId, RepoPath};
+use crate::message::MessageProblem;
 use crate::ops::{AuthPrompt, Failure, OpOutcome, Progress, WriteRequest};
 use crate::stash::StashEntry;
 use crate::undo::{Irreversible, UndoStack};
@@ -333,6 +334,26 @@ pub enum Refusal {
     NoRemoteValue(RefName),
     /// The branch checked out is not the one the request was made for.
     BranchChanged,
+    /// A commit or amend that cannot run (task 14).
+    Commit(CommitRefusal),
+}
+
+/// Why a commit request was turned down (task 14). These are expected
+/// outcomes: nothing was written, and each says what to change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitRefusal {
+    /// The message cannot be committed (empty, only whitespace, NUL).
+    Message(MessageProblem),
+    /// Nothing is staged, and an amend can still reword, so only a plain
+    /// commit is refused. Not asked of a merge in progress.
+    NothingStaged,
+    /// `HEAD` names a branch with no commits: there is nothing to amend.
+    AmendUnborn,
+    /// A merge is in progress: git concludes it with a new commit and does
+    /// not amend one.
+    AmendDuringMerge,
+    /// A merge is in progress and files are still conflicted.
+    UnresolvedConflicts,
 }
 
 /// Why a branch request was turned down (task 15).

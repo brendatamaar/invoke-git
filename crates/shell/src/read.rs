@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use invoke_core::detect::{Markers, RebaseFiles, detect_phase};
+use invoke_core::message;
 use invoke_core::{
     BranchName, Command, Conflicts, DiskState, ErrorClass, Event, Failure, LockState, Oid, ReadId,
     RefName, RefsSnapshot, RepoPath, StashEntry, Tracking, Upstream,
@@ -66,6 +67,47 @@ pub fn read_state(paths: &RepoPaths) -> Result<DiskState, Failure> {
         stashes,
         lock,
     })
+}
+
+/// Task 14: the message of the commit `HEAD` is on, cleaned, as the amend
+/// editor's starting text. `None` on an unborn branch (nothing to amend).
+/// Read through gix; takes no lock.
+pub fn head_message(paths: &RepoPaths) -> Result<Option<String>, Failure> {
+    let fail = |details: String| Failure {
+        class: ErrorClass::Bug,
+        details,
+    };
+    let repo = precondition::open(paths).map_err(fail)?;
+    if repo
+        .head()
+        .map_err(|error| fail(format!("read HEAD: {error}")))?
+        .is_unborn()
+    {
+        return Ok(None);
+    }
+    let commit = repo
+        .head_commit()
+        .map_err(|error| fail(format!("read the HEAD commit: {error}")))?;
+    let raw = commit
+        .message_raw()
+        .map_err(|error| fail(format!("read the HEAD commit message: {error}")))?;
+    Ok(Some(message::normalize(&String::from_utf8_lossy(raw))))
+}
+
+/// Task 14: the message git prepared for the merge in progress
+/// (`MERGE_MSG`), without the `#` lines it adds as instructions, as the
+/// starting text for concluding the merge. `None` when there is none.
+pub fn merge_message(paths: &RepoPaths) -> Result<Option<String>, Failure> {
+    match fs::read(paths.git_dir.join("MERGE_MSG")) {
+        Ok(bytes) => Ok(Some(message::strip_comment_lines(
+            &String::from_utf8_lossy(&bytes),
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Failure {
+            class: ErrorClass::Bug,
+            details: format!("read MERGE_MSG: {error}"),
+        }),
+    }
 }
 
 /// Which markers exist in the worktree's own git dir, with their counters.

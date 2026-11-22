@@ -3,18 +3,20 @@
 use std::mem;
 
 use crate::branch;
+use crate::commit::{self, CommitKind};
 use crate::event::{
     ChangeSet, Command, Event, Expect, HeadTarget, IndexEffect, ReadScope, RefValue, UndoPoint,
 };
 use crate::ids::{BranchName, Oid, OpId, ReadId, RefName, RepoId};
+use crate::message::CommitMessage;
 use crate::ops::{
     ErrorClass, Failure, GitArgs, Lease, OpOutcome, PullMode, RemoteBranch, StageRequest,
     WriteRequest,
 };
 use crate::stash;
 use crate::state::{
-    Action, BranchRefusal, DiskState, Freshness, Head, LockState, Notice, OpPhase, Phase, QueuedOp,
-    Refusal, RepoState, RunningOp, Snapshot,
+    Action, BranchRefusal, CommitRefusal, DiskState, Freshness, Head, LockState, Notice, OpPhase,
+    Phase, QueuedOp, Refusal, RepoState, RunningOp, Snapshot,
 };
 use crate::undo::{self, Irreversible, Reversal, Reversible, UndoEntry, UndoPending};
 
@@ -78,9 +80,16 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
                 state.undo.pending = UndoPending::Taken { point, tree };
             }
         }
-        Event::CommitRequested { message, amend } => {
-            enqueue(&mut state, WriteRequest::Commit { message, amend });
-        }
+        // Task 14: the message is cleaned and checked here, at the boundary;
+        // what depends on the disk is checked when the request is dispatched.
+        Event::CommitRequested { message, amend } => match CommitMessage::parse(&message) {
+            Ok(message) => enqueue(&mut state, WriteRequest::Commit { message, amend }),
+            Err(problem) => refuse_because(
+                &mut state,
+                Action::Commit,
+                Refusal::Commit(CommitRefusal::Message(problem)),
+            ),
+        },
         // Task 15: branches. Names are parsed here; everything that depends
         // on the disk is checked when the request is dispatched.
         Event::BranchCreateRequested { name, at, switch } => match BranchName::parse(&name) {
@@ -375,20 +384,33 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
         };
         match &request {
             WriteRequest::Commit { message, amend } => {
+                let kind = match commit::plan(&disk, *amend) {
+                    Ok(kind) => kind,
+                    Err(reason) => {
+                        refuse_because(state, Action::Commit, reason);
+                        continue;
+                    }
+                };
+                // A merge commit is a marker an undo stops at (see
+                // `Irreversible::MergeConcluded`); the others restore refs.
+                let reverse = match kind {
+                    CommitKind::ConcludeMerge => Reversal::Never(Irreversible::MergeConcluded),
+                    CommitKind::Commit | CommitKind::Amend => Reversal::Refs,
+                };
                 let point = UndoPoint {
                     op: id,
-                    label: commit_label(message, *amend),
+                    label: message.label(kind.verb()),
                     head: HeadTarget::of(&disk.head),
                     refs: vec![head_ref(&disk.head)],
                     index: expect.index.clone(),
                     index_effect: IndexEffect::Rewrites,
-                    reverse: Reversal::Refs,
+                    reverse,
                 };
                 commands.push(Command::SnapshotForUndo(point.clone()));
                 commands.push(Command::RunGit {
                     op: id,
                     args: GitArgs::Commit {
-                        message: message.clone(),
+                        message: message.as_str().to_owned(),
                         amend: *amend,
                     },
                     expect,
@@ -679,12 +701,6 @@ fn head_ref(head: &Head) -> RefValue {
             oid: None,
         },
     }
-}
-
-fn commit_label(message: &str, amend: bool) -> String {
-    let subject = message.lines().next().unwrap_or("").trim();
-    let verb = if amend { "Amend" } else { "Commit" };
-    format!("{verb} '{subject}'")
 }
 
 // Task 17: network and branch-config requests.

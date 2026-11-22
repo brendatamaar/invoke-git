@@ -490,7 +490,12 @@ fn commit_round_trip() {
         },
         phase: Phase::Clean,
         index: index.clone(),
-        status: StatusSnapshot::default(),
+        // Task 14: a plain commit needs something staged.
+        status: StatusSnapshot::from_entries([StatusEntry {
+            path: RepoPath("a.txt".into()),
+            staged: Some(FileChange::Modified),
+            unstaged: None,
+        }]),
         refs: RefsSnapshot::default(),
         stashes: Vec::new(),
         lock: LockState::HeldByOther,
@@ -548,7 +553,8 @@ fn commit_round_trip() {
             Command::RunGit {
                 op,
                 args: GitArgs::Commit {
-                    message: "Fix login\n\nBody".into(),
+                    // Cleaned: one newline at the end (task 14).
+                    message: "Fix login\n\nBody\n".into(),
                     amend: false,
                 },
                 expect: Expect {

@@ -448,13 +448,34 @@ fn undo_is_refused_after_switching_branch() {
     assert_eq!(repo.observe(), before);
 }
 
-/// A commit that fails (nothing to commit) leaves no point and no saved ref.
+/// A commit that fails leaves no point and no saved ref. Task 14: nothing
+/// staged is refused by the core before anything is saved, so the failing
+/// run here is a commit hook that rejects it.
 #[test]
 fn a_failed_commit_leaves_nothing_behind() {
     let repo = seeded();
     let mut driver = Driver::open(&repo);
     driver.deliver(Event::CommitRequested {
         message: "empty".into(),
+        amend: false,
+    });
+    assert!(driver.last_outcome().is_none());
+    assert!(driver.state.undo.entries.is_empty());
+    assert!(repo.saved_refs().is_empty());
+
+    let hooks = repo.paths.git_dir.join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    repo.stage("a.txt", "two\n");
+    driver.outside_change();
+    driver.deliver(Event::CommitRequested {
+        message: "rejected".into(),
         amend: false,
     });
     assert!(matches!(driver.last_outcome(), Some(OpOutcome::Failed(_))));
