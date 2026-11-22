@@ -9,13 +9,14 @@
 //! syntax spans cover the whole file, so scrolling or dragging the
 //! scrollbar never waits for a highlight.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use diff::{DiffLine, DiffNote, Eol, LineKind, TextDiff};
 use gpui::{
-    AnyElement, Context, Div, FontWeight, HighlightStyle, IntoElement, ParentElement, Render,
-    SharedString, Styled, StyledText, UniformListScrollHandle, Window, div, point, px,
-    uniform_list,
+    AnyElement, Context, Div, EventEmitter, FontWeight, HighlightStyle, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    StyledText, UniformListScrollHandle, Window, div, point, px, uniform_list,
 };
 use highlight::{Capture, Span};
 use tokens::{
@@ -52,8 +53,41 @@ pub enum Content {
 }
 
 /// One file's diff, with the syntax spans of both sides.
+/// What the diff can be used for: read only, or the source of a stage or an
+/// unstage (the checkboxes and hunk buttons appear).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StageMode {
+    #[default]
+    ReadOnly,
+    /// Index to worktree: selected changes can be staged.
+    Stage,
+    /// `HEAD` to index: selected changes can be unstaged.
+    Unstage,
+}
+
+/// What a stage request needs to know about the sides the diff was made
+/// from (see `shell::DiffInputs`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputsMeta {
+    pub based_on: invoke_core::IndexId,
+    pub executable: bool,
+    pub old_exists: bool,
+    pub new_exists: bool,
+}
+
+/// A request from the diff: stage or unstage a part of the file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffEvent {
+    /// Every change in the hunk (an index into the hunks as shown).
+    Hunk { hunk: usize },
+    /// The selected lines of one hunk.
+    Lines { hunk: usize, lines: Vec<usize> },
+}
+
 pub struct DiffData {
     pub path: SharedString,
+    pub mode: StageMode,
+    pub inputs: Option<InputsMeta>,
     pub diff: TextDiff,
     /// Spans over `diff.old` and `diff.new`; empty for plain text.
     pub old_spans: Arc<[Span]>,
@@ -96,8 +130,12 @@ pub struct DiffView {
     rows: Vec<Row>,
     /// Width of a line number column: as many digits as the longest number.
     number_w: f32,
+    /// Selected changed lines as (hunk, line), for line staging.
+    selection: BTreeSet<(usize, usize)>,
     scroll: UniformListScrollHandle,
 }
+
+impl EventEmitter<DiffEvent> for DiffView {}
 
 impl Default for DiffView {
     fn default() -> Self {
@@ -113,6 +151,7 @@ impl DiffView {
             around: Around::default(),
             rows: Vec::new(),
             number_w: NUMBER_W,
+            selection: BTreeSet::new(),
             scroll: UniformListScrollHandle::new(),
         }
     }
@@ -123,6 +162,7 @@ impl DiffView {
 
     pub fn set_content(&mut self, content: Content, cx: &mut Context<Self>) {
         self.content = content;
+        self.selection.clear();
         self.rebuild();
         self.scroll_to_top();
         cx.notify();
@@ -131,6 +171,7 @@ impl DiffView {
     pub fn set_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
         if self.layout != layout {
             self.layout = layout;
+            self.selection.clear();
             self.rebuild();
             self.scroll_to_top();
             cx.notify();
@@ -140,6 +181,7 @@ impl DiffView {
     pub fn set_around(&mut self, around: Around, cx: &mut Context<Self>) {
         if self.around != around {
             self.around = around;
+            self.selection.clear();
             self.rebuild();
             cx.notify();
         }
@@ -266,9 +308,12 @@ impl DiffView {
         }
         let theme = cx.ui_theme().theme();
         let p = cx.palette();
+        let view = cx.entity();
         let (data, cx): (&DiffData, &gpui::App) = (data, cx);
         let ctx = Ctx {
             data,
+            view,
+            selection: &self.selection,
             number_w: self.number_w,
             theme,
             p,
@@ -344,6 +389,8 @@ impl Render for DiffView {
 /// What drawing a row needs, gathered once per frame.
 struct Ctx<'a> {
     data: &'a DiffData,
+    view: gpui::Entity<DiffView>,
+    selection: &'a BTreeSet<(usize, usize)>,
     number_w: f32,
     theme: Theme,
     p: &'a tokens::Palette,
@@ -352,16 +399,100 @@ struct Ctx<'a> {
 
 fn hunk_row(ctx: &Ctx, hunk: usize) -> Div {
     let (data, p, cx) = (ctx.data, ctx.p, ctx.cx);
-    div()
+    let mut row = div()
         .flex()
         .items_center()
+        .gap(px(SPACE_3))
         .h(px(ROW_DIFF))
         .w_full()
         .px(px(SPACE_3))
         .bg(hsla(p.bg_raised))
         .text_style(&TEXT_CODE_SMALL, cx)
         .text_color(hsla(p.ink_muted))
-        .child(hunk_header(&data.diff.hunks[hunk]))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .child(hunk_header(&data.diff.hunks[hunk])),
+        );
+    let verb = match data.mode {
+        StageMode::ReadOnly => return row,
+        StageMode::Stage => "Stage",
+        StageMode::Unstage => "Unstage",
+    };
+    let selected = ctx.selection.range((hunk, 0)..(hunk + 1, 0)).count();
+    if selected > 0 {
+        let view = ctx.view.clone();
+        row = row.child(link_button(
+            ("hunk-lines", hunk),
+            format!(
+                "{verb} {selected} {}",
+                if selected == 1 { "line" } else { "lines" }
+            ),
+            p.accent,
+            move |cx| view.update(cx, |view, cx| view.request_lines(hunk, cx)),
+        ));
+    }
+    let view = ctx.view.clone();
+    row.child(link_button(
+        ("hunk-all", hunk),
+        format!("{verb} hunk"),
+        p.accent,
+        move |cx| view.update(cx, |view, cx| view.request_hunk(hunk, cx)),
+    ))
+}
+
+/// A small text button for a hunk header row (20px tall, like the row).
+fn link_button(
+    id: (&'static str, usize),
+    label: String,
+    colour: tokens::Rgba,
+    on_click: impl Fn(&mut gpui::App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_none()
+        .px(px(SPACE_2))
+        .rounded(px(tokens::RADIUS_SM))
+        .text_color(hsla(colour))
+        .cursor_pointer()
+        .hover(|style| style.opacity(0.75))
+        .on_click(move |_, _, cx| on_click(cx))
+        .child(label)
+}
+
+/// The checkbox slot of a changed line; context lines and read-only diffs
+/// have an empty slot.
+fn select_cell(ctx: &Ctx, hunk: usize, line: usize, kind: LineKind) -> Div {
+    let slot = div()
+        .flex_none()
+        .w(px(SELECT_SLOT))
+        .flex()
+        .items_center()
+        .justify_center();
+    if ctx.data.mode == StageMode::ReadOnly || kind == LineKind::Context {
+        return slot;
+    }
+    let p = ctx.p;
+    let on = ctx.selection.contains(&(hunk, line));
+    let view = ctx.view.clone();
+    slot.child(
+        div()
+            .id(("line-check", hunk * 100_000 + line))
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(12.))
+            .rounded(px(2.))
+            .border_1()
+            .border_color(hsla(if on { p.accent } else { p.line_control }))
+            .bg(hsla(if on { p.accent } else { p.bg_panel }))
+            .text_color(hsla(p.on_accent))
+            .cursor_pointer()
+            .on_click(move |_, _, cx| view.update(cx, |view, cx| view.toggle_line(hunk, line, cx)))
+            .child(if on { "✓" } else { "" }),
+    )
 }
 
 /// The width of the line number columns: room for the longest number the
@@ -434,7 +565,7 @@ fn unified_row(ctx: &Ctx, hunk: usize, line: usize) -> Div {
     let l = &data.diff.hunks[hunk].lines[line];
     base_row(ctx.cx)
         .bg(hsla(fill(l.kind, p)))
-        .child(div().flex_none().w(px(SELECT_SLOT)))
+        .child(select_cell(ctx, hunk, line, l.kind))
         .child(number_cell(l.old_no, nw, p))
         .child(number_cell(l.new_no, nw, p))
         .child(sign_cell(l.kind, p))
@@ -457,7 +588,7 @@ fn split_row(ctx: &Ctx, hunk: usize, left: Option<usize>, right: Option<usize>) 
             .min_w(px(0.))
             .h_full()
             .bg(hsla(fill(l.kind, p)))
-            .child(div().flex_none().w(px(SELECT_SLOT)))
+            .child(select_cell(ctx, hunk, index, l.kind))
             .child(number_cell(number, nw, p))
             .child(sign_cell(l.kind, p))
             .child(code_cell(ctx, l))
@@ -553,6 +684,8 @@ fn code_cell(ctx: &Ctx, line: &DiffLine) -> Div {
 pub fn compute(path: &str, old: &str, new: &str) -> DiffData {
     DiffData {
         path: path.to_owned().into(),
+        mode: StageMode::ReadOnly,
+        inputs: None,
         diff: diff::diff_text(old, new, &diff::DiffOptions::default()),
         old_spans: Arc::from(Vec::new()),
         new_spans: Arc::from(Vec::new()),
@@ -604,7 +737,48 @@ impl DiffView {
     /// is kept, where [`DiffView::set_content`] goes back to the top.
     pub fn replace_content(&mut self, content: Content, cx: &mut Context<Self>) {
         self.content = content;
+        self.selection.clear();
         self.rebuild();
+        cx.notify();
+    }
+}
+
+impl DiffView {
+    /// The diff on show, with what a stage request needs.
+    pub fn data(&self) -> Option<&DiffData> {
+        match &self.content {
+            Content::Text(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// The selected lines of `hunk`, in order.
+    pub fn selected_lines(&self, hunk: usize) -> Vec<usize> {
+        self.selection
+            .range((hunk, 0)..(hunk + 1, 0))
+            .map(|(_, line)| *line)
+            .collect()
+    }
+
+    fn toggle_line(&mut self, hunk: usize, line: usize, cx: &mut Context<Self>) {
+        if !self.selection.remove(&(hunk, line)) {
+            self.selection.insert((hunk, line));
+        }
+        cx.notify();
+    }
+
+    fn request_hunk(&mut self, hunk: usize, cx: &mut Context<Self>) {
+        self.selection.clear();
+        cx.emit(DiffEvent::Hunk { hunk });
+        cx.notify();
+    }
+
+    fn request_lines(&mut self, hunk: usize, cx: &mut Context<Self>) {
+        let lines = self.selected_lines(hunk);
+        self.selection.clear();
+        if !lines.is_empty() {
+            cx.emit(DiffEvent::Lines { hunk, lines });
+        }
         cx.notify();
     }
 }

@@ -1,25 +1,30 @@
-//! What one repo tab shows: the summary header, the list of changed files
-//! and the diff of the selected one. The state it renders belongs to the
-//! `RepoSession`; this view only remembers which file is selected.
+//! What one repo tab shows: the summary header with the Changes and History
+//! switch, then either the status tree beside the diff of the selected file
+//! (with staging of files, hunks and lines) or the commit graph. The state it
+//! renders belongs to the `RepoSession`; this view remembers which file is
+//! selected, which folders are folded, and the files still to stage.
+
+use std::collections::{HashSet, VecDeque};
 
 use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window,
     div, px,
 };
-use invoke_core::{ReadId, RepoPath, Snapshot, StatusSnapshot};
-use shell::Source;
-use tokens::{SIDEBAR, SPACE_8};
+use invoke_core::{Event, ReadId, RepoPath, Snapshot, StatusSnapshot};
+use tokens::{SIDEBAR, SPACE_2, SPACE_8, TEXT_SMALL};
 use ui::convert::hsla;
 use ui::{
-    ChangeList, DiffContent, DiffView, RepoSummary, Section, Segmented, Summary, ThemeExt,
-    diff_view, list_rows,
+    Banner, BannerKind, Button, DiffContent, DiffEvent, DiffView, RepoSummary, Section, Segmented,
+    StatusTree, Summary, TextStyleExt, ThemeExt, TreeAction, TreeRow, diff_view, tree_rows,
 };
 
 use crate::diff_load::{self, Loaded};
 use crate::history_view::HistoryPane;
+use crate::notice::{self, Tone};
 use crate::session::RepoSession;
+use crate::staging::{self, Part};
 
-/// The changed-file list is a little wider than the repository sidebar.
+/// The changed-file tree is a little wider than the repository sidebar.
 const CHANGES_W: f32 = SIDEBAR + 2.0 * SPACE_8;
 
 /// The two pages of a repo tab.
@@ -29,12 +34,28 @@ enum Page {
     History,
 }
 
+/// Files to stage or unstage one after another. Each stage is built from a
+/// fresh read and carries the index id it expects, so the next one waits for
+/// the previous to finish and for the repo to be read again.
+enum Bulk {
+    Idle,
+    /// The next request is being built on a background thread.
+    Preparing,
+    /// A request was handed to the core; waiting for the session to settle.
+    Running,
+}
+
 pub struct RepoView {
     pub session: Entity<RepoSession>,
     page: Page,
     history: Entity<HistoryPane>,
     diff: Entity<DiffView>,
     selected: Option<(Section, RepoPath)>,
+    collapsed: HashSet<(Section, String)>,
+    queue: VecDeque<(Section, RepoPath)>,
+    bulk: Bulk,
+    /// Something the app itself has to say (a file that cannot be staged).
+    local_notice: Option<String>,
     /// The read the list was last reconciled with.
     last_read: Option<ReadId>,
     /// Numbers each diff request; an answer for an older one is dropped.
@@ -49,6 +70,23 @@ fn has(status: &StatusSnapshot, section: Section, path: &RepoPath) -> bool {
                 Section::Unstaged => entry.unstaged.is_some(),
             }
     })
+}
+
+/// Every file of `section` at or below `dir` (all of them when `dir` is
+/// `None`).
+fn files_of(status: &StatusSnapshot, section: Section, dir: Option<&str>) -> Vec<RepoPath> {
+    let entries: Vec<&RepoPath> = match section {
+        Section::Staged => status.staged().map(|(p, _)| p).collect(),
+        Section::Unstaged => status.unstaged().map(|(p, _)| p).collect(),
+    };
+    entries
+        .into_iter()
+        .filter(|path| match dir {
+            Some(dir) => path.0.starts_with(&format!("{dir}/")),
+            None => true,
+        })
+        .cloned()
+        .collect()
 }
 
 impl RepoView {
@@ -66,26 +104,49 @@ impl RepoView {
         let history = cx.new(|cx| HistoryPane::new(session.clone(), cx));
         cx.observe(&session, |this, _, cx| this.session_changed(cx))
             .detach();
+        cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| {
+            this.diff_event(event, cx)
+        })
+        .detach();
         Self {
             session,
             page: Page::Changes,
             history,
             diff,
             selected: None,
+            collapsed: HashSet::new(),
+            queue: VecDeque::new(),
+            bulk: Bulk::Idle,
+            local_notice: None,
             last_read: None,
             request: 0,
         }
     }
 
+    fn status(&self, cx: &Context<Self>) -> Option<StatusSnapshot> {
+        match &self.session.read(cx).state.snapshot {
+            Snapshot::Read { disk, .. } => Some(disk.status.clone()),
+            Snapshot::NotRead => None,
+        }
+    }
+
+    /// Nothing running or waiting, and the newest read has landed.
+    fn settled(&self, cx: &Context<Self>) -> bool {
+        let state = &self.session.read(cx).state;
+        state.ops.running.is_none() && state.ops.queued.is_empty() && state.fresh_disk().is_some()
+    }
+
     /// The session moved. Only a new read can change the list or the diff.
     fn session_changed(&mut self, cx: &mut Context<Self>) {
-        let (read, status) = match &self.session.read(cx).state.snapshot {
-            Snapshot::Read { read, disk } => (*read, disk.status.clone()),
-            Snapshot::NotRead => {
-                cx.notify();
-                return;
-            }
+        if matches!(self.bulk, Bulk::Running) && self.settled(cx) {
+            self.bulk = Bulk::Idle;
+        }
+        self.next_in_queue(cx);
+        let Snapshot::Read { read, disk } = &self.session.read(cx).state.snapshot else {
+            cx.notify();
+            return;
         };
+        let (read, status) = (*read, disk.status.clone());
         if self.last_read == Some(read) {
             cx.notify();
             return;
@@ -110,11 +171,16 @@ impl RepoView {
             }
             // Nothing chosen yet: open the first file.
             None => {
-                if let Some(ui::ListRow::File { section, path, .. }) = list_rows(&status)
+                let first = [Section::Unstaged, Section::Staged]
                     .into_iter()
-                    .find(|row| matches!(row, ui::ListRow::File { .. }))
-                {
-                    self.select(section, RepoPath(path.to_string()), cx);
+                    .find_map(|section| {
+                        files_of(&status, section, None)
+                            .into_iter()
+                            .next()
+                            .map(|path| (section, path))
+                    });
+                if let Some((section, path)) = first {
+                    self.select(section, path, cx);
                 }
             }
         }
@@ -144,16 +210,12 @@ impl RepoView {
         self.request += 1;
         let request = self.request;
         let paths = self.session.read(cx).discovered.paths.clone();
-        let source = match section {
-            Section::Unstaged => Source::IndexToWorktree,
-            Section::Staged => Source::HeadToIndex,
-        };
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
                 .spawn({
                     let path = path.clone();
-                    async move { diff_load::load(&paths, &path, source) }
+                    async move { diff_load::load(&paths, &path, section) }
                 })
                 .await;
             let name = path.0.clone();
@@ -203,6 +265,130 @@ impl RepoView {
         })
         .detach();
     }
+
+    /// A hunk or a set of lines was chosen in the diff.
+    fn diff_event(&mut self, event: &DiffEvent, cx: &mut Context<Self>) {
+        let Some((section, path)) = self.selected.clone() else {
+            return;
+        };
+        let part = match event {
+            DiffEvent::Hunk { hunk } => Part::Hunk(*hunk),
+            DiffEvent::Lines { hunk, lines } => Part::Lines {
+                hunk: *hunk,
+                lines: lines.clone(),
+            },
+        };
+        let request = {
+            let view = self.diff.read(cx);
+            let Some(data) = view.data() else { return };
+            let Some(inputs) = &data.inputs else { return };
+            staging::request(section, &path, &data.diff, inputs, &part)
+        };
+        if let Some(request) = request {
+            self.deliver(request, cx);
+        }
+    }
+
+    fn deliver(&mut self, event: Event, cx: &mut Context<Self>) {
+        self.local_notice = None;
+        self.session
+            .update(cx, |session, cx| session.deliver(event, cx));
+    }
+
+    /// Something in the tree was clicked.
+    fn tree_action(&mut self, action: TreeAction, cx: &mut Context<Self>) {
+        let Some(status) = self.status(cx) else {
+            return;
+        };
+        match action {
+            TreeAction::Select { section, path } => self.select(section, RepoPath(path), cx),
+            TreeAction::Collapse { section, dir } => {
+                if !self.collapsed.remove(&(section, dir.clone())) {
+                    self.collapsed.insert((section, dir));
+                }
+                cx.notify();
+            }
+            TreeAction::ToggleFile { section, path } => self.enqueue(
+                files_of(&status, section, None)
+                    .into_iter()
+                    .filter(|p| p.0 == path)
+                    .map(|p| (section, p))
+                    .collect(),
+                cx,
+            ),
+            TreeAction::ToggleDir { section, dir } => self.enqueue(
+                files_of(&status, section, Some(&dir))
+                    .into_iter()
+                    .map(|p| (section, p))
+                    .collect(),
+                cx,
+            ),
+            TreeAction::All { section } => self.enqueue(
+                files_of(&status, section, None)
+                    .into_iter()
+                    .map(|p| (section, p))
+                    .collect(),
+                cx,
+            ),
+        }
+    }
+
+    fn enqueue(&mut self, files: Vec<(Section, RepoPath)>, cx: &mut Context<Self>) {
+        self.local_notice = None;
+        self.queue.extend(files);
+        self.next_in_queue(cx);
+    }
+
+    /// Starts the next queued file if nothing else is in progress.
+    fn next_in_queue(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.bulk, Bulk::Idle) || !self.settled(cx) {
+            return;
+        }
+        let Some((section, path)) = self.queue.pop_front() else {
+            return;
+        };
+        self.bulk = Bulk::Preparing;
+        let paths = self.session.read(cx).discovered.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let path = path.clone();
+                    async move { diff_load::file_request(&paths, &path, section) }
+                })
+                .await;
+            this.update(cx, |this, cx| match result {
+                Ok(Some(event)) => {
+                    this.bulk = Bulk::Running;
+                    this.session
+                        .update(cx, |session, cx| session.deliver(event, cx));
+                }
+                Ok(None) => {
+                    this.bulk = Bulk::Idle;
+                    this.next_in_queue(cx);
+                }
+                Err(message) => {
+                    this.local_notice = Some(format!("Cannot stage {}: {message}", path.0));
+                    this.bulk = Bulk::Idle;
+                    this.next_in_queue(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn undo(&mut self, cx: &mut Context<Self>) {
+        self.deliver(Event::UndoRequested, cx);
+    }
+
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.local_notice = None;
+        self.session.update(cx, |session, cx| {
+            session.deliver(Event::NoticeDismissed, cx)
+        });
+    }
 }
 
 impl Render for RepoView {
@@ -218,17 +404,26 @@ impl Render for RepoView {
                 "Changes made outside Invoke Git will not show up on their own ({error}). Press F5 to refresh."
             ));
         }
-        let rows = match &session.state.snapshot {
-            Snapshot::Read { disk, .. } => list_rows(&disk.status),
+        let rows: Vec<TreeRow> = match &session.state.snapshot {
+            Snapshot::Read { disk, .. } => tree_rows(&disk.status, &self.collapsed),
             Snapshot::NotRead => Vec::new(),
         };
+        let undo_label = session
+            .state
+            .undo
+            .top()
+            .ok()
+            .map(|entry| entry.point.label.clone());
+        let notice = session.state.notice.as_ref().and_then(notice::message);
         let selected: Option<(Section, SharedString)> = self
             .selected
             .as_ref()
             .map(|(section, path)| (*section, path.0.clone().into()));
         let this = cx.entity();
         let switch = cx.entity();
-        summary = summary.control(Segmented::new(
+        let undo = cx.entity();
+        let dismiss = cx.entity();
+        let page_switch = Segmented::new(
             "repo-page",
             vec!["Changes".into(), "History".into()],
             match self.page {
@@ -247,7 +442,64 @@ impl Render for RepoView {
                     )
                 })
             },
-        ));
+        );
+        let mut controls = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_2))
+            .child(page_switch);
+        if let Some(label) = undo_label {
+            controls = controls
+                .child(
+                    Button::new("undo", "Undo")
+                        .on_click(move |_, _, cx| undo.update(cx, |view, cx| view.undo(cx))),
+                )
+                .child(
+                    div()
+                        .max_w(px(260.))
+                        .truncate()
+                        .text_style(&TEXT_SMALL, cx)
+                        .text_color(hsla(p.ink_muted))
+                        .child(label),
+                );
+        }
+        summary = summary.control(controls);
+
+        let mut banners = div().flex().flex_col().flex_none().gap(px(SPACE_2));
+        let mut any = false;
+        if let Some(text) = &self.local_notice {
+            banners = banners.child(Banner::new(BannerKind::Warning, text.clone()));
+            any = true;
+        }
+        if let Some(message) = notice {
+            let kind = match message.tone {
+                Tone::Warning => BannerKind::Warning,
+                Tone::Error => BannerKind::Error,
+            };
+            let mut banner = Banner::new(kind, message.text).action(
+                Button::new("dismiss-notice", "Dismiss")
+                    .ghost()
+                    .on_click(move |_, _, cx| dismiss.update(cx, |view, cx| view.dismiss(cx))),
+            );
+            if let Some(details) = message.details {
+                banner = banner.action(
+                    div()
+                        .max_w(px(360.))
+                        .truncate()
+                        .text_style(&TEXT_SMALL, cx)
+                        .child(details.lines().next().unwrap_or_default().to_owned()),
+                );
+            }
+            banners = banners.child(banner);
+            any = true;
+        }
+        let banners = any.then(|| {
+            banners
+                .p(px(SPACE_2))
+                .border_b_1()
+                .border_color(hsla(p.line))
+        });
+
         let body = match self.page {
             Page::History => div().flex().flex_1().min_h(px(0.)).child(
                 div()
@@ -265,19 +517,13 @@ impl Render for RepoView {
                         .flex_col()
                         .flex_none()
                         .w(px(CHANGES_W))
-                        .py(px(tokens::SPACE_2))
+                        .py(px(SPACE_2))
                         .bg(hsla(p.bg_panel))
                         .border_r_1()
                         .border_color(hsla(p.line))
-                        .child(ChangeList::new(
-                            rows,
-                            selected,
-                            move |section, path, _, cx| {
-                                this.update(cx, |this, cx| {
-                                    this.select(section, RepoPath(path.to_string()), cx)
-                                })
-                            },
-                        )),
+                        .child(StatusTree::new(rows, selected, move |action, _, cx| {
+                            this.update(cx, |this, cx| this.tree_action(action, cx))
+                        })),
                 )
                 .child(div().flex_1().min_w(px(0.)).child(self.diff.clone())),
         };
@@ -287,6 +533,7 @@ impl Render for RepoView {
             .flex_1()
             .min_h(px(0.))
             .child(summary)
+            .children(banners)
             .child(body)
     }
 }

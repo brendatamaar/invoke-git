@@ -10,6 +10,7 @@ name = "invoke-git"
 path = "src/main.rs"
 
 [dependencies]
+diff = { path = "../diff" }
 gpui.workspace = true
 gpui_platform.workspace = true
 invoke-core = { path = "../core" }

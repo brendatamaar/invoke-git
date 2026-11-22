@@ -19,6 +19,7 @@ pub mod fonts;
 pub mod graph_view;
 pub mod ref_labels;
 pub mod scrollbar;
+pub mod status_tree;
 pub mod summary;
 pub mod tabs;
 pub mod text;
@@ -31,8 +32,11 @@ pub use components::{
     Banner, BannerKind, Button, ButtonKind, CheckState, Checkbox, Divider, Pill, ProgressBar,
     SectionLabel, Segmented,
 };
-pub use diff_view::{Around, Content as DiffContent, DiffData, DiffView};
+pub use diff_view::{
+    Around, Content as DiffContent, DiffData, DiffEvent, DiffView, InputsMeta, StageMode,
+};
 pub use graph_view::{GraphEvent, GraphView, RowMeta};
+pub use status_tree::{StatusTree, TreeAction, TreeRow, tree_rows};
 pub use summary::{RepoSummary, Summary};
 pub use tabs::{TabBar, TabItem};
 pub use text::TextStyleExt;

@@ -1,9 +1,12 @@
 //! Reading the two sides of a file and diffing them, off the UI thread.
 
-use invoke_core::RepoPath;
+use diff::{DiffOptions, diff_text};
+use invoke_core::{Event, RepoPath};
 use shell::precondition::RepoPaths;
-use shell::{InputsError, Source, load_inputs};
-use ui::{DiffData, diff_view};
+use shell::{DiffInputs, InputsError, Source, load_inputs};
+use ui::{DiffData, InputsMeta, Section, StageMode, diff_view};
+
+use crate::staging::{self, Part};
 
 /// What the diff viewer shows for one file.
 pub enum Loaded {
@@ -12,25 +15,78 @@ pub enum Loaded {
     Message(String),
 }
 
-/// Reads `path` for `source` and diffs it. The index can move while the
-/// sides are read (the shell reports `Moved`); a few tries are made, since a
-/// burst of changes ends quickly.
-pub fn load(paths: &RepoPaths, path: &RepoPath, source: Source) -> Loaded {
+fn source_of(section: Section) -> Source {
+    match section {
+        Section::Unstaged => Source::IndexToWorktree,
+        Section::Staged => Source::HeadToIndex,
+    }
+}
+
+fn meta(inputs: &DiffInputs) -> InputsMeta {
+    InputsMeta {
+        based_on: inputs.based_on.clone(),
+        executable: inputs.executable,
+        old_exists: inputs.old.is_some(),
+        new_exists: inputs.new.is_some(),
+    }
+}
+
+/// Reads the sides, retrying a few times when the index moves while they are
+/// read (a burst of changes ends quickly).
+fn read(paths: &RepoPaths, path: &RepoPath, section: Section) -> Result<DiffInputs, String> {
     for _ in 0..3 {
-        match load_inputs(paths, path, source) {
-            Ok(inputs) => {
-                let old = inputs.old.as_deref().unwrap_or("");
-                let new = inputs.new.as_deref().unwrap_or("");
-                return Loaded::Diff(Box::new(diff_view::compute(&path.0, old, new)));
-            }
+        match load_inputs(paths, path, source_of(section)) {
+            Ok(inputs) => return Ok(inputs),
             Err(InputsError::Moved) => continue,
             Err(InputsError::NotText(reason)) => {
-                return Loaded::Message(format!("{reason}. There is no text diff to show."));
+                return Err(format!("{reason}. There is no text diff to show."));
             }
             Err(InputsError::Read(error)) => {
-                return Loaded::Message(format!("Could not read {}: {error}", path.0));
+                return Err(format!("Could not read {}: {error}", path.0));
             }
         }
     }
-    Loaded::Message("The repository kept changing while the file was read. Try again.".into())
+    Err("The repository kept changing while the file was read. Try again.".into())
+}
+
+/// Reads `path` for `section` and diffs it for the viewer.
+pub fn load(paths: &RepoPaths, path: &RepoPath, section: Section) -> Loaded {
+    match read(paths, path, section) {
+        Ok(inputs) => {
+            let mut data = diff_view::compute(
+                &path.0,
+                inputs.old.as_deref().unwrap_or(""),
+                inputs.new.as_deref().unwrap_or(""),
+            );
+            data.mode = match section {
+                Section::Unstaged => StageMode::Stage,
+                Section::Staged => StageMode::Unstage,
+            };
+            data.inputs = Some(meta(&inputs));
+            Loaded::Diff(Box::new(data))
+        }
+        Err(message) => Loaded::Message(message),
+    }
+}
+
+/// The request that stages (or unstages) the whole file, built from a fresh
+/// read of its sides. `Ok(None)`: the file has nothing to stage.
+pub fn file_request(
+    paths: &RepoPaths,
+    path: &RepoPath,
+    section: Section,
+) -> Result<Option<Event>, String> {
+    let inputs = read(paths, path, section)?;
+    let diff = diff_text(
+        inputs.old.clone().unwrap_or_default(),
+        inputs.new.clone().unwrap_or_default(),
+        &DiffOptions::default(),
+    );
+    Ok(staging::request(
+        section,
+        path,
+        &diff,
+        &meta(&inputs),
+        &Part::File,
+    ))
 }

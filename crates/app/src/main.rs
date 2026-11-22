@@ -4,11 +4,13 @@
 
 mod diff_load;
 mod history_view;
+mod notice;
 mod paths;
 mod persist;
 mod repo_view;
 mod session;
 mod setup;
+mod staging;
 mod tabs;
 mod workspace;
 
