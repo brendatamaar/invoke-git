@@ -163,15 +163,26 @@ pub const LAWS: [Law; 14] = [
     Law {
         number: 10,
         summary: "force push only with lease on the last fetched value",
-        // Push is backlog task 17 and is not merged yet.
-        owner: Owner::Pending {
-            task: 17,
-            will_be: test(
-                "crates/shell/tests/push.rs",
-                "law_10_force_push_only_with_lease",
+        // Spec: a unit test on command building plus an integration test
+        // with a local bare remote (task 17).
+        owner: Owner::Test(test(
+            "crates/shell/src/git.rs",
+            "force_only_ever_comes_with_an_expected_value",
+        )),
+        also: &[
+            test(
+                "crates/shell/tests/sync.rs",
+                "force_with_lease_overwrites_only_the_reviewed_value",
             ),
-        },
-        also: &[],
+            test(
+                "crates/shell/tests/sync.rs",
+                "force_with_lease_is_refused_when_the_remote_moved_since_review",
+            ),
+            test(
+                "crates/core/tests/step_props.rs",
+                "force_push_is_leased_against_the_reviewed_value",
+            ),
+        ],
         markers: &[],
     },
     Law {

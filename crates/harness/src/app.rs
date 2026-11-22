@@ -136,7 +136,9 @@ impl App {
                 OpOutcome::Failed(failure) => Outcome::Failed(failure.clone()),
                 OpOutcome::Cancelled => Outcome::Cancelled,
             },
-            Some(Notice::ReadFailed { failure, .. }) => Outcome::Failed(failure.clone()),
+            Some(Notice::ReadFailed { failure, .. } | Notice::PushRejected { failure, .. }) => {
+                Outcome::Failed(failure.clone())
+            }
             None => Outcome::Nothing,
         }
     }

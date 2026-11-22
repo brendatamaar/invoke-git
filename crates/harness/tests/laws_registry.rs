@@ -35,8 +35,8 @@ fn pending_laws_are_the_ones_whose_tasks_are_not_merged() {
             Owner::Test(_) => None,
         })
         .collect();
-    // Law 7 waits for task 13 (discard), law 10 for task 17 (push).
-    assert_eq!(pending, [(7, 13), (10, 17)]);
+    // Law 7 waits for task 13 (discard).
+    assert_eq!(pending, [(7, 13)]);
 }
 
 // The checks themselves, run on a small fake source tree, so the registry
