@@ -9,8 +9,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use diff::{DiffOptions, Direction, Mode, PatchSpec, Pick as DiffPick, build_patch, diff_text};
 use invoke_core::{
-    Area, BranchName, BranchStart, ErrorClass, Event, FileChange, LockState, MAX_POINTS, Oid,
-    Patch, Refusal, RepoPath, Reversal, Selection, StageRequest,
+    Area, BranchName, BranchStart, DiscardRequest, ErrorClass, Event, FileChange, LockState,
+    MAX_POINTS, Oid, Patch, Refusal, RepoPath, Reversal, Selection, StageRequest,
 };
 use shell::{InputsError, Source, load_inputs, read::read_state};
 
@@ -51,6 +51,8 @@ struct Write {
     hint: Hint,
     /// Staging and unstaging: law 4 says the worktree is never touched.
     index_only: bool,
+    /// Task 13: a discard of this file; law 7 says no other file changes.
+    discarded: Option<String>,
 }
 
 enum Prepared {
@@ -69,6 +71,13 @@ enum Kind {
     StashDrop { id: String, message: String },
     /// A stash save, apply or pop, or a drop below the top: undo stops.
     Irreversible,
+    /// Task 13: a discard. Undo writes `before` back to the file, but only
+    /// while the file still holds `after`; refs and index are not involved.
+    Discard {
+        path: String,
+        before: Option<Vec<u8>>,
+        after: Option<Vec<u8>>,
+    },
 }
 
 /// The model's copy of one undo-stack entry, built from the twin only.
@@ -89,6 +98,9 @@ struct Entry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Expect {
     Refuse(&'static str),
+    /// Task 13: the file was changed after the discard, so the undo fails
+    /// (a precondition change reported by the shell, not a refusal).
+    RefuseFile,
     Accept,
     Either,
 }
@@ -209,6 +221,9 @@ impl World {
             Transition::StageThenUnstage { file, pick } => {
                 self.stage_then_unstage(FILES[file % FILES.len()], pick);
             }
+            Transition::DiscardThenUndo { file, pick, edit } => {
+                self.discard_then_undo(FILES[file % FILES.len()], pick, edit.as_ref());
+            }
             Transition::OutsideCommitAll { message } => {
                 self.outside(&["commit", "-q", "-a", "-m", message]);
             }
@@ -319,6 +334,7 @@ impl World {
                 twin,
                 hint,
                 index_only: false,
+                discarded: None,
             }))
         };
         match transition {
@@ -327,6 +343,9 @@ impl World {
             }
             Transition::Unstage { file, pick } => {
                 self.prepare_stage(FILES[file % FILES.len()], pick, Direction::Unstage)
+            }
+            Transition::Discard { file, pick } => {
+                self.prepare_stage(FILES[file % FILES.len()], pick, Direction::Discard)
             }
             Transition::Commit { message, amend } => {
                 let mut args = vec!["commit", "-q"];
@@ -497,7 +516,7 @@ impl World {
     /// sees them now. `Nothing` when the selection changes nothing.
     fn prepare_stage(&mut self, path: &str, pick: &Pick, direction: Direction) -> Prepared {
         let source = match direction {
-            Direction::Stage => Source::IndexToWorktree,
+            Direction::Stage | Direction::Discard => Source::IndexToWorktree,
             Direction::Unstage => Source::HeadToIndex,
         };
         let inputs = match load_inputs(&self.app.repo.paths, &RepoPath(path.into()), source) {
@@ -580,15 +599,27 @@ impl World {
             Err(error) => panic!("harness resolved a selection that does not exist: {error:?}"),
         };
         let request = StageRequest {
-            selection,
+            selection: selection.clone(),
             patch: Patch(patch.clone()),
-            based_on: inputs.based_on,
+            based_on: inputs.based_on.clone(),
         };
         // Plain git has a command for a whole file; hunks and lines go in as
         // the same patch (git has no other way to stage part of a file).
+        // A whole-file discard is `git restore` (or `git clean` for a file
+        // the index does not know), which does not share the app's patch.
         let twin = match (pick, direction) {
             (Pick::File, Direction::Stage) => TwinOp::git(&["add", "--", path]),
             (Pick::File, Direction::Unstage) => TwinOp::git(&["restore", "--staged", "--", path]),
+            (Pick::File, Direction::Discard) if inputs.old.is_some() => {
+                TwinOp::git(&["restore", "--", path])
+            }
+            (Pick::File, Direction::Discard) => TwinOp::git(&["clean", "-f", "-q", "--", path]),
+            (_, Direction::Discard) => TwinOp {
+                args: ["apply", "--whitespace=nowarn", "-"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                stdin: Some(patch),
+            },
             _ => TwinOp {
                 args: ["apply", "--cached", "--whitespace=nowarn", "-"]
                     .map(str::to_owned)
@@ -596,14 +627,22 @@ impl World {
                 stdin: Some(patch),
             },
         };
+        let discarded = (direction == Direction::Discard).then(|| path.to_owned());
         Prepared::Write(Box::new(Write {
             event: match direction {
                 Direction::Stage => Event::StageRequested(request),
                 Direction::Unstage => Event::UnstageRequested(request),
+                Direction::Discard => Event::DiscardRequested(DiscardRequest {
+                    selection: request.selection,
+                    patch: request.patch,
+                    based_on: request.based_on,
+                    expect_file: inputs.new_blob.clone(),
+                }),
             },
             twin,
             hint: Hint::Other,
-            index_only: true,
+            index_only: discarded.is_none(),
+            discarded,
         }))
     }
 
@@ -715,8 +754,34 @@ impl World {
                 panic!("law 4: the app changed the worktree while staging or unstaging");
             }
         }
+        if let Some(path) = &write.discarded {
+            // Law 7: a discard changes the file it was asked for and no
+            // other; a refused or failed one changes nothing.
+            let after = self.app.repo.worktree();
+            let others = |files: &BTreeMap<String, Vec<u8>>| {
+                files
+                    .iter()
+                    .filter(|(name, _)| *name != path)
+                    .map(|(name, bytes)| (name.clone(), bytes.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            if others(&after) != others(&worktree_before) {
+                panic!("law 7: the app changed a file other than {path} while discarding");
+            }
+            if !succeeded && after != worktree_before {
+                panic!("law 7: a refused or failed discard changed {path}");
+            }
+        }
         if succeeded {
+            let discard = write.discarded.as_ref().map(|path| Kind::Discard {
+                path: path.clone(),
+                before: worktree_before.get(path).cloned(),
+                after: self.twin_obs.worktree.get(path).cloned(),
+            });
             self.push_entry(before, tree_var, write.hint, dropped);
+            if let (Some(kind), Some(top)) = (discard, self.stack.last_mut()) {
+                top.kind = kind;
+            }
         }
         self.settle();
         succeeded
@@ -870,6 +935,15 @@ impl World {
         };
         let moved = match &top.kind {
             Kind::Irreversible => return Expect::Refuse("NotUndoable"),
+            // Neither refs nor index matter to a discard's undo: only the
+            // file's own bytes (the app does not look at anything else).
+            Kind::Discard { path, after, .. } => {
+                return if self.twin_obs.worktree.get(path) == after.as_ref() {
+                    Expect::Accept
+                } else {
+                    Expect::RefuseFile
+                };
+            }
             Kind::StashDrop { .. } => {
                 now.refs.get("refs/stash") != top.after.refs.get("refs/stash")
             }
@@ -916,6 +990,11 @@ impl World {
                     panic!("undo refused as {reason:?}, the model says {kind}");
                 }
             }
+            (Expect::RefuseFile, Outcome::Failed(failure))
+                if failure.class == ErrorClass::PreconditionChanged => {}
+            (Expect::RefuseFile, other) => panic!(
+                "law 8: the discarded file was changed afterwards, undo must not overwrite it, the app answered {other:?}"
+            ),
             (Expect::Refuse(kind), other) => panic!(
                 "law 8/9: the model says undo must be refused ({kind}: something else moved the repo) but the app answered {other:?}"
             ),
@@ -962,6 +1041,17 @@ impl World {
             .expect("model entry for an accepted undo");
         match &entry.kind {
             Kind::Irreversible => unreachable!("an irreversible entry is never undone"),
+            Kind::Discard { path, before, .. } => match before {
+                Some(bytes) => {
+                    let text = String::from_utf8(bytes.clone()).expect("harness files are text");
+                    self.script.push(write_line(path, &text));
+                    self.twin.write(path, &text);
+                }
+                None => {
+                    self.script.push(format!("rm {}", quote(path)));
+                    self.twin.remove(path);
+                }
+            },
             Kind::StashDrop { id, message } => {
                 let op = TwinOp::git(&["stash", "store", &format!("--message={message}"), id]);
                 assert!(self.twin_git(&op).ok, "twin: git stash store failed");
@@ -1059,6 +1149,36 @@ impl World {
             );
         }
         stat("law 5 checked (every hunk staged)");
+    }
+
+    /// Laws 7 and 8: discard a selection; an undo right away gives the file
+    /// back byte for byte, and after an edit of the same file it must not
+    /// overwrite the edit.
+    fn discard_then_undo(&mut self, path: &str, pick: &Pick, edit: Option<&content::Change>) {
+        let prepared = self.prepare_stage(path, pick, Direction::Discard);
+        if matches!(prepared, Prepared::Nothing) {
+            self.refresh_twin();
+            self.check();
+            return;
+        }
+        let before = self.app.repo.worktree();
+        if !self.drive(prepared, false) {
+            return;
+        }
+        if let Some(change) = edit {
+            let text = content::apply(self.twin.read(path).as_deref(), change);
+            self.fs_write(path, &text);
+            self.outside_files();
+        }
+        let undone = self.drive(Prepared::Undo, false);
+        if undone && edit.is_none() && self.app.repo.worktree() != before {
+            panic!("law 8: undoing a discard of {path} did not give the exact files back");
+        }
+        stat(if edit.is_some() {
+            "law 8 checked (discard, edit, undo)"
+        } else {
+            "law 8 checked (discard then undo)"
+        });
     }
 
     /// Law 6: stage a selection of a file with nothing staged, unstage the
@@ -1196,6 +1316,13 @@ impl World {
         let mut expected = BTreeSet::new();
         for entry in &self.app.state.undo.entries {
             expected.insert(format!("refs/invoke-git/undo/{}", entry.point.op.0));
+            if matches!(entry.point.reverse, Reversal::Discard { .. }) {
+                expected.insert(format!("refs/invoke-git/undo/{}-discard", entry.point.op.0));
+                expected.insert(format!(
+                    "refs/invoke-git/undo/{}-discard-after",
+                    entry.point.op.0
+                ));
+            }
             if matches!(
                 entry.point.reverse,
                 Reversal::StashStore(_) | Reversal::StashKept(_)

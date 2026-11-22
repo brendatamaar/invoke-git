@@ -64,6 +64,19 @@ pub enum Transition {
         file: usize,
         pick: Pick,
     },
+    /// Task 13: take a selection out of the worktree file (law 7), undoable.
+    Discard {
+        file: usize,
+        pick: Pick,
+    },
+    /// Discard a selection, then (maybe) edit the same file, then undo:
+    /// without the edit the file comes back byte for byte (law 8); with it
+    /// the undo must not overwrite the edit.
+    DiscardThenUndo {
+        file: usize,
+        pick: Pick,
+        edit: Option<Change>,
+    },
     /// Stage the first hunk until none is left (laws 4 and 5).
     StageEveryHunk {
         file: usize,
@@ -128,6 +141,7 @@ impl Transition {
             self,
             Transition::Stage { .. }
                 | Transition::Unstage { .. }
+                | Transition::Discard { .. }
                 | Transition::Commit { .. }
                 | Transition::CreateBranch { .. }
                 | Transition::SwitchBranch { .. }
@@ -182,6 +196,7 @@ fn app_write() -> impl Strategy<Value = Transition> {
     prop_oneof![
         10 => (file(), pick()).prop_map(|(file, pick)| Transition::Stage { file, pick }),
         3 => (file(), pick()).prop_map(|(file, pick)| Transition::Unstage { file, pick }),
+        4 => (file(), pick()).prop_map(|(file, pick)| Transition::Discard { file, pick }),
         5 => (message(), prop_oneof![5 => Just(false), 1 => Just(true)])
             .prop_map(|(message, amend)| Transition::Commit { message, amend }),
         2 => (branch(), any::<bool>(), any::<bool>())
@@ -215,6 +230,8 @@ pub fn transition() -> impl Strategy<Value = Transition> {
         1 => (file(), file()).prop_map(|(from, to)| Transition::RenameFile { from, to }),
         26 => app_write(),
         3 => file().prop_map(|file| Transition::StageEveryHunk { file }),
+        3 => (file(), pick(), proptest::option::of(change()))
+            .prop_map(|(file, pick, edit)| Transition::DiscardThenUndo { file, pick, edit }),
         2 => (file(), pick()).prop_map(|(file, pick)| Transition::StageThenUnstage { file, pick }),
         1 => Just(Transition::Refresh),
         2 => message().prop_map(|message| Transition::OutsideCommitAll { message }),

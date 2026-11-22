@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 
 use crate::event::{Expect, HeadTarget, IndexEffect, RefValue, UndoPoint};
-use crate::ids::{BranchName, IndexId, Oid, OpId, RefName};
+use crate::ids::{BranchName, IndexId, Oid, OpId, RefName, RepoPath};
 use crate::stash::{self, StashEntry};
 use crate::state::{DiskState, Head, Phase, Refusal, UndoMoved};
 
@@ -81,6 +81,13 @@ pub enum Reversal {
     StashKept(StashEntry),
     /// Not undoable; an undo stops here with this reason.
     Never(Irreversible),
+    /// Task 13: a discard. The shell saved the file's content before it ran
+    /// (a blob plus its mode, kept alive under
+    /// `refs/invoke-git/undo/<op>-discard`) and, once it succeeded, what it
+    /// left behind (`<op>-discard-after`). The undo writes the saved content
+    /// back, but only while the file still holds what the discard left. No
+    /// ref and not the index are involved.
+    Discard { path: RepoPath },
 }
 
 /// Where the point of the operation in flight is in its life.
@@ -117,12 +124,24 @@ pub struct UndoReplay {
     pub head: Option<HeadRestore>,
     /// Head and index as read just now; the shell refuses if they moved.
     pub expect: Expect,
-    // Task 13 adds the discarded blobs to write back to their paths here.
+    /// Task 13: when set, the replay writes a discarded file back (the refs
+    /// and index above are then empty / unused). The shell checks the file
+    /// still holds what the discard left.
+    pub discard: Option<DiscardRestore>,
     /// Task 20: when set, the replay puts this stash back (the refs and
     /// index above are then empty / unused: the stash is stored, not the
     /// refs restored). The shell checks the stash list still has
     /// `expect_top` on top first.
     pub stash: Option<StashRestore>,
+}
+
+/// Writing a discarded file back (task 13).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscardRestore {
+    /// The discard being undone: its saved content is kept under its own
+    /// op id (the replay's `op` is the undo's).
+    pub discarded: OpId,
+    pub path: RepoPath,
 }
 
 /// Putting a dropped stash back on top of the stash list.
@@ -199,6 +218,9 @@ pub fn plan(undo: &UndoStack, disk: &DiskState, op: OpId) -> Result<UndoReplay, 
     if disk.phase != Phase::Clean {
         return Err(Refusal::RepoBusy);
     }
+    if let Reversal::Discard { path } = &entry.point.reverse {
+        return Ok(plan_discard(entry, path, disk, op));
+    }
     if HeadTarget::of(&disk.head) != entry.after_head {
         return Err(Refusal::Changed(UndoMoved::Head));
     }
@@ -237,7 +259,32 @@ pub fn plan(undo: &UndoStack, disk: &DiskState, op: OpId) -> Result<UndoReplay, 
             index: disk.index.clone(),
         },
         stash: None,
+        discard: None,
     })
+}
+
+/// Undo of a discard touches one worktree file and nothing in `.git`, so no
+/// ref or index check applies: the shell compares the file's bytes with what
+/// the discard left, which is the only thing that can make it unsafe. A
+/// branch switch that changed the file makes it refuse; one that did not
+/// change it does not matter.
+fn plan_discard(entry: &UndoEntry, path: &RepoPath, disk: &DiskState, op: OpId) -> UndoReplay {
+    UndoReplay {
+        op,
+        refs: Vec::new(),
+        tree: entry.tree.clone(),
+        index_effect: IndexEffect::Untouched,
+        head: None,
+        expect: Expect {
+            head: disk.head.clone(),
+            index: disk.index.clone(),
+        },
+        stash: None,
+        discard: Some(DiscardRestore {
+            discarded: entry.point.op,
+            path: path.clone(),
+        }),
+    }
 }
 
 /// Undo of a stash drop touches only the stash list, so only that is
@@ -270,6 +317,7 @@ fn plan_stash_store(
             entry: stashed.clone(),
             expect_top: now,
         }),
+        discard: None,
     })
 }
 

@@ -322,7 +322,10 @@ impl Sim {
                 self.deliver(Event::OpFinished(replay.op, OpOutcome::Succeeded));
             }
             Command::PruneUndo(ops) => self.pruned.extend(ops),
-            Command::ApplyPatchToIndex { .. } | Command::CancelOp(_) | Command::AnswerAuth(..) => {
+            Command::ApplyPatchToIndex { .. }
+            | Command::ApplyPatchToWorktree { .. }
+            | Command::CancelOp(_)
+            | Command::AnswerAuth(..) => {
                 panic!("unexpected command");
             }
         }

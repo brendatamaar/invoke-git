@@ -258,7 +258,7 @@ fn oracle(
     // Source side = what the patch applies to.
     let source = match direction {
         Direction::Stage => &diff.old,
-        Direction::Unstage => &diff.new,
+        Direction::Unstage | Direction::Discard => &diff.new,
     };
     let file = split_lines(source);
     let mut out: Vec<String> = Vec::new();
@@ -266,7 +266,7 @@ fn oracle(
     for (h, hunk) in diff.hunks.iter().enumerate() {
         let first = match direction {
             Direction::Stage => lines_before(hunk.old_start, hunk.old_len),
-            Direction::Unstage => lines_before(hunk.new_start, hunk.new_len),
+            Direction::Unstage | Direction::Discard => lines_before(hunk.new_start, hunk.new_len),
         };
         out.extend(file[cursor..first].iter().map(|l| l.to_string()));
         cursor = first;
@@ -289,13 +289,13 @@ fn oracle(
                         out.push(full);
                     }
                 }
-                (Direction::Unstage, LineKind::Added) => {
+                (Direction::Unstage | Direction::Discard, LineKind::Added) => {
                     cursor += 1;
                     if !on {
                         out.push(full);
                     }
                 }
-                (Direction::Unstage, LineKind::Removed) => {
+                (Direction::Unstage | Direction::Discard, LineKind::Removed) => {
                     if on {
                         out.push(full);
                     }
@@ -330,13 +330,15 @@ proptest! {
     fn line_selection_gives_exactly_the_selected_change(
         (old, new) in pair(),
         on in bits(),
-        unstage in any::<bool>(),
+        way in 0..3u8,
     ) {
-        let (direction, source_text, diff) = if unstage {
+        let (direction, source_text, diff) = match way {
             // HEAD = old, index = new: the diff is old -> new, source is new.
-            (Direction::Unstage, new.clone(), make(&old, &new))
-        } else {
-            (Direction::Stage, old.clone(), make(&old, &new))
+            0 => (Direction::Unstage, new.clone(), make(&old, &new)),
+            // Task 13: index = old, worktree = new: the same rewrite, on the
+            // worktree text.
+            1 => (Direction::Discard, new.clone(), make(&old, &new)),
+            _ => (Direction::Stage, old.clone(), make(&old, &new)),
         };
         for (h, hunk) in diff.hunks.iter().enumerate() {
             let pick = |hh: usize, i: usize| hh == h && on[i % on.len()];
@@ -394,11 +396,55 @@ proptest! {
         }
     }
 
+    /// Law 7, pure side: discarding every hunk of a worktree file gives the
+    /// index text back, byte for byte (CRLF and end-of-file marker included).
+    #[test]
+    fn discarding_every_hunk_gives_the_index_text((index, worktree) in pair()) {
+        let diff = make(&index, &worktree);
+        let patch = build_patch(&diff, &spec(Direction::Discard, &index, &worktree), &Pick::File)
+            .unwrap();
+        match patch {
+            None => prop_assert_eq!(&index, &worktree),
+            Some(patch) => {
+                let applied = apply(&patch, &worktree)
+                    .unwrap_or_else(|e| panic!("{e}\n{patch}"));
+                prop_assert_eq!(applied, index);
+            }
+        }
+    }
+
+    /// Law 7, pure side: discarding one hunk reverts that hunk and leaves
+    /// every other changed line of the worktree text exactly as it is.
+    #[test]
+    fn discarding_a_hunk_keeps_the_other_hunks((index, worktree) in pair(), pick in 0..8usize) {
+        let diff = make(&index, &worktree);
+        if diff.hunks.is_empty() {
+            return Ok(());
+        }
+        let h = pick % diff.hunks.len();
+        let patch = build_patch(
+            &diff,
+            &spec(Direction::Discard, &index, &worktree),
+            &Pick::Hunk(h),
+        )
+        .unwrap()
+        .expect("a hunk has changes");
+        let applied = apply(&patch, &worktree).unwrap_or_else(|e| panic!("{e}\n{patch}"));
+        let expected = oracle(&diff, Direction::Discard, &|hh, i| {
+            hh == h && diff.hunks[hh].lines[i].kind != LineKind::Context
+        });
+        prop_assert_eq!(applied, expected.concat());
+    }
+
     /// Hunk picks equal picking all of a hunk's changed lines.
     #[test]
-    fn a_hunk_pick_equals_all_its_lines((old, new) in pair(), unstage in any::<bool>()) {
+    fn a_hunk_pick_equals_all_its_lines((old, new) in pair(), way in 0..3u8) {
         let diff = make(&old, &new);
-        let direction = if unstage { Direction::Unstage } else { Direction::Stage };
+        let direction = match way {
+            0 => Direction::Unstage,
+            1 => Direction::Discard,
+            _ => Direction::Stage,
+        };
         for h in 0..diff.hunks.len() {
             let lines = changed(&diff, h);
             let s = spec(direction, &old, &new);
@@ -414,10 +460,14 @@ proptest! {
     fn header_counts_match_the_body(
         (old, new) in pair(),
         on in bits(),
-        unstage in any::<bool>(),
+        way in 0..3u8,
     ) {
         let diff = make(&old, &new);
-        let direction = if unstage { Direction::Unstage } else { Direction::Stage };
+        let direction = match way {
+            0 => Direction::Unstage,
+            1 => Direction::Discard,
+            _ => Direction::Stage,
+        };
         for (h, hunk) in diff.hunks.iter().enumerate() {
             let lines: Vec<usize> = (0..hunk.lines.len()).filter(|&i| on[i % on.len()]).collect();
             if let Some(patch) = build_patch(
@@ -491,6 +541,30 @@ fn out_of_range_picks_are_errors() {
         )
         .is_err()
     );
+}
+
+/// Task 13: discarding an untracked file removes it (a deleted-file patch
+/// on the worktree text); discarding a deletion recreates the file.
+#[test]
+fn discard_deletes_an_untracked_file_and_recreates_a_deleted_one() {
+    let untracked = patch_of("", "x\r\ny", Direction::Discard, Pick::File).unwrap();
+    assert_eq!(
+        untracked,
+        "diff --git a/f.txt b/f.txt\ndeleted file mode 100644\n--- a/f.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\r\n-y\n\\ No newline at end of file\n"
+    );
+    let deleted = patch_of("x\r\ny", "", Direction::Discard, Pick::File).unwrap();
+    assert_eq!(
+        deleted,
+        "diff --git a/f.txt b/f.txt\nnew file mode 100644\n--- /dev/null\n+++ b/f.txt\n@@ -0,0 +1,2 @@\n+x\r\n+y\n\\ No newline at end of file\n"
+    );
+}
+
+/// Discarding the last line of a file whose index version had no final
+/// newline gives that exact file back, marker included.
+#[test]
+fn discard_restores_the_missing_final_newline() {
+    let patch = patch_of("a\nb", "a\nb\nc\n", Direction::Discard, Pick::File).unwrap();
+    assert_eq!(apply(&patch, "a\nb\nc\n").unwrap(), "a\nb");
 }
 
 /// Staging only `+c` after `b` (no newline) must also stage the newline

@@ -35,8 +35,8 @@ fn pending_laws_are_the_ones_whose_tasks_are_not_merged() {
             Owner::Test(_) => None,
         })
         .collect();
-    // Law 7 waits for task 13 (discard).
-    assert_eq!(pending, [(7, 13)]);
+    // Every backlog task that owns a law is merged (law 7 came with task 13).
+    assert!(pending.is_empty(), "laws still pending: {pending:?}");
 }
 
 // The checks themselves, run on a small fake source tree, so the registry

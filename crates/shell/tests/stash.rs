@@ -740,6 +740,7 @@ fn replaying_a_drop_checks_the_stash_list_first() {
             entry: entry.clone(),
             expect_top,
         }),
+        discard: None,
     };
 
     let wrong = Some(Oid::from_hex(&"2".repeat(40)).unwrap());

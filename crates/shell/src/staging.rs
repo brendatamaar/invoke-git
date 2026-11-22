@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
-use invoke_core::{ErrorClass, Event, Failure, IndexId, OpId, OpOutcome, Patch, RepoPath};
+use invoke_core::{ErrorClass, Event, Failure, IndexId, Oid, OpId, OpOutcome, Patch, RepoPath};
 
 use crate::git::{GLOBAL_ARGS, Git};
 use crate::precondition::{self, RepoPaths};
@@ -132,6 +132,10 @@ pub struct DiffInputs {
     pub new: Option<String>,
     /// The executable bit of the side that exists (the new side if both).
     pub executable: bool,
+    /// The blob id of the new side's bytes, exactly as they are (no
+    /// filters), or `None` when the new side does not exist. A discard
+    /// carries it as `expect_file` (task 13).
+    pub new_blob: Option<Oid>,
     /// The index id the sides were read under; a stage built from them
     /// carries it as `based_on`.
     pub based_on: IndexId,
@@ -164,7 +168,10 @@ pub fn load_inputs(
 
     let index_side = read_index_side(&repo, path)?;
     let (old, new) = match source {
-        Source::IndexToWorktree => (index_side.clone(), read_worktree_side(paths, path)?),
+        Source::IndexToWorktree => (
+            index_side.clone(),
+            read_worktree_side(paths, path, repo.object_hash())?,
+        ),
         Source::HeadToIndex => (read_head_side(&repo, path)?, index_side.clone()),
     };
 
@@ -175,9 +182,11 @@ pub fn load_inputs(
         .as_ref()
         .or(old.as_ref())
         .is_some_and(|side| side.executable);
+    let new_blob = new.as_ref().map(|side| side.blob.clone());
     Ok(DiffInputs {
         old: old.map(|side| side.text),
         new: new.map(|side| side.text),
+        new_blob,
         executable,
         based_on: before,
     })
@@ -187,14 +196,25 @@ pub fn load_inputs(
 struct Side {
     text: String,
     executable: bool,
+    /// The blob id of the bytes.
+    blob: Oid,
 }
 
-fn text_of(path: &RepoPath, bytes: Vec<u8>, executable: bool) -> Result<Side, InputsError> {
+fn text_of(
+    path: &RepoPath,
+    bytes: Vec<u8>,
+    executable: bool,
+    blob: Oid,
+) -> Result<Side, InputsError> {
     if bytes.iter().take(8000).any(|b| *b == 0) {
         return Err(InputsError::NotText(format!("{} is binary", path.0)));
     }
     match String::from_utf8(bytes) {
-        Ok(text) => Ok(Side { text, executable }),
+        Ok(text) => Ok(Side {
+            text,
+            executable,
+            blob,
+        }),
         Err(_) => Err(InputsError::NotText(format!("{} is not UTF-8", path.0))),
     }
 }
@@ -224,7 +244,8 @@ fn read_index_side(repo: &gix::Repository, path: &RepoPath) -> Result<Option<Sid
     let blob = repo
         .find_object(entry.id)
         .map_err(|e| read(format!("read blob: {e}")))?;
-    text_of(path, blob.data.clone(), executable).map(Some)
+    let id = precondition::oid(&entry.id).map_err(read)?;
+    text_of(path, blob.data.clone(), executable, id).map(Some)
 }
 
 fn read_head_side(repo: &gix::Repository, path: &RepoPath) -> Result<Option<Side>, InputsError> {
@@ -253,10 +274,23 @@ fn read_head_side(repo: &gix::Repository, path: &RepoPath) -> Result<Option<Side
     let object = entry
         .object()
         .map_err(|e| read(format!("read blob: {e}")))?;
-    text_of(path, object.data.clone(), executable).map(Some)
+    let id = precondition::oid(&object.id).map_err(read)?;
+    text_of(path, object.data.clone(), executable, id).map(Some)
 }
 
-fn read_worktree_side(paths: &RepoPaths, path: &RepoPath) -> Result<Option<Side>, InputsError> {
+/// The blob id of `bytes`, as the system tool's `hash-object --no-filters`
+/// gives it.
+pub fn blob_id(hash: gix::hash::Kind, bytes: &[u8]) -> Result<Oid, String> {
+    let id = gix::objs::compute_hash(hash, gix::object::Kind::Blob, bytes)
+        .map_err(|error| format!("hash: {error}"))?;
+    precondition::oid(&id)
+}
+
+fn read_worktree_side(
+    paths: &RepoPaths,
+    path: &RepoPath,
+    hash: gix::hash::Kind,
+) -> Result<Option<Side>, InputsError> {
     let full = paths.workdir.join(&path.0);
     let metadata = match fs::symlink_metadata(&full) {
         Ok(metadata) => metadata,
@@ -271,7 +305,8 @@ fn read_worktree_side(paths: &RepoPaths, path: &RepoPath) -> Result<Option<Side>
     }
     let bytes =
         fs::read(&full).map_err(|error| InputsError::Read(format!("{}: {error}", path.0)))?;
-    text_of(path, bytes, is_executable(&metadata)).map(Some)
+    let blob = blob_id(hash, &bytes).map_err(InputsError::Read)?;
+    text_of(path, bytes, is_executable(&metadata), blob).map(Some)
 }
 
 #[cfg(unix)]

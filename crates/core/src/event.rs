@@ -2,10 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName};
+use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName, RepoPath};
 use crate::ops::{
-    AuthAnswer, AuthPrompt, BranchStart, Failure, GitArgs, OpOutcome, Patch, Progress, PullMode,
-    RemoteBranch, StageRequest,
+    AuthAnswer, AuthPrompt, BranchStart, DiscardRequest, Failure, GitArgs, OpOutcome, Patch,
+    Progress, PullMode, RemoteBranch, StageRequest,
 };
 use crate::state::{DiskState, Head};
 use crate::undo::{Reversal, UndoReplay};
@@ -15,6 +15,8 @@ pub enum Event {
     // From the UI.
     StageRequested(StageRequest),
     UnstageRequested(StageRequest),
+    // Task 13.
+    DiscardRequested(DiscardRequest),
     CommitRequested {
         message: String,
         amend: bool,
@@ -195,6 +197,17 @@ pub enum Command {
         patch: Patch,
         expect_index: IndexId,
     },
+    /// Task 13: apply the patch to the worktree file `path` (`git apply`,
+    /// no `--index`). Refused unless the index is `expect_index` and the
+    /// file's bytes hash to `expect_file` (`None`: the file must be absent).
+    /// The pre-discard content was saved by the `SnapshotForUndo` before it.
+    ApplyPatchToWorktree {
+        op: OpId,
+        patch: Patch,
+        path: RepoPath,
+        expect_index: IndexId,
+        expect_file: Option<Oid>,
+    },
     RunGit {
         op: OpId,
         args: GitArgs,
@@ -219,6 +232,7 @@ impl Command {
         matches!(
             self,
             Command::ApplyPatchToIndex { .. }
+                | Command::ApplyPatchToWorktree { .. }
                 | Command::RunGit { .. }
                 | Command::SnapshotForUndo(_)
                 | Command::ReplayUndo(_)

@@ -1,5 +1,6 @@
 //! The model-based harness (backlog task 24; `docs/spec/verification.md`,
-//! "Model-based test harness"). It owns laws 4, 5, 6, 8, 9 and 11 and also
+//! "Model-based test harness"). It owns laws 4, 5, 6, 8, 9 and 11, checks
+//! law 7 (discard) inside its sequences and also
 //! checks law 12 (no write while `index.lock` is held) on the real shell.
 //!
 //! Each case is a random sequence of up to 40 user and outside actions. The

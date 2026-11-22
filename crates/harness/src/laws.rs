@@ -123,16 +123,26 @@ pub const LAWS: [Law; 14] = [
     Law {
         number: 7,
         summary: "discard changes only the selected lines",
-        // Discard is backlog task 13 and is not merged yet.
-        owner: Owner::Pending {
-            task: 13,
-            will_be: test(
-                "crates/shell/tests/discard.rs",
-                "law_7_discard_changes_only_selected_lines",
+        // Spec: proptest on real repos, layers diff + shell. The shell test
+        // drives the real core on random files and selections; the diff
+        // tests check the patch side; the model-based harness checks it
+        // inside random sequences, together with undo (law 8) of discards.
+        owner: Owner::Test(test(
+            "crates/shell/tests/discard.rs",
+            "law_7_discard_changes_only_selected_lines",
+        )),
+        also: &[
+            test(
+                "crates/diff/tests/patch.rs",
+                "line_selection_gives_exactly_the_selected_change",
             ),
-        },
-        also: &[],
-        markers: &[],
+            test(
+                "crates/diff/tests/patch.rs",
+                "discarding_a_hunk_keeps_the_other_hunks",
+            ),
+            HARNESS_TEST,
+        ],
+        markers: &[marker("law 7:")],
     },
     Law {
         number: 8,

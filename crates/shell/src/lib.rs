@@ -6,6 +6,7 @@
 pub mod askpass;
 pub mod classify;
 pub mod clone;
+pub mod discard;
 pub mod discover;
 pub mod git;
 pub mod precondition;
@@ -19,6 +20,7 @@ pub mod undo;
 pub mod watch;
 
 pub use clone::CloneRunner;
+pub use discard::DiscardRunner;
 pub use discover::{DiscoverError, Discovered, discover};
 pub use git::{Git, GitVersion, SetupError};
 pub use precondition::RepoPaths;

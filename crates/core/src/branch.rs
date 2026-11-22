@@ -24,6 +24,7 @@ pub fn action_of(request: &WriteRequest) -> Option<Action> {
         | WriteRequest::Undo
         | WriteRequest::Stage(_)
         | WriteRequest::Unstage(_)
+        | WriteRequest::Discard(_)
         | WriteRequest::StashSave { .. }
         | WriteRequest::StashApply { .. }
         | WriteRequest::StashPop { .. }
@@ -191,6 +192,7 @@ fn check(
         | WriteRequest::Undo
         | WriteRequest::Stage(_)
         | WriteRequest::Unstage(_)
+        | WriteRequest::Discard(_)
         | WriteRequest::StashSave { .. }
         | WriteRequest::StashApply { .. }
         | WriteRequest::StashPop { .. }
