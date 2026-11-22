@@ -6,4 +6,9 @@ publish.workspace = true
 description = "Pure diff engine: Myers, histogram, hunks, word-level diff. No IO."
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "diff"
+harness = false

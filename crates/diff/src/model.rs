@@ -36,7 +36,9 @@ pub struct DiffOptions {
     /// Slide changes to natural block edges.
     pub indent_heuristic: bool,
     /// Work units (roughly one per line compared) before the diff gives up and
-    /// reports a whole-file replace. The caller maps its 200 ms budget to this.
+    /// reports a whole-file replace. The default is calibrated by the task 25
+    /// benchmarks: the worst inputs spend it in about 100 ms on the shared
+    /// VPS, half of the 200 ms budget, and typical diffs use under 1M.
     pub max_work: u64,
 }
 
@@ -48,7 +50,7 @@ impl Default for DiffOptions {
             ignore_blank_lines: false,
             context: 3,
             indent_heuristic: true,
-            max_work: 50_000_000,
+            max_work: 10_000_000,
         }
     }
 }

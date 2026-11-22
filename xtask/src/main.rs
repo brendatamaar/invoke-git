@@ -1,3 +1,4 @@
+mod bench;
 mod fixtures;
 mod metadata;
 
@@ -16,8 +17,12 @@ fn main() -> ExitCode {
         // Core only: skip the GPUI crates everywhere (Linux and macOS CI).
         [command, flag] if command == "check" && flag == "--core" => check(true),
         [command] if command == "fixtures" => write_fixtures(),
+        // Benchmarks against the ceilings in docs/perf-budgets.toml (task 25).
+        [command] if command == "bench-check" => bench::bench_check(),
         _ => {
-            eprintln!("Usage: cargo xtask check [--core] | cargo xtask fixtures");
+            eprintln!(
+                "Usage: cargo xtask check [--core] | cargo xtask fixtures | cargo xtask bench-check"
+            );
             return ExitCode::FAILURE;
         }
     };

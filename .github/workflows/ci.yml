@@ -1,7 +1,8 @@
 # CI matrix from docs/spec/verification.md ("Fixtures and CI"):
 # Windows builds and tests everything on every push; Linux and macOS run the
-# core (non-UI) suite to catch Windows-only assumptions. Benchmarks, Quint and
-# the nightly jobs arrive with their backlog tasks (24, 25).
+# core (non-UI) suite to catch Windows-only assumptions. The diff and graph
+# benchmarks run in their own Linux job against docs/perf-budgets.toml (task
+# 25). Quint and the nightly jobs arrive with their backlog tasks (24).
 name: CI
 
 on:
@@ -83,3 +84,35 @@ jobs:
 
       - name: Check (fmt, clippy, tests, core crates only)
         run: cargo xtask check --core
+
+  # Backlog task 25: criterion benchmarks for the diff engine and the graph
+  # layout, failing the build past the absolute ceilings in
+  # docs/perf-budgets.toml. A separate job, so a cold release build does not
+  # lengthen the Windows job; the viewer and status-tree benchmarks join it
+  # when the UI exists. Linux runs the pure crates only, no UI is built.
+  bench:
+    name: Benchmarks (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: bench-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: bench-cargo-
+
+      - name: Benchmarks against the performance budgets
+        run: cargo xtask bench-check
