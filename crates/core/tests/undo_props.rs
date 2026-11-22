@@ -37,7 +37,13 @@ impl World {
             },
             phase: Phase::Clean,
             index: self.index.clone(),
-            status: StatusSnapshot::default(),
+            // Something is always staged, so a plain commit is allowed
+            // (task 14).
+            status: StatusSnapshot::from_entries([StatusEntry {
+                path: RepoPath("a.txt".into()),
+                staged: Some(FileChange::Modified),
+                unstaged: None,
+            }]),
             refs: RefsSnapshot {
                 refs: self.refs.clone(),
                 ..RefsSnapshot::default()

@@ -22,7 +22,7 @@ pub use clone::CloneRunner;
 pub use discover::{DiscoverError, Discovered, discover};
 pub use git::{Git, GitVersion, SetupError};
 pub use precondition::RepoPaths;
-pub use read::{execute as execute_read, read_state};
+pub use read::{execute as execute_read, head_message, merge_message, read_state};
 pub use runner::GitRunner;
 pub use staging::{DiffInputs, InputsError, Source, StagingRunner, load_inputs};
 pub use undo::UndoRunner;

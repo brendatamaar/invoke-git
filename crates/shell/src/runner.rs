@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -18,7 +18,7 @@ use invoke_core::{
 };
 
 use crate::askpass::AskpassServer;
-use crate::classify::{classify, classify_stash_save};
+use crate::classify::{classify, classify_commit, classify_stash_save};
 use crate::git::{Git, invocation};
 use crate::precondition::{self, RepoPaths};
 use crate::progress::{self, Lines};
@@ -221,12 +221,22 @@ impl Job {
                 }
             }
         }
+        // Task 14: git says nothing of its own when a commit hook fails, so
+        // a commit also writes its trace2 events, which name the hook.
+        let trace = matches!(self.args, GitArgs::Commit { .. }).then(|| TraceFile::new(op));
+        if let Some(trace) = &trace {
+            command.env("GIT_TRACE2_EVENT", &trace.path);
+        }
         let outcome = match run_child(command, run.stdin, Some(sink), &self.control) {
             Ok(done) if done.killed && !done.success => OpOutcome::Cancelled,
             // A cancel that lost the race to a finished git reports what
             // really happened.
             Ok(done) => match self.args {
                 GitArgs::StashSave { .. } => classify_stash_save(done.success, &done.output),
+                GitArgs::Commit { .. } => {
+                    let events = trace.as_ref().map(TraceFile::read).unwrap_or_default();
+                    classify_commit(done.success, &done.output, &events)
+                }
                 _ => classify(done.success, &done.output),
             },
             Err(error) => failed(ErrorClass::Environment, format!("start git: {error}")),
@@ -236,6 +246,48 @@ impl Job {
             lock(&self.control.askpass).take();
         }
         outcome
+    }
+}
+
+/// Where git writes its trace2 events for one run (`GIT_TRACE2_EVENT`), in
+/// the temp folder (never in `.git`, which only our writes touch). Gone when
+/// dropped.
+struct TraceFile {
+    path: PathBuf,
+}
+
+/// The most trace read back: a hook that runs a lot of git cannot make the
+/// shell read without bound.
+const TRACE_LIMIT: u64 = 8 * 1024 * 1024;
+
+impl TraceFile {
+    fn new(op: OpId) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "invoke-git-trace2-{}-{}-{}.jsonl",
+            std::process::id(),
+            op.0,
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_file(&path);
+        Self { path }
+    }
+
+    /// What git wrote; empty when it wrote nothing or it cannot be read
+    /// (the commit is then classified from its output alone).
+    fn read(&self) -> String {
+        let Ok(file) = std::fs::File::open(&self.path) else {
+            return String::new();
+        };
+        let mut bytes = Vec::new();
+        let _ = file.take(TRACE_LIMIT).read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl Drop for TraceFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 

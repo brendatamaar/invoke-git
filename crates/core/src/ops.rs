@@ -4,12 +4,14 @@ use std::fmt;
 
 use crate::event::RefValue;
 use crate::ids::{BranchName, IndexId, Oid, RefName, RepoPath};
+use crate::message::CommitMessage;
 
 /// A write the user asked for, waiting in or running from the op queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteRequest {
     Commit {
-        message: String,
+        /// Cleaned by the core when the request arrives (task 14).
+        message: CommitMessage,
         amend: bool,
     },
     /// Reverse the newest undo point.
@@ -310,6 +312,10 @@ pub enum ErrorClass {
     Auth,
     Environment,
     Network,
+    /// git ran fine and refused, with its own message to show: a commit
+    /// hook that exited non-zero (task 14, `tasks/004.DONE.md` question 3).
+    /// The UI shows the output inline; it is not a bug.
+    Rejected,
     Bug,
 }
 
