@@ -20,6 +20,7 @@ pub mod fonts;
 pub mod graph_view;
 pub mod ref_labels;
 pub mod scrollbar;
+pub mod sidebar;
 pub mod status_tree;
 pub mod summary;
 pub mod tabs;
@@ -38,6 +39,7 @@ pub use diff_view::{
     Around, Content as DiffContent, DiffData, DiffEvent, DiffView, InputsMeta, StageMode,
 };
 pub use graph_view::{GraphEvent, GraphView, RowMeta};
+pub use sidebar::{SideAction, SideRow, Sidebar, sidebar_rows};
 pub use status_tree::{StatusTree, TreeAction, TreeRow, tree_rows};
 pub use summary::{RepoSummary, Summary};
 pub use tabs::{TabBar, TabItem};

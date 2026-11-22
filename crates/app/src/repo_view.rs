@@ -18,6 +18,7 @@ use ui::{
     StatusTree, Summary, TextStyleExt, ThemeExt, TreeAction, TreeRow, diff_view, tree_rows,
 };
 
+use crate::branch_panel::BranchPanel;
 use crate::commit_box::CommitBox;
 use crate::diff_load::{self, Loaded};
 use crate::history_view::HistoryPane;
@@ -51,6 +52,7 @@ pub struct RepoView {
     page: Page,
     history: Entity<HistoryPane>,
     commit: Entity<CommitBox>,
+    branches: Entity<BranchPanel>,
     diff: Entity<DiffView>,
     selected: Option<(Section, RepoPath)>,
     collapsed: HashSet<(Section, String)>,
@@ -105,6 +107,7 @@ impl RepoView {
         let diff = cx.new(|_| DiffView::new());
         let history = cx.new(|cx| HistoryPane::new(session.clone(), cx));
         let commit = cx.new(|cx| CommitBox::new(session.clone(), cx));
+        let branches = cx.new(|cx| BranchPanel::new(session.clone(), cx));
         cx.observe(&session, |this, _, cx| this.session_changed(cx))
             .detach();
         cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| {
@@ -116,6 +119,7 @@ impl RepoView {
             page: Page::Changes,
             history,
             commit,
+            branches,
             diff,
             selected: None,
             collapsed: HashSet::new(),
@@ -532,6 +536,12 @@ impl Render for RepoView {
                 )
                 .child(div().flex_1().min_w(px(0.)).child(self.diff.clone())),
         };
+        let sidebar = div()
+            .flex_none()
+            .w(px(SIDEBAR))
+            .border_r_1()
+            .border_color(hsla(p.line))
+            .child(self.branches.clone());
         div()
             .flex()
             .flex_col()
@@ -539,6 +549,13 @@ impl Render for RepoView {
             .min_h(px(0.))
             .child(summary)
             .children(banners)
-            .child(body)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(sidebar)
+                    .child(body),
+            )
     }
 }

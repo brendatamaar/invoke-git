@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use gpui::{Context, Task};
-use invoke_core::{Command, Event, OpId, RepoId, RepoState, open, step};
+use invoke_core::{Command, Event, OpId, RepoId, RepoState, UndoPoint, open, step};
 use shell::undo::Snapshotted;
 use shell::{
     DiscardRunner, Discovered, Git, GitRunner, RepoWatcher, StagingRunner, UndoRunner,
@@ -62,9 +62,7 @@ impl RepoSession {
             _watcher: watcher,
             _pump: Self::pump(inbox, cx),
         };
-        for command in commands {
-            session.exec(command, cx);
-        }
+        session.exec_all(commands, cx);
         session
     }
 
@@ -73,9 +71,7 @@ impl RepoSession {
         let placeholder = RepoState::new(self.state.id.clone());
         let (state, commands) = step(std::mem::replace(&mut self.state, placeholder), event);
         self.state = state;
-        for command in commands {
-            self.exec(command, cx);
-        }
+        self.exec_all(commands, cx);
         cx.notify();
     }
 
@@ -115,9 +111,69 @@ impl RepoSession {
         })
     }
 
+    /// Runs the commands one step produced. A write that has an undo
+    /// snapshot waits for it: the snapshot's event must reach the core
+    /// before the write's own `OpFinished`, or the undo point is dropped
+    /// (a quick write such as deleting a branch outruns the snapshot).
+    fn exec_all(&self, commands: Vec<Command>, cx: &mut Context<Self>) {
+        let mut gates: Vec<(OpId, Receiver<()>)> = Vec::new();
+        let mut doors: Vec<(OpId, Sender<()>)> = Vec::new();
+        for command in &commands {
+            if let Command::SnapshotForUndo(point) = command {
+                let (done, gate) = mpsc::channel();
+                doors.push((point.op, done));
+                gates.push((point.op, gate));
+            }
+        }
+        for command in commands {
+            match command {
+                Command::SnapshotForUndo(point) => {
+                    let done = doors
+                        .iter()
+                        .position(|(op, _)| *op == point.op)
+                        .map(|at| doors.remove(at).1);
+                    self.snapshot(point, done, cx);
+                }
+                Command::RunGit { op, .. }
+                | Command::ApplyPatchToIndex { op, .. }
+                | Command::ApplyPatchToWorktree { op, .. } => {
+                    let gate = gates
+                        .iter()
+                        .position(|(gated, _)| *gated == op)
+                        .map(|at| gates.remove(at).1);
+                    self.exec(command, gate, cx);
+                }
+                other => self.exec(other, None, cx),
+            }
+        }
+    }
+
+    fn snapshot(&self, point: UndoPoint, done: Option<Sender<()>>, cx: &mut Context<Self>) {
+        let events = self.events.clone();
+        let (undo, skip) = (self.undo.clone(), self.skip.clone());
+        cx.background_executor()
+            .spawn(async move {
+                let event = match undo.snapshot(&point) {
+                    Snapshotted::Taken(event) => event,
+                    Snapshotted::Failed(event) => {
+                        if let Ok(mut skip) = skip.lock() {
+                            skip.insert(point.op);
+                        }
+                        event
+                    }
+                };
+                let _ = events.send(event);
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            })
+            .detach();
+    }
+
     /// Runs one command. Reads and writes run off the UI thread; each
-    /// answers with an event on the channel.
-    fn exec(&self, command: Command, cx: &mut Context<Self>) {
+    /// answers with an event on the channel. A `gate` holds a write back
+    /// until its undo snapshot is done.
+    fn exec(&self, command: Command, gate: Option<Receiver<()>>, cx: &mut Context<Self>) {
         let events = self.events.clone();
         match command {
             Command::ReadState { read, .. } => {
@@ -128,28 +184,20 @@ impl RepoSession {
                     })
                     .detach();
             }
-            Command::SnapshotForUndo(point) => {
-                let (undo, skip) = (self.undo.clone(), self.skip.clone());
+            Command::SnapshotForUndo(_) => {}
+            Command::RunGit { op, args, expect } => {
+                let (runner, skip) = (self.runner.clone(), self.skip.clone());
                 cx.background_executor()
                     .spawn(async move {
-                        let event = match undo.snapshot(&point) {
-                            Snapshotted::Taken(event) => event,
-                            Snapshotted::Failed(event) => {
-                                if let Ok(mut skip) = skip.lock() {
-                                    skip.insert(point.op);
-                                }
-                                event
-                            }
-                        };
-                        let _ = events.send(event);
+                        if let Some(gate) = gate {
+                            let _ = gate.recv();
+                        }
+                        let skipped = skip.lock().is_ok_and(|mut skip| skip.remove(&op));
+                        if !skipped {
+                            runner.run(op, args, expect, events);
+                        }
                     })
                     .detach();
-            }
-            Command::RunGit { op, args, expect } => {
-                let skipped = self.skip.lock().is_ok_and(|mut skip| skip.remove(&op));
-                if !skipped {
-                    self.runner.run(op, args, expect, events);
-                }
             }
             Command::ApplyPatchToIndex {
                 op,
@@ -159,6 +207,9 @@ impl RepoSession {
                 let staging = self.staging.clone();
                 cx.background_executor()
                     .spawn(async move {
+                        if let Some(gate) = gate {
+                            let _ = gate.recv();
+                        }
                         let _ = events.send(staging.apply(op, &patch, &expect_index));
                     })
                     .detach();
@@ -170,13 +221,16 @@ impl RepoSession {
                 expect_index,
                 expect_file,
             } => {
-                let skipped = self.skip.lock().is_ok_and(|mut skip| skip.remove(&op));
-                if skipped {
-                    return;
-                }
+                let skip = self.skip.clone();
                 let discard = self.discard.clone();
                 cx.background_executor()
                     .spawn(async move {
+                        if let Some(gate) = gate {
+                            let _ = gate.recv();
+                        }
+                        if skip.lock().is_ok_and(|mut skip| skip.remove(&op)) {
+                            return;
+                        }
                         let done =
                             discard.apply(op, &patch, &path, &expect_index, expect_file.as_ref());
                         let _ = events.send(done);

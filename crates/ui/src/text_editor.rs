@@ -172,6 +172,9 @@ pub struct TextEditor {
     preferred_x: Option<Pixels>,
     selecting: bool,
     min_rows: usize,
+    /// One line: Enter submits and line breaks are not accepted (branch
+    /// names).
+    single_line: bool,
 }
 
 impl EventEmitter<EditorEvent> for TextEditor {}
@@ -196,7 +199,15 @@ impl TextEditor {
             preferred_x: None,
             selecting: false,
             min_rows: min_rows.max(1),
+            single_line: false,
         }
+    }
+
+    /// Makes this a one-line field: Enter submits, pasted line breaks become
+    /// spaces.
+    pub fn single_line(mut self) -> Self {
+        self.single_line = true;
+        self
     }
 
     pub fn text(&self) -> &str {
@@ -844,8 +855,13 @@ impl Render for TextEditor {
         let root = on!(root, Paste, |this, window, cx| {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                 // A pasted line break is a line break, whatever its kind.
-                this.editor
-                    .insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                let text = if this.single_line {
+                    text.replace('\n', " ")
+                } else {
+                    text
+                };
+                this.editor.insert(&text);
                 this.changed(window, cx);
             }
         });
@@ -860,8 +876,12 @@ impl Render for TextEditor {
             }
         });
         let root = on!(root, Newline, |this, window, cx| {
-            this.editor.insert("\n");
-            this.changed(window, cx)
+            if this.single_line {
+                cx.emit(EditorEvent::Submit);
+            } else {
+                this.editor.insert("\n");
+                this.changed(window, cx)
+            }
         });
         let root = on!(root, Submit, |_this, _w, cx| cx.emit(EditorEvent::Submit));
         root.child(EditorElement { input: cx.entity() })

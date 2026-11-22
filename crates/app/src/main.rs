@@ -2,6 +2,7 @@
 
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
+mod branch_panel;
 mod commit_box;
 mod diff_load;
 mod history_view;
