@@ -24,7 +24,20 @@ enum Form {
     None,
     Create,
     Rename(BranchName),
-    Delete { name: BranchName, force: bool },
+    Delete {
+        name: BranchName,
+        force: bool,
+    },
+    /// Save the local changes as a stash.
+    Stash {
+        untracked: bool,
+    },
+    /// Ask before a stash entry is thrown away.
+    DropStash {
+        id: Oid,
+        label: String,
+        newest: bool,
+    },
 }
 
 /// Why a typed name is not a branch name, in words.
@@ -50,9 +63,32 @@ pub fn local_name_of(remote_branch: &str) -> &str {
         .map_or(remote_branch, |(_, name)| name)
 }
 
+/// What the drop question says. Only the newest stash can be put back by
+/// Undo (a stash below it cannot go back to its place).
+pub fn drop_text(label: &str, newest: bool) -> String {
+    let what =
+        format!("Drop stash {label}? The changes saved in it are removed from the stash list.");
+    if newest {
+        format!("{what} You can undo this.")
+    } else {
+        format!("{what} This cannot be undone, because it is not the newest stash.")
+    }
+}
+
+/// The line under the stash message: what will and will not be saved.
+pub fn stash_hint(has_changes: bool, untracked: bool) -> &'static str {
+    match (has_changes, untracked) {
+        (false, _) => "There are no local changes to stash.",
+        (true, true) => "Saves staged, unstaged and new files, then restores a clean tree.",
+        (true, false) => "Saves staged and unstaged changes of tracked files; new files stay.",
+    }
+}
+
 pub struct BranchPanel {
     session: Entity<RepoSession>,
     editor: Entity<TextEditor>,
+    /// The stash message.
+    message: Entity<TextEditor>,
     form: Form,
     _subscriptions: Vec<Subscription>,
 }
@@ -60,8 +96,13 @@ pub struct BranchPanel {
 impl BranchPanel {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| TextEditor::new("Branch name", 1, cx).single_line());
+        let message = cx.new(|cx| TextEditor::new("Message (optional)", 1, cx).single_line());
         let subscriptions = vec![
             cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| match event {
+                EditorEvent::Changed => cx.notify(),
+                EditorEvent::Submit => this.submit(false, cx),
+            }),
+            cx.subscribe(&message, |this, _, event: &EditorEvent, cx| match event {
                 EditorEvent::Changed => cx.notify(),
                 EditorEvent::Submit => this.submit(false, cx),
             }),
@@ -70,6 +111,7 @@ impl BranchPanel {
         Self {
             session,
             editor,
+            message,
             form: Form::None,
             _subscriptions: subscriptions,
         }
@@ -137,8 +179,35 @@ impl BranchPanel {
             }
             SideAction::StashApply(index) => self.stash(index, StashOp::Apply, cx),
             SideAction::StashPop(index) => self.stash(index, StashOp::Pop, cx),
-            SideAction::StashDrop(index) => self.stash(index, StashOp::Drop, cx),
+            SideAction::StashDrop(index) => self.ask_to_drop(index, cx),
         }
+    }
+
+    /// Opens the question before a stash entry is dropped.
+    fn ask_to_drop(&mut self, index: usize, cx: &mut Context<Self>) {
+        let entry = match &self.session.read(cx).state.snapshot {
+            Snapshot::Read { disk, .. } => disk.stashes.get(index).cloned(),
+            Snapshot::NotRead => None,
+        };
+        if let Some(entry) = entry {
+            self.open(
+                Form::DropStash {
+                    id: entry.id,
+                    label: entry.message,
+                    newest: index == 0,
+                },
+                "",
+                cx,
+            );
+        }
+    }
+
+    /// Opens the form that saves the local changes as a stash.
+    fn ask_to_stash(&mut self, cx: &mut Context<Self>) {
+        self.message
+            .update(cx, |message, cx| message.set_text("", cx));
+        self.form = Form::Stash { untracked: false };
+        cx.notify();
     }
 
     fn stash(&mut self, index: usize, op: StashOp, cx: &mut Context<Self>) {
@@ -151,7 +220,6 @@ impl BranchPanel {
             match op {
                 StashOp::Apply => Event::StashApplyRequested(id),
                 StashOp::Pop => Event::StashPopRequested(id),
-                StashOp::Drop => Event::StashDropRequested(id),
             },
             cx,
         );
@@ -181,6 +249,21 @@ impl BranchPanel {
                     self.close(cx);
                 }
             }
+            Form::Stash { untracked } => {
+                let message = self.message.read(cx).text().to_owned();
+                self.deliver(
+                    Event::StashSaveRequested {
+                        message,
+                        include_untracked: untracked,
+                    },
+                    cx,
+                );
+                self.close(cx);
+            }
+            Form::DropStash { id, .. } => {
+                self.deliver(Event::StashDropRequested(id), cx);
+                self.close(cx);
+            }
             Form::Delete { name, force } => {
                 self.deliver(Event::BranchDeleteRequested { name, force }, cx);
                 self.close(cx);
@@ -193,7 +276,6 @@ impl BranchPanel {
 enum StashOp {
     Apply,
     Pop,
-    Drop,
 }
 
 impl Render for BranchPanel {
@@ -205,6 +287,7 @@ impl Render for BranchPanel {
         };
         let this = cx.entity();
         let new = cx.entity();
+        let stash = cx.entity();
         let mut panel = div()
             .flex()
             .flex_col()
@@ -220,9 +303,19 @@ impl Render for BranchPanel {
                     .px(px(SPACE_3))
                     .pb(px(SPACE_2))
                     .child(SectionLabel::new("Branches"))
-                    .child(Button::new("new-branch", "New branch").ghost().on_click(
-                        move |_, _, cx| new.update(cx, |this, cx| this.open(Form::Create, "", cx)),
-                    )),
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(SPACE_2))
+                            .child(Button::new("stash-open", "Stash").ghost().on_click(
+                                move |_, _, cx| stash.update(cx, |this, cx| this.ask_to_stash(cx)),
+                            ))
+                            .child(Button::new("new-branch", "+ Branch").ghost().on_click(
+                                move |_, _, cx| {
+                                    new.update(cx, |this, cx| this.open(Form::Create, "", cx))
+                                },
+                            )),
+                    ),
             );
 
         let text = self.editor.read(cx).text().trim().to_owned();
@@ -303,6 +396,100 @@ impl Render for BranchPanel {
                                 Button::new("form-rename", "Rename")
                                     .primary()
                                     .disabled(problem.is_some())
+                                    .on_click(move |_, _, cx| {
+                                        ok.update(cx, |this, cx| this.submit(false, cx))
+                                    }),
+                            )
+                            .child(cancel),
+                    ),
+            ),
+            Form::Stash { untracked } => {
+                let has_changes = match &self.session.read(cx).state.snapshot {
+                    Snapshot::Read { disk, .. } => {
+                        disk.status.unstaged().next().is_some()
+                            || disk.status.staged().next().is_some()
+                    }
+                    Snapshot::NotRead => false,
+                };
+                let toggle = cx.entity();
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(SPACE_2))
+                        .child(self.message.clone())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(SPACE_2))
+                                .child(
+                                    Checkbox::new(
+                                        "stash-untracked",
+                                        if untracked {
+                                            CheckState::Checked
+                                        } else {
+                                            CheckState::Unchecked
+                                        },
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            toggle.update(cx, |this, cx| {
+                                                if let Form::Stash { untracked } = &mut this.form {
+                                                    *untracked = !*untracked;
+                                                }
+                                                cx.notify();
+                                            })
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .text_style(&TEXT_SMALL, cx)
+                                        .text_color(hsla(p.ink_muted))
+                                        .child("Include untracked files"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_style(&TEXT_SMALL, cx)
+                                .text_color(hsla(p.ink_faint))
+                                .child(stash_hint(has_changes, untracked)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(SPACE_2))
+                                .child(
+                                    Button::new("form-stash", "Stash changes")
+                                        .primary()
+                                        .disabled(!has_changes)
+                                        .on_click(move |_, _, cx| {
+                                            ok.update(cx, |this, cx| this.submit(false, cx))
+                                        }),
+                                )
+                                .child(cancel),
+                        ),
+                )
+            }
+            Form::DropStash { label, newest, .. } => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(SPACE_2))
+                    .child(
+                        div()
+                            .text_style(&TEXT_SMALL, cx)
+                            .text_color(hsla(p.ink))
+                            .child(drop_text(&label, newest)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(SPACE_2))
+                            .child(
+                                Button::new("form-drop-stash", "Drop stash")
+                                    .danger()
                                     .on_click(move |_, _, cx| {
                                         ok.update(cx, |this, cx| this.submit(false, cx))
                                     }),

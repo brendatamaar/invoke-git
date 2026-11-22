@@ -158,6 +158,10 @@ impl Sidebar {
     }
 }
 
+/// The room the hover buttons take, so a name is cut short instead of covered.
+const ROW_ACTIONS_W: f32 = 160.0;
+const REMOTE_ACTIONS_W: f32 = 100.0;
+
 /// The shared look of a sidebar row: focusable, with a hover group so its
 /// actions can appear.
 fn base_row(
@@ -284,6 +288,9 @@ impl RenderOnce for Sidebar {
                                             .flex_1()
                                             .min_w(px(0.))
                                             .truncate()
+                                            .group_hover("side-row", |style| {
+                                                style.pr(px(ROW_ACTIONS_W))
+                                            })
                                             .font_weight(FontWeight(if *current {
                                                 600.0
                                             } else {
@@ -354,7 +361,16 @@ impl RenderOnce for Sidebar {
                             base_row(ElementId::from(("side-remote", index)), window, cx, ring)
                                 .hover(move |style| style.bg(hover))
                                 .text_color(hsla(p.ink_muted))
-                                .child(div().flex_1().min_w(px(0.)).truncate().child(name.clone()))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .group_hover("side-row", |style| {
+                                            style.pr(px(REMOTE_ACTIONS_W))
+                                        })
+                                        .child(name.clone()),
+                                )
                                 .child(actions)
                                 .into_any_element()
                         }
@@ -399,7 +415,16 @@ impl RenderOnce for Sidebar {
                             base_row(ElementId::from(("side-stash", index)), window, cx, ring)
                                 .hover(move |style| style.bg(hover))
                                 .text_color(hsla(p.ink_muted))
-                                .child(div().flex_1().min_w(px(0.)).truncate().child(label.clone()))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .group_hover("side-row", |style| {
+                                            style.pr(px(ROW_ACTIONS_W))
+                                        })
+                                        .child(label.clone()),
+                                )
                                 .child(actions)
                                 .into_any_element()
                         }

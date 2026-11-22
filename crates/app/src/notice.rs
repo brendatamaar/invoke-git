@@ -118,6 +118,27 @@ fn commit_text(problem: &CommitRefusal) -> String {
     }
 }
 
+/// Words for the refusals git itself gives that the user can act on, found
+/// in its output. `None` for everything else (the generic words and the
+/// details toggle stay).
+fn known_refusal(details: &str) -> Option<&'static str> {
+    const KNOWN: [(&str, &str); 3] = [
+        (
+            "No local changes to save",
+            "Nothing was stashed: there are no changes to tracked files. New files are saved only when \"Include untracked files\" is ticked.",
+        ),
+        (
+            "Your local changes to the following files would be overwritten",
+            "Some of your local changes are in the way. Commit or stash them, then try again.",
+        ),
+        ("No stash entries found", "There is no stash to apply."),
+    ];
+    KNOWN
+        .iter()
+        .find(|(phrase, _)| details.contains(phrase))
+        .map(|(_, words)| *words)
+}
+
 fn failure_text(failure: &Failure) -> (Tone, String) {
     let (tone, text) = match failure.class {
         ErrorClass::Expected => (Tone::Warning, "Git declined the operation."),
@@ -157,7 +178,12 @@ pub fn message(notice: &Notice) -> Option<Message> {
                 details: None,
             }),
             OpOutcome::Failed(failure) => {
-                let (tone, text) = failure_text(failure);
+                let (tone, mut text) = failure_text(failure);
+                if failure.class == ErrorClass::Expected
+                    && let Some(words) = known_refusal(&failure.details)
+                {
+                    text = words.into();
+                }
                 Some(Message {
                     tone,
                     text,
@@ -223,6 +249,66 @@ mod tests {
         assert_eq!(message.tone, Tone::Error);
     }
 
+    #[test]
+    fn git_refusals_the_user_can_act_on_have_their_own_words() {
+        let failed = |details: &str| {
+            message(&Notice::OpEnded {
+                op: OpId(3),
+                outcome: OpOutcome::Failed(Failure {
+                    class: ErrorClass::Expected,
+                    details: details.into(),
+                }),
+            })
+            .unwrap()
+        };
+        let none = failed("No local changes to save\n");
+        assert!(
+            none.text.starts_with("Nothing was stashed"),
+            "{}",
+            none.text
+        );
+        assert_eq!(none.details.as_deref(), Some("No local changes to save\n"));
+        let in_the_way = failed(
+            "error: Your local changes to the following files would be overwritten by merge:\n\ta.txt",
+        );
+        assert!(
+            in_the_way.text.contains("in the way"),
+            "{}",
+            in_the_way.text
+        );
+        assert_eq!(
+            failed("No stash entries found.").text,
+            "There is no stash to apply."
+        );
+        // Anything else keeps the generic words.
+        assert_eq!(failed("fatal: odd").text, "Git declined the operation.");
+        // Only an expected outcome is reworded.
+        let bug = message(&Notice::OpEnded {
+            op: OpId(4),
+            outcome: OpOutcome::Failed(Failure {
+                class: ErrorClass::Bug,
+                details: "No local changes to save".into(),
+            }),
+        })
+        .unwrap();
+        assert!(!bug.text.starts_with("Nothing was stashed"));
+    }
+
+    #[test]
+    fn the_drop_question_says_whether_undo_can_help() {
+        assert!(crate::branch_panel::drop_text("wip", true).contains("You can undo this."));
+        assert!(crate::branch_panel::drop_text("wip", false).contains("cannot be undone"));
+        assert!(crate::branch_panel::drop_text("On main: wip", true).contains("On main: wip"));
+    }
+
+    #[test]
+    fn the_stash_hint_follows_the_choices() {
+        use crate::branch_panel::stash_hint;
+        assert!(stash_hint(false, true).contains("no local changes"));
+        assert!(!stash_hint(true, true).contains("stay"));
+        assert!(stash_hint(true, true).contains("new files"));
+        assert!(stash_hint(true, false).contains("new files stay"));
+    }
     #[test]
     fn every_error_class_has_words() {
         for class in [
