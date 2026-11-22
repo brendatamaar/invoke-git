@@ -11,6 +11,7 @@
 pub mod components;
 pub mod convert;
 pub mod focus;
+pub mod fonts;
 pub mod summary;
 pub mod tabs;
 pub mod text;

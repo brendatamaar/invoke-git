@@ -36,6 +36,10 @@ impl UiTheme {
 /// Registers the theme global (dark, the default) and resolves fonts. Call
 /// once at start-up, before the first window renders.
 pub fn init(cx: &mut App) {
+    // Bundled Inter and JetBrains Mono first, so the stacks find them.
+    if let Err(error) = crate::fonts::register(cx) {
+        eprintln!("ui: could not register the bundled fonts: {error}");
+    }
     let installed = cx.text_system().all_font_names();
     cx.set_global(UiTheme {
         theme: Theme::default(),
