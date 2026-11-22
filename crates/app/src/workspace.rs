@@ -12,13 +12,11 @@ use invoke_core::Event;
 use shell::{DiscoverError, Discovered, Git, git::SetupError};
 use tokens::{SPACE_3, SPACE_4, TEXT_BODY, TEXT_TITLE};
 use ui::convert::hsla;
-use ui::{
-    Banner, BannerKind, Button, RepoSummary, Summary, TabBar, TabItem, TextStyleExt, ThemeExt,
-    Welcome,
-};
+use ui::{Banner, BannerKind, Button, Summary, TabBar, TabItem, TextStyleExt, ThemeExt, Welcome};
 
 use crate::paths;
 use crate::persist::{self, Saved};
+use crate::repo_view::RepoView;
 use crate::session::RepoSession;
 use crate::setup;
 use crate::tabs::{Active, Tabs};
@@ -45,7 +43,7 @@ enum Notice {
 
 pub struct Workspace {
     git: Result<Git, SetupError>,
-    tabs: Tabs<Entity<RepoSession>>,
+    tabs: Tabs<Entity<RepoView>>,
     notice: Option<Notice>,
     pub focus: FocusHandle,
     title: String,
@@ -111,7 +109,15 @@ impl Workspace {
                 .tabs
                 .items()
                 .iter()
-                .map(|session| session.read(cx).discovered.paths.workdir.clone())
+                .map(|view| {
+                    view.read(cx)
+                        .session
+                        .read(cx)
+                        .discovered
+                        .paths
+                        .workdir
+                        .clone()
+                })
                 .collect(),
             active: self.tabs.active_index(),
         }
@@ -221,16 +227,16 @@ impl Workspace {
     fn add_repo(&mut self, found: Discovered, cx: &mut Context<Self>) {
         let Ok(git) = self.git.clone() else { return };
         self.notice = None;
-        let existing = self.tabs.position(|session| {
+        let existing = self.tabs.position(|view| {
             paths::same_repo(
-                &session.read(cx).discovered.paths.workdir,
+                &view.read(cx).session.read(cx).discovered.paths.workdir,
                 &found.paths.workdir,
             )
         });
         self.tabs.open(existing, || {
             let session = cx.new(|cx| RepoSession::new(found, git, cx));
             cx.observe(&session, |_, _, cx| cx.notify()).detach();
-            session
+            cx.new(|cx| RepoView::new(session, cx))
         });
         self.changed(cx);
     }
@@ -247,7 +253,11 @@ impl Workspace {
 
     /// Reads the selected repo again (F5), for when the watcher is not running.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if let Some(session) = self.tabs.active_item() {
+        if let Some(session) = self
+            .tabs
+            .active_item()
+            .map(|view| view.read(cx).session.clone())
+        {
             session.update(cx, |session, cx| {
                 session.deliver(Event::RefreshRequested, cx)
             });
@@ -298,9 +308,9 @@ impl Workspace {
 
     fn window_title(&self, cx: &gpui::App) -> String {
         match self.tabs.active_item() {
-            Some(session) => format!(
+            Some(view) => format!(
                 "{} — Invoke Git",
-                paths::title(&session.read(cx).discovered.paths.workdir)
+                paths::title(&view.read(cx).session.read(cx).discovered.paths.workdir)
             ),
             None => "Invoke Git".to_owned(),
         }
@@ -381,8 +391,8 @@ impl Workspace {
             .tabs
             .items()
             .iter()
-            .map(|session| {
-                let session = session.read(cx);
+            .map(|view| {
+                let session = view.read(cx).session.read(cx);
                 TabItem {
                     title: paths::title(&session.discovered.paths.workdir).into(),
                     badge: Summary::of(&session.state).badge().into(),
@@ -423,19 +433,7 @@ impl Render for Workspace {
         }
         let content = match self.tabs.active() {
             Active::Welcome => self.render_welcome(cx),
-            Active::Repo(index) => {
-                let session = self.tabs.items()[index].read(cx);
-                let mut summary = RepoSummary::new(
-                    Summary::of(&session.state),
-                    session.discovered.paths.workdir.display().to_string(),
-                );
-                if let Some(error) = &session.watch_error {
-                    summary = summary.warning(format!(
-                        "Changes made outside Invoke Git will not show up on their own ({error}). Press F5 to refresh."
-                    ));
-                }
-                summary.into_any_element()
-            }
+            Active::Repo(index) => self.tabs.items()[index].clone().into_any_element(),
         };
         root.child(self.render_tab_bar(cx)).child(
             div()

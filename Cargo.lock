@@ -6428,8 +6428,10 @@ dependencies = [
 name = "ui"
 version = "0.0.0"
 dependencies = [
+ "diff",
  "gpui",
  "gpui_platform",
+ "highlight",
  "invoke-core",
  "proptest",
  "tokens",

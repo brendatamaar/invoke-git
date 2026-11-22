@@ -7,6 +7,7 @@ mod divider;
 mod pill;
 mod progress;
 mod section_label;
+mod segmented;
 
 pub use banner::{Banner, BannerKind};
 pub use button::{Button, ButtonKind};
@@ -15,3 +16,4 @@ pub use divider::Divider;
 pub use pill::Pill;
 pub use progress::{ProgressBar, clamp_fraction};
 pub use section_label::SectionLabel;
+pub use segmented::Segmented;

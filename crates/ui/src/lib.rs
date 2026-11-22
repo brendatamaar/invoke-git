@@ -8,20 +8,27 @@
 //! active colours and `.text_style(&tokens::TEXT_BODY, cx)` sets a token
 //! text style on any element.
 
+pub mod changes;
+pub mod code_text;
 pub mod components;
 pub mod convert;
+pub mod diff_rows;
+pub mod diff_view;
 pub mod focus;
 pub mod fonts;
+pub mod scrollbar;
 pub mod summary;
 pub mod tabs;
 pub mod text;
 pub mod theme;
 pub mod welcome;
 
+pub use changes::{ChangeList, ListRow, Section, list_rows};
 pub use components::{
     Banner, BannerKind, Button, ButtonKind, CheckState, Checkbox, Divider, Pill, ProgressBar,
-    SectionLabel,
+    SectionLabel, Segmented,
 };
+pub use diff_view::{Around, Content as DiffContent, DiffData, DiffView};
 pub use summary::{RepoSummary, Summary};
 pub use tabs::{TabBar, TabItem};
 pub use text::TextStyleExt;

@@ -2,8 +2,10 @@
 
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
+mod diff_load;
 mod paths;
 mod persist;
+mod repo_view;
 mod session;
 mod setup;
 mod tabs;

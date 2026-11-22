@@ -3,7 +3,7 @@
 
 use gpui::{App, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div, px};
 use invoke_core::{Freshness, Head, LockState, Phase, RepoState, Snapshot, Tracking};
-use tokens::{SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_SMALL};
+use tokens::{SPACE_2, SPACE_3, TEXT_BODY, TEXT_SMALL};
 
 use crate::components::{Banner, BannerKind, Pill};
 use crate::convert::hsla;
@@ -199,49 +199,43 @@ impl RenderOnce for RepoSummary {
             }
         }
 
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .gap(px(SPACE_4))
-            .p(px(SPACE_4))
-            .bg(hsla(p.bg_panel));
+        header = header.child(div().flex_1()).child(
+            div()
+                .min_w(px(0.))
+                .truncate()
+                .text_style(&tokens::TEXT_CODE_SMALL, cx)
+                .text_color(hsla(p.ink_faint))
+                .child(self.path),
+        );
+
+        let mut body = div().flex().flex_col().flex_none().gap(px(SPACE_2));
+        let mut any = false;
         if let Some(phase) = &s.phase {
             body = body.child(Banner::new(BannerKind::Warning, phase.clone()));
+            any = true;
         }
         if let Some(warning) = self.warning {
             body = body.child(Banner::new(BannerKind::Warning, warning));
+            any = true;
         }
         if let Some(lock) = &s.lock {
             body = body.child(Banner::new(BannerKind::Warning, lock.clone()));
+            any = true;
         }
         if s.stale {
             body = body.child(Banner::new(
                 BannerKind::Error,
                 "The last read failed. What you see may be out of date.",
             ));
+            any = true;
         }
-        if !s.reading {
-            body = body.child(
-                div()
-                    .text_style(&TEXT_BODY, cx)
-                    .text_color(hsla(p.ink))
-                    .child(s.changes()),
-            );
-        }
-        body = body.child(
-            div()
-                .text_style(&tokens::TEXT_CODE_SMALL, cx)
-                .text_color(hsla(p.ink_faint))
-                .child(self.path),
-        );
+        let banners = any.then(|| body.p(px(SPACE_2)).border_b_1().border_color(hsla(p.line)));
         div()
             .flex()
             .flex_col()
-            .flex_1()
-            .min_h(px(0.))
+            .flex_none()
             .child(header)
-            .child(body)
+            .children(banners)
     }
 }
 
