@@ -41,6 +41,14 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         Event::UnstageRequested(request) => {
             enqueue_index_write(&mut state, Action::Unstage, request, WriteRequest::Unstage);
         }
+        // Task 13: an empty patch changes nothing and is refused up front.
+        Event::DiscardRequested(request) => {
+            if request.patch.0.is_empty() {
+                refuse_because(&mut state, Action::Discard, Refusal::NothingSelected);
+            } else {
+                enqueue(&mut state, WriteRequest::Discard(request));
+            }
+        }
         // Task 17.
         Event::PushRequested {
             to,
@@ -249,7 +257,12 @@ fn cancel(state: &mut RepoState, op: OpId, commands: &mut Vec<Command>) {
         // law 13 would not hold. It is local and quick.
         // Task 23: the same for the conflict flow. Killing an abort or a
         // continue half way would leave git between two states of its own.
-        if is_stash(&running.request) || is_conflict_flow(&running.request) {
+        // Task 13: a discard is one patch run plus the records around it;
+        // killing it between the two would lose the undo.
+        if is_stash(&running.request)
+            || is_conflict_flow(&running.request)
+            || matches!(running.request, WriteRequest::Discard(_))
+        {
             return;
         }
         if !matches!(running.phase, OpPhase::Cancelling) {
@@ -334,7 +347,9 @@ fn settle_undo(state: &mut RepoState, commands: &mut Vec<Command>) {
             let reversible = match &point.reverse {
                 Reversal::Never(why) => Reversible::No(*why),
                 Reversal::StashKept(_) => Reversible::No(Irreversible::StashNotOnTop),
-                Reversal::Refs | Reversal::StashStore(_) => Reversible::Yes,
+                Reversal::Refs | Reversal::StashStore(_) | Reversal::Discard { .. } => {
+                    Reversible::Yes
+                }
             };
             let pruned = state.undo.push(UndoEntry {
                 point,
@@ -476,6 +491,40 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     op: id,
                     patch: stage.patch.clone(),
                     expect_index: expect.index.clone(),
+                });
+                state.undo.pending = UndoPending::Recording { point };
+            }
+            // Task 13. Refused in a merge, rebase, cherry-pick or revert, like
+            // the other writes that rewrite files, and when the diff the patch
+            // was built from is older than the index on disk. The file's own
+            // bytes are checked by the shell (`expect_file`, rule 5).
+            WriteRequest::Discard(discard) => {
+                if disk.phase != Phase::Clean {
+                    refuse_because(state, Action::Discard, Refusal::RepoBusy);
+                    continue;
+                }
+                if discard.based_on != expect.index {
+                    refuse_because(state, Action::Discard, Refusal::StaleDiff);
+                    continue;
+                }
+                let path = discard.selection.path().clone();
+                // Neither a ref nor the index changes.
+                let point = UndoPoint {
+                    op: id,
+                    label: discard.selection.label("Discard"),
+                    head: HeadTarget::of(&disk.head),
+                    refs: Vec::new(),
+                    index: expect.index.clone(),
+                    index_effect: IndexEffect::Untouched,
+                    reverse: Reversal::Discard { path: path.clone() },
+                };
+                commands.push(Command::SnapshotForUndo(point.clone()));
+                commands.push(Command::ApplyPatchToWorktree {
+                    op: id,
+                    patch: discard.patch.clone(),
+                    path,
+                    expect_index: expect.index.clone(),
+                    expect_file: discard.expect_file.clone(),
                 });
                 state.undo.pending = UndoPending::Recording { point };
             }

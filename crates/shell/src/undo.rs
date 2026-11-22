@@ -40,10 +40,22 @@ pub enum Snapshotted {
     Failed(Event),
 }
 
+/// Task 13: where the content of a discarded file, as it was before the
+/// discard, is kept alive (a tree holding the file's blob and mode).
+pub fn discard_ref(op: OpId) -> String {
+    format!("refs/invoke-git/undo/{}-discard", op.0)
+}
+
+/// Task 13: the same for the file as the discard left it. An undo only
+/// writes the saved content back while the file still holds this.
+pub fn discard_after_ref(op: OpId) -> String {
+    format!("refs/invoke-git/undo/{}-discard-after", op.0)
+}
+
 pub struct UndoRunner {
-    git: Git,
-    paths: RepoPaths,
-    env: Vec<(OsString, OsString)>,
+    pub(crate) git: Git,
+    pub(crate) paths: RepoPaths,
+    pub(crate) env: Vec<(OsString, OsString)>,
 }
 
 impl UndoRunner {
@@ -122,6 +134,12 @@ impl UndoRunner {
             )
             .map_err(|details| fail(ErrorClass::Bug, details))?;
         }
+        // Task 13: a discard's undo needs the file as it is right now, and
+        // the snapshot is the last moment before the patch runs.
+        if let Reversal::Discard { path } = &point.reverse {
+            self.save_file(&discard_ref(op), path)
+                .map_err(|details| fail(ErrorClass::Bug, details))?;
+        }
         Ok(tree)
     }
 
@@ -138,6 +156,11 @@ impl UndoRunner {
         }
         if let Some(restore) = &replay.stash {
             return self.restore_stash(restore);
+        }
+        // Task 13: a discard's undo writes one file back and touches no ref
+        // and not the index.
+        if let Some(restore) = &replay.discard {
+            return self.restore_discard(restore);
         }
         let zero = "0".repeat(replay.tree.as_hex().len());
         let transaction = |restore: bool| {
@@ -277,11 +300,13 @@ impl UndoRunner {
         for op in ops {
             let _ = self.run(&["update-ref", "-d", &undo_ref(*op)], &[], None);
             let _ = self.run(&["update-ref", "-d", &stash_keep_ref(*op)], &[], None);
+            let _ = self.run(&["update-ref", "-d", &discard_ref(*op)], &[], None);
+            let _ = self.run(&["update-ref", "-d", &discard_after_ref(*op)], &[], None);
         }
     }
 
     /// Runs git and returns stdout, or stderr (with the command) on failure.
-    fn run(
+    pub(crate) fn run(
         &self,
         args: &[&str],
         extra_env: &[(&str, &std::ffi::OsStr)],

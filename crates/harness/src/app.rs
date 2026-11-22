@@ -13,7 +13,7 @@ use invoke_core::{
     open, step,
 };
 use shell::undo::Snapshotted;
-use shell::{Git, GitRunner, StagingRunner, UndoRunner, read::read_event};
+use shell::{DiscardRunner, Git, GitRunner, StagingRunner, UndoRunner, read::read_event};
 
 use crate::gitdir::RepoDir;
 
@@ -36,6 +36,7 @@ pub struct App {
     pub state: RepoState,
     runner: GitRunner,
     staging: StagingRunner,
+    discard: DiscardRunner,
     undo: UndoRunner,
     /// Operations whose undo snapshot failed: their git run is skipped.
     skip: BTreeSet<OpId>,
@@ -51,6 +52,7 @@ impl App {
         let mut app = Self {
             runner: GitRunner::new(git(), repo.paths.clone()).with_env(repo.env.clone()),
             staging: StagingRunner::new(git(), repo.paths.clone()).with_env(repo.env.clone()),
+            discard: DiscardRunner::new(git(), repo.paths.clone()).with_env(repo.env.clone()),
             undo: UndoRunner::new(git(), repo.paths.clone()).with_env(repo.env.clone()),
             repo,
             state,
@@ -102,6 +104,21 @@ impl App {
                 patch,
                 expect_index,
             } => self.deliver(self.staging.apply(op, &patch, &expect_index)),
+            Command::ApplyPatchToWorktree {
+                op,
+                patch,
+                path,
+                expect_index,
+                expect_file,
+            } => {
+                if self.skip.remove(&op) {
+                    return;
+                }
+                let done =
+                    self.discard
+                        .apply(op, &patch, &path, &expect_index, expect_file.as_ref());
+                self.deliver(done);
+            }
             Command::ReplayUndo(replay) => self.deliver(self.undo.replay(&replay)),
             Command::PruneUndo(ops) => self.undo.prune(&ops),
             other => panic!("the harness does not drive {other:?}"),

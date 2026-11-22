@@ -276,6 +276,8 @@ pub enum Notice {
 pub enum Action {
     Stage,
     Unstage,
+    // Task 13.
+    Discard,
     Commit,
     Push,
     Undo,

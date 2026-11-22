@@ -559,6 +559,7 @@ fn replay_refuses_when_a_ref_is_not_where_planned() {
         head: None,
         expect: precondition::current(&repo.paths).unwrap(),
         stash: None,
+        discard: None,
     };
 
     // Planned against `first`, but main is at `second`.
@@ -604,6 +605,7 @@ fn replay_refuses_a_stale_expect() {
         head: None,
         expect: stale,
         stash: None,
+        discard: None,
     });
     assert!(matches!(
         outcome,

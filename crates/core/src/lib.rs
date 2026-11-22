@@ -32,8 +32,9 @@ pub use ids::{
 };
 pub use message::{CommitMessage, MessageProblem, SubjectHint, SubjectLevel};
 pub use ops::{
-    AuthAnswer, AuthKind, AuthPrompt, BranchStart, ErrorClass, Failure, GitArgs, Lease, OpOutcome,
-    Patch, Progress, PullMode, RemoteBranch, Selection, StageRequest, WriteRequest,
+    AuthAnswer, AuthKind, AuthPrompt, BranchStart, DiscardRequest, ErrorClass, Failure, GitArgs,
+    Lease, OpOutcome, Patch, Progress, PullMode, RemoteBranch, Selection, StageRequest,
+    WriteRequest,
 };
 pub use stash::StashEntry;
 pub use state::{
@@ -43,6 +44,6 @@ pub use state::{
 };
 pub use step::{open, step};
 pub use undo::{
-    HeadRestore, Irreversible, MAX_POINTS, RestoreRef, Reversal, Reversible, StashRestore,
-    UndoEntry, UndoPending, UndoReplay, UndoStack,
+    DiscardRestore, HeadRestore, Irreversible, MAX_POINTS, RestoreRef, Reversal, Reversible,
+    StashRestore, UndoEntry, UndoPending, UndoReplay, UndoStack,
 };

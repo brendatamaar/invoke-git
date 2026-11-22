@@ -4,9 +4,10 @@
 //! The rules are the table in `docs/spec/diff-engine.md` -> "Line staging".
 //! Pure text in, text out; the shell applies the result.
 //!
-//! The patch applies to the *source* side, which is the index in both
-//! directions (stage: the diff's old side; unstage: the diff's new side,
-//! because the diff is HEAD to index there).
+//! The patch applies to the *source* side, which is the index for staging
+//! and unstaging (stage: the diff's old side; unstage: the diff's new side,
+//! because the diff is HEAD to index there) and the worktree file for a
+//! discard (the diff's new side, because the diff is index to worktree).
 //!
 //! The diff must have been made with exact whitespace comparison and
 //! without `ignore_blank_lines`: a context line then is the same bytes on
@@ -28,6 +29,19 @@ pub enum Direction {
     Stage,
     /// The diff is HEAD to index; selected changes come out of the index.
     Unstage,
+    /// Task 13: the diff is index to worktree; selected changes are taken
+    /// out of the worktree file (`git apply`, worktree only). The rewrite is
+    /// the one of `Unstage`: the patch applies to the diff's new side and
+    /// turns each selected line back into the old side's.
+    Discard,
+}
+
+impl Direction {
+    /// The patch applies to the diff's new side and undoes selected changes
+    /// (`Unstage` and `Discard`); otherwise to the old side and adds them.
+    fn reverts(self) -> bool {
+        matches!(self, Direction::Unstage | Direction::Discard)
+    }
 }
 
 /// What the user selected. Line numbers are positions in `Hunk::lines`
@@ -83,9 +97,10 @@ pub fn build_patch(
     pick: &Pick<'_>,
 ) -> Result<Option<String>, PatchError> {
     let mut selected = mask(diff, pick)?;
-    let (source, source_exists, result_exists) = match spec.direction {
-        Direction::Stage => (&diff.old, spec.old_exists, spec.new_exists),
-        Direction::Unstage => (&diff.new, spec.new_exists, spec.old_exists),
+    let (source, source_exists, result_exists) = if spec.direction.reverts() {
+        (&diff.new, spec.new_exists, spec.old_exists)
+    } else {
+        (&diff.old, spec.old_exists, spec.new_exists)
     };
 
     let mut body = String::new();
@@ -100,9 +115,10 @@ pub fn build_patch(
         let lines = rewrite(spec.direction, diff, hunk, &selected[h]);
         let old_len = lines.iter().filter(|l| l.sign != '+').count() as i64;
         let new_len = lines.iter().filter(|l| l.sign != '-').count() as i64;
-        let (start, len) = match spec.direction {
-            Direction::Stage => (hunk.old_start, hunk.old_len),
-            Direction::Unstage => (hunk.new_start, hunk.new_len),
+        let (start, len) = if spec.direction.reverts() {
+            (hunk.new_start, hunk.new_len)
+        } else {
+            (hunk.old_start, hunk.old_len)
         };
         // Lines before the hunk on the source side (git counts a hunk
         // without source lines from the line before it).
@@ -211,7 +227,7 @@ fn mask(diff: &TextDiff, pick: &Pick<'_>) -> Result<Vec<Vec<bool>>, PatchError> 
 ///   after `b`, so `b` must get its newline: select the removal of `b` and
 ///   the addition of its newline-terminated twin (the first added line with
 ///   the same text).
-/// * Unstage: the removal of the diff's last old line `b` (no newline in
+/// * Unstage and discard: the removal of the diff's last old line `b` (no newline in
 ///   HEAD) is selected, so `b` returns without a newline, yet an added line
 ///   after it stays in the index. Nothing may follow it, so every added line
 ///   after it is selected too.
@@ -236,7 +252,7 @@ fn widen(direction: Direction, diff: &TextDiff, hunk: &Hunk, selected: &mut [boo
                 }
             }
         }
-        Direction::Unstage => {
+        Direction::Unstage | Direction::Discard => {
             if selected[at] {
                 for i in after().filter(|&i| added(i)) {
                     selected[i] = true;
@@ -268,10 +284,10 @@ fn rewrite<'a>(
             (Direction::Stage, LineKind::Added, false) => None,
             (Direction::Stage, LineKind::Removed, true) => Some('-'),
             (Direction::Stage, LineKind::Removed, false) => Some(' '),
-            (Direction::Unstage, LineKind::Added, true) => Some('-'),
-            (Direction::Unstage, LineKind::Added, false) => Some(' '),
-            (Direction::Unstage, LineKind::Removed, true) => Some('+'),
-            (Direction::Unstage, LineKind::Removed, false) => None,
+            (Direction::Unstage | Direction::Discard, LineKind::Added, true) => Some('-'),
+            (Direction::Unstage | Direction::Discard, LineKind::Added, false) => Some(' '),
+            (Direction::Unstage | Direction::Discard, LineKind::Removed, true) => Some('+'),
+            (Direction::Unstage | Direction::Discard, LineKind::Removed, false) => None,
         };
         if let Some(sign) = sign {
             out.push(piece(diff, line, sign));

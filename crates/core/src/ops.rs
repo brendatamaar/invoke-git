@@ -20,6 +20,8 @@ pub enum WriteRequest {
     // Task 11: index writes from the status tree.
     Stage(StageRequest),
     Unstage(StageRequest),
+    // Task 13: takes lines out of a worktree file; undoable.
+    Discard(DiscardRequest),
     // Task 15: branches. Checked against the fresh snapshot at dispatch.
     CreateBranch {
         name: BranchName,
@@ -440,4 +442,23 @@ pub struct StageRequest {
     pub selection: Selection,
     pub patch: Patch,
     pub based_on: IndexId,
+}
+
+/// A discard the user asked for (task 13): selected changes are taken out of
+/// one worktree file. The patch is built by `diff::build_patch` with
+/// `Direction::Discard` from the diff index to worktree the user sees.
+///
+/// Discarding loses work, so the request carries both things it expects to
+/// find (rule 5): the index the diff was made against and the exact bytes of
+/// the worktree file it was made from. It is refused when either moved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscardRequest {
+    /// What was selected; names the undo point and the notice.
+    pub selection: Selection,
+    pub patch: Patch,
+    /// The index id the diff was made against.
+    pub based_on: IndexId,
+    /// The git blob id of the worktree file's bytes the diff was made from
+    /// (`None`: the file did not exist, so the discard brings it back).
+    pub expect_file: Option<Oid>,
 }

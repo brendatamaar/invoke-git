@@ -222,6 +222,7 @@ impl<'a> Driver<'a> {
         self.deliver(match direction {
             Direction::Stage => Event::StageRequested(request),
             Direction::Unstage => Event::UnstageRequested(request),
+            Direction::Discard => unreachable!("discard is tested in discard.rs"),
         });
         Some(())
     }
@@ -252,7 +253,7 @@ impl<'a> Driver<'a> {
 
 fn source_of(direction: Direction) -> Source {
     match direction {
-        Direction::Stage => Source::IndexToWorktree,
+        Direction::Stage | Direction::Discard => Source::IndexToWorktree,
         Direction::Unstage => Source::HeadToIndex,
     }
 }
