@@ -8,6 +8,7 @@ description = "GPUI component layer: a thin layer over GPUI that reads every col
 [dependencies]
 gpui.workspace = true
 tokens = { path = "../tokens" }
+invoke-core = { path = "../core" }
 
 [dev-dependencies]
 gpui_platform.workspace = true

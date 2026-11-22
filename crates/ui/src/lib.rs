@@ -11,12 +11,18 @@
 pub mod components;
 pub mod convert;
 pub mod focus;
+pub mod summary;
+pub mod tabs;
 pub mod text;
 pub mod theme;
+pub mod welcome;
 
 pub use components::{
     Banner, BannerKind, Button, ButtonKind, CheckState, Checkbox, Divider, Pill, ProgressBar,
     SectionLabel,
 };
+pub use summary::{RepoSummary, Summary};
+pub use tabs::{TabBar, TabItem};
 pub use text::TextStyleExt;
 pub use theme::{ThemeExt, UiTheme, init, set_theme};
+pub use welcome::Welcome;

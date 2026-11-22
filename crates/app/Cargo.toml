@@ -1,0 +1,21 @@
+[package]
+name = "app"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description = "The Invoke Git binary: wires the ui, core and shell crates."
+
+[[bin]]
+name = "invoke-git"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+invoke-core = { path = "../core" }
+shell = { path = "../shell" }
+tokens = { path = "../tokens" }
+ui = { path = "../ui" }
+
+[dev-dependencies]
+proptest.workspace = true
