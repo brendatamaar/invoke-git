@@ -8,17 +8,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui::{AppContext, Context, Entity, IntoElement, Render, Subscription, Task, Window};
+use gpui::{
+    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Task,
+    Window, div, px,
+};
 use invoke_core::{Head, RefsSnapshot, Snapshot};
 use shell::history::{CommitId, CommitMeta, HistoryEvent, read_meta, walk};
 use ui::time::relative;
 use ui::{GraphEvent, GraphView, RowMeta, ref_labels::ref_labels};
 
+use ui::ThemeExt;
+use ui::convert::hsla;
+
+use crate::commit_pane::CommitPane;
 use crate::session::RepoSession;
+
+/// The width of the commit detail beside the graph.
+const DETAIL_W: f32 = 520.0;
 
 pub struct HistoryPane {
     session: Entity<RepoSession>,
     pub graph: Entity<GraphView<CommitId>>,
+    detail: Entity<CommitPane>,
     cancel: Arc<AtomicBool>,
     started: bool,
     last_refs: Option<(Head, RefsSnapshot)>,
@@ -45,10 +56,13 @@ fn now_seconds() -> i64 {
 impl HistoryPane {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
         let graph = cx.new(|_| GraphView::<CommitId>::new());
+        let detail = cx.new(|cx| CommitPane::new(session.clone(), cx));
         let subscriptions = vec![
-            cx.subscribe(&graph, |this, _, event: &GraphEvent, cx| {
-                if let GraphEvent::NeedMeta(range) = event {
-                    this.load_meta(range.clone(), cx);
+            cx.subscribe(&graph, |this, graph, event: &GraphEvent, cx| match event {
+                GraphEvent::NeedMeta(range) => this.load_meta(range.clone(), cx),
+                GraphEvent::Selected(row) => {
+                    let id = graph.read(cx).id_at(*row).copied();
+                    this.detail.update(cx, |detail, cx| detail.show(id, cx));
                 }
             }),
             cx.observe(&session, |this, _, cx| this.session_changed(cx)),
@@ -56,6 +70,7 @@ impl HistoryPane {
         Self {
             session,
             graph,
+            detail,
             cancel: Arc::new(AtomicBool::new(false)),
             started: false,
             last_refs: None,
@@ -196,8 +211,20 @@ impl Drop for HistoryPane {
 }
 
 impl Render for HistoryPane {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        self.graph.clone()
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = cx.palette();
+        div()
+            .flex()
+            .size_full()
+            .child(div().flex_1().min_w(px(0.)).child(self.graph.clone()))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(DETAIL_W))
+                    .border_l_1()
+                    .border_color(hsla(p.line))
+                    .child(self.detail.clone()),
+            )
     }
 }
 

@@ -10,6 +10,7 @@
 
 pub mod changes;
 pub mod code_text;
+pub mod commit_detail;
 pub mod components;
 pub mod convert;
 pub mod diff_rows;
@@ -31,6 +32,7 @@ pub mod time;
 pub mod welcome;
 
 pub use changes::{ChangeList, ListRow, Section, list_rows};
+pub use commit_detail::{CommitDetail, CommitFile, CommitInfo, short_hash, split_message};
 pub use components::{
     Banner, BannerKind, Button, ButtonKind, CheckState, Checkbox, Divider, Pill, ProgressBar,
     SectionLabel, Segmented,

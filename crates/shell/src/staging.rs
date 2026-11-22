@@ -190,14 +190,14 @@ pub fn load_inputs(
 }
 
 #[derive(Clone)]
-struct Side {
-    text: String,
+pub(crate) struct Side {
+    pub(crate) text: String,
     executable: bool,
     /// The blob id of the bytes.
     blob: Oid,
 }
 
-fn text_of(
+pub(crate) fn text_of(
     path: &RepoPath,
     bytes: Vec<u8>,
     executable: bool,

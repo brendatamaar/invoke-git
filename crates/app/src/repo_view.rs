@@ -509,12 +509,11 @@ impl Render for RepoView {
         });
 
         let body = match self.page {
-            Page::History => div().flex().flex_1().min_h(px(0.)).child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .child(self.history.read(cx).graph.clone()),
-            ),
+            Page::History => div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .child(div().flex_1().min_w(px(0.)).child(self.history.clone())),
             Page::Changes => div()
                 .flex()
                 .flex_1()

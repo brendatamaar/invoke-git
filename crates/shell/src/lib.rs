@@ -6,6 +6,7 @@
 pub mod askpass;
 pub mod classify;
 pub mod clone;
+pub mod commit_detail;
 pub mod conflict;
 pub mod discard;
 pub mod discover;

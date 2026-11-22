@@ -15,6 +15,22 @@ pub fn format_date(seconds: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// `YYYY-MM-DD HH:MM +HH:MM`: the author's own local time and the offset it
+/// was written with, as the commit detail shows it.
+pub fn format_date_time(seconds: i64, offset: i32) -> String {
+    let local = seconds.saturating_add(i64::from(offset));
+    let day_seconds = local.rem_euclid(86_400);
+    let (hours, minutes) = (day_seconds / 3_600, day_seconds % 3_600 / 60);
+    let sign = if offset < 0 { '-' } else { '+' };
+    let away = offset.unsigned_abs();
+    format!(
+        "{} {hours:02}:{minutes:02} {sign}{:02}:{:02}",
+        format_date(local),
+        away / 3_600,
+        away % 3_600 / 60
+    )
+}
+
 /// How long ago `then` was, at `now` (both Unix seconds): `just now`,
 /// `12 min ago`, `3 h ago`, `Yesterday`, `4 days ago`, and a plain date from
 /// a week on. A time in the future (clock skew) reads as `just now`. Numbers
@@ -45,6 +61,22 @@ mod tests {
         assert_eq!(format_date(-86_400), "1969-12-31");
     }
 
+    #[test]
+    fn date_time_uses_the_authors_offset() {
+        // 2024-03-05 03:20:30 UTC is 10:20 at +07:00, 22:50 the day before at -04:30.
+        assert_eq!(
+            format_date_time(1_709_608_830, 7 * 3_600),
+            "2024-03-05 10:20 +07:00"
+        );
+        assert_eq!(
+            format_date_time(1_709_608_830, 0),
+            "2024-03-05 03:20 +00:00"
+        );
+        assert_eq!(
+            format_date_time(1_709_608_830, -(4 * 3_600 + 1_800)),
+            "2024-03-04 22:50 -04:30"
+        );
+    }
     #[test]
     fn reads_like_the_mockup() {
         let now = 1_000_000_000;
