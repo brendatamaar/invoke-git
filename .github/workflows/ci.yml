@@ -1,7 +1,9 @@
 # CI matrix from docs/spec/verification.md ("Fixtures and CI"):
 # Windows builds and tests everything on every push; Linux and macOS run the
-# core (non-UI) suite to catch Windows-only assumptions. Benchmarks, Quint and
-# the nightly jobs arrive with their backlog tasks (24, 25).
+# core (non-UI) suite to catch Windows-only assumptions. Benchmarks and the
+# Kani nightly job arrive with their backlog tasks (25 and later). The
+# model-based harness (task 24) runs inside the core suite; the Quint specs
+# are checked by quint.yml and the 10000-sequence run is nightly.yml.
 name: CI
 
 on:
@@ -47,7 +49,13 @@ jobs:
           key: windows-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: windows-cargo-
 
+      # The model-based harness (backlog task 24) starts a few thousand git
+      # processes per 256 sequences, which is slow on Windows. Linux and macOS
+      # run the full 256 on every push and Linux runs 10000 nightly
+      # (nightly.yml); Windows runs 32 here to keep this job short.
       - name: Check (fmt, clippy, tests, all crates)
+        env:
+          INVOKE_HARNESS_CASES: "32"
         run: cargo xtask check
 
   core:
@@ -57,7 +65,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # The core suite includes the model-based harness: 256 sequences.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 

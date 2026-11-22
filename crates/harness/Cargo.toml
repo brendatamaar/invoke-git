@@ -1,0 +1,13 @@
+[package]
+name = "harness"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description = "Test-only: the laws registry and the model-based harness (backlog task 24). Real core + shell against a plain-git twin."
+
+[dependencies]
+invoke-core = { path = "../core" }
+shell = { path = "../shell" }
+diff = { path = "../diff" }
+proptest.workspace = true
+proptest-state-machine = "0.9"
