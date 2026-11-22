@@ -75,7 +75,8 @@ Staging, unstaging and discarding a selection all build a unified patch from the
 2. Rewrite each line by the table; existing context stays context.
 3. Recount the header: old length = context + `-` lines; new length = context + `+` lines. Shift each hunk's new start by the net line change of the hunks before it in this patch.
 4. Preserve end-of-file state: emit `\ No newline at end of file` exactly where the source line had `Eol::None`.
-5. Keep line endings byte for byte (CRLF stays CRLF).
+5. Keep line endings byte for byte (CRLF stays CRLF). The diff's two sides are the index blob and the worktree file after the repo's to-git filters (`core.autocrlf`, `text`, `eol`), so with `core.autocrlf=true` a CRLF checkout of an LF blob shows only its real edits and the patch is LF, like the index.
+6. A line without a final newline cannot be followed by another line, so a selection that touches one is widened: staging also takes the removal of the unterminated line and its newline-terminated twin; unstaging the removal of an unterminated line also takes the added lines after it.
 
 **Safety**
 

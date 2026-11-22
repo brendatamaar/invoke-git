@@ -122,7 +122,7 @@ Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are 
 | 19 | Commit detail view with its diff | UI | 10, 18 | Not started |
 | 20 | Stash: save (incl. untracked), apply, pop, drop | Core + UI | 5 | Core done |
 | 21 | Pre-push review screen: outgoing commits, combined and per-commit diffs | UI | 10, 17 | Not started |
-| 22 | Notes and annotations: SQLite store, anchoring, to-do warning on push | Core + UI | 21 | Not started |
+| 22 | Notes and annotations: SQLite store (`rusqlite`, approved 2026-11-22), anchoring, to-do warning on push; also persists the undo stack (task 12 follow-up) | Core + UI | 21 | Not started |
 | 23 | Conflict resolution UI with continue and abort | Core + UI | 10, 17 | Core done |
 | 24 | Laws as `proptest` tests and the model-based test harness, in CI | Verification | 3, 11, 12 | Done |
 | 25 | Benchmarks with performance budgets, failing CI on regression | Verification | 10, 11, 18 | Core done |

@@ -4,6 +4,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
 use invoke_core::{BranchName, ErrorClass, Expect, Failure, Head, IndexId, Oid, RefValue};
@@ -26,10 +27,28 @@ pub fn current(paths: &RepoPaths) -> Result<Expect, String> {
     Ok(Expect { head, index })
 }
 
-/// Opens the repo whose own git dir is `paths.git_dir`, ignoring the user's
-/// and the system's git config.
+static USER_CONFIG: AtomicBool = AtomicBool::new(false);
+
+/// Makes reads honour the user's and the system's git config, as git does
+/// (`core.autocrlf`, `core.excludesFile`, ...). Off by default, so tests are
+/// the same on every machine; the app turns it on at start-up. The repo's own
+/// config always applies.
+pub fn use_user_config(on: bool) {
+    USER_CONFIG.store(on, Ordering::Relaxed);
+}
+
+fn options() -> gix::open::Options {
+    if USER_CONFIG.load(Ordering::Relaxed) {
+        gix::open::Options::default()
+    } else {
+        gix::open::Options::isolated()
+    }
+}
+
+/// Opens the repo whose own git dir is `paths.git_dir`. See [`use_user_config`]
+/// for which config applies.
 pub(crate) fn open(paths: &RepoPaths) -> Result<gix::Repository, String> {
-    gix::open_opts(&paths.git_dir, gix::open::Options::isolated())
+    gix::open_opts(&paths.git_dir, options())
         .map_err(|error| format!("open {}: {error}", paths.git_dir.display()))
 }
 
@@ -37,7 +56,7 @@ pub(crate) fn open(paths: &RepoPaths) -> Result<gix::Repository, String> {
 /// Opening by git dir alone knows no worktree when the git dir is
 /// elsewhere (`--separate-git-dir`) or a linked worktree's own.
 pub(crate) fn open_with_worktree(paths: &RepoPaths) -> Result<gix::Repository, String> {
-    gix::open_opts(&paths.workdir, gix::open::Options::isolated())
+    gix::open_opts(&paths.workdir, options())
         .map_err(|error| format!("open {}: {error}", paths.workdir.display()))
 }
 

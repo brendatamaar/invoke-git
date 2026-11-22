@@ -20,6 +20,9 @@ use workspace::{
 fn main() {
     gpui_platform::application().run(|cx: &mut App| {
         ui::init(cx);
+        // Reads honour the user's git config like git does, so Git for
+        // Windows' `core.autocrlf=true` gives the same status and diffs.
+        shell::use_user_config(true);
         cx.bind_keys([
             KeyBinding::new("ctrl-o", OpenRepository, None),
             KeyBinding::new("ctrl-shift-o", InitRepository, None),

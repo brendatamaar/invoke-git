@@ -56,8 +56,8 @@ pub enum Phase {
 
 pub enum Event {
     // from the UI
-    StageRequested(Selection),
-    UnstageRequested(Selection),
+    StageRequested(StageRequest),   // selection (for labels) + the patch the UI built + the index id the diff was made against
+    UnstageRequested(StageRequest),
     CommitRequested { message: String, amend: bool },
     PushRequested { force_with_lease: bool },
     OpCancelRequested(OpId),
@@ -119,11 +119,16 @@ The shell executes commands and turns every outcome into an event; it holds no b
 - **Cancel:** kill the child process tree; on Windows use a job object so grandchildren (ssh, credential helpers) die too. After a cancel the shell always issues `ReadState` (law 13).
 - **Auth:** set `GIT_ASKPASS` and `SSH_ASKPASS` to a small helper binary shipped with the app. The helper connects back over a local named pipe, the core emits `AuthNeeded`, the UI shows the dialog, and the answer flows back to the helper. Nothing is written to disk.
 - **Concurrency:** one write at a time per repo (a queue in `OpQueue`); reads run freely alongside.
-- **Environment:** inherit the user's environment and git config untouched; never pass `-c` options that change behaviour (only output formatting).
+- **Environment:** inherit the user's environment and git config; never pass `-c` options that change behaviour (only output formatting). Three additions, none of which changes what git does:
+  - `GIT_TERMINAL_PROMPT=0`, so git never blocks on a hidden terminal.
+  - `LANGUAGE=en`, so git's messages are English and the classifier can match them. It changes message text only (git has no `en` catalogue and prints its built-in English).
+  - `GIT_EDITOR=true`, for the operations that would open an editor (continue a merge or rebase, `commit --no-edit` flows), so git never waits for one.
+- **Git config in reads:** reads through gix honour the user's and the system's git config, like git itself (`core.autocrlf`, `core.excludesFile`, `.gitattributes` filters). The app switches this on at start-up (`shell::use_user_config`); tests leave it off so they do not depend on the machine. The text a diff shows for a worktree file is that file after the same to-git filters `git add` applies, so a CRLF checkout of an LF blob shows only its real edits; the blob id kept for discard is that of the file's raw bytes.
+- **Stale lock files after a cancel:** terminating git hard (a Windows job object) can leave a `*.lock` it could not remove, which would look like "another git process is running" for ever. The shell never deletes a lock on its own. After a cancel, the core asks the user before removing a `*.lock` the cancelled operation could have created, and only when it is not newer than the kill.
 
 ## Undo design
 
-Undo restores refs and the index to their exact values before an operation (law 8); it never rewrites working-tree files except to reverse a discard.
+Undo restores refs and the index to their exact values before an operation (law 8); it never rewrites working-tree files except to reverse a discard or a branch switch.
 
 **What an undo point records** (taken by `SnapshotForUndo` before every write)
 
@@ -134,14 +139,15 @@ Undo restores refs and the index to their exact values before an operation (law 
 
 **Replaying an undo**
 
-1. Check each recorded ref still points where the operation left it; if anything else moved it since, refuse and explain (never undo over someone else's change).
-2. Restore refs with `git update-ref` using the old value as the expected value, so it is atomic against races.
+1. Check each recorded ref still points where the operation left it, and that `HEAD` is where the operation left it; if anything else moved them since, refuse and explain (never undo over someone else's change). This includes the index: an undo after the index changed for another reason (an outside `git add`, or a refresh that rewrote it) is refused, and the UI says the repo changed.
+2. Restore refs with `git update-ref` using the old value as the expected value, so it is atomic against races. When the operation moved `HEAD` (switch, rename, create and switch), move `HEAD` back first.
 3. Restore the index with `git read-tree` from the saved tree.
 4. For a discard, write the saved blobs back to their paths.
+5. Undoing a branch switch also puts the old branch's files back in the worktree (it is a checkout), because the user asked for the files to change.
 
 **Scope and limits**
 
-- The stack keeps the last 50 points per repo, in memory and in the app's SQLite store so it survives a restart.
+- The stack keeps the last 50 points per repo, in memory and in the app's SQLite store so it survives a restart. The store arrives with task 22; until then the stack is in memory only, and undo refs are named by the session's op id. On start-up the stored rows are reconciled against `refs/invoke-git/undo/*` and orphan refs are deleted.
 - Push is not undoable (it changed the remote); the UI says so in the push confirmation instead.
 - Saved trees and blobs are referenced from `refs/invoke-git/undo/*` so `git gc` keeps them; the oldest are pruned with their points.
 

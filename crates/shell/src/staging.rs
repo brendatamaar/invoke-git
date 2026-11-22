@@ -158,7 +158,7 @@ pub fn load_inputs(
     source: Source,
 ) -> Result<DiffInputs, InputsError> {
     let read = |error: String| InputsError::Read(error);
-    let repo = precondition::open(paths).map_err(read)?;
+    let repo = precondition::open_with_worktree(paths).map_err(read)?;
     let hash_len = repo.object_hash().len_in_bytes();
     let index_path = paths.git_dir.join("index");
     let id = |at: &Path| {
@@ -168,10 +168,7 @@ pub fn load_inputs(
 
     let index_side = read_index_side(&repo, path)?;
     let (old, new) = match source {
-        Source::IndexToWorktree => (
-            index_side.clone(),
-            read_worktree_side(paths, path, repo.object_hash())?,
-        ),
+        Source::IndexToWorktree => (index_side.clone(), read_worktree_side(&repo, paths, path)?),
         Source::HeadToIndex => (read_head_side(&repo, path)?, index_side.clone()),
     };
 
@@ -286,10 +283,14 @@ pub fn blob_id(hash: gix::hash::Kind, bytes: &[u8]) -> Result<Oid, String> {
     precondition::oid(&id)
 }
 
+/// The worktree file's text as `git add` would store it: through the repo's
+/// filters (`core.autocrlf`, `.gitattributes` `text` and `eol`), so a CRLF
+/// checkout of an LF blob is the same text as the index and only real edits
+/// differ. The blob id is that of the raw file bytes.
 fn read_worktree_side(
+    repo: &gix::Repository,
     paths: &RepoPaths,
     path: &RepoPath,
-    hash: gix::hash::Kind,
 ) -> Result<Option<Side>, InputsError> {
     let full = paths.workdir.join(&path.0);
     let metadata = match fs::symlink_metadata(&full) {
@@ -303,10 +304,39 @@ fn read_worktree_side(
             path.0
         )));
     }
-    let bytes =
-        fs::read(&full).map_err(|error| InputsError::Read(format!("{}: {error}", path.0)))?;
-    let blob = blob_id(hash, &bytes).map_err(InputsError::Read)?;
+    let raw = fs::read(&full).map_err(|error| InputsError::Read(format!("{}: {error}", path.0)))?;
+    // The id is of the file's own bytes: discard and its undo compare those
+    // exactly. Only the text for the diff goes through the filters.
+    let blob = blob_id(repo.object_hash(), &raw).map_err(InputsError::Read)?;
+    let bytes = filter_to_git(repo, path, raw)?;
     text_of(path, bytes, is_executable(&metadata), blob).map(Some)
+}
+
+/// Runs `bytes` through the repo's to-git filters, as `git add` does.
+fn filter_to_git(
+    repo: &gix::Repository,
+    path: &RepoPath,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, InputsError> {
+    use std::io::Read;
+    let read = |what: &str, error: &dyn std::fmt::Display| {
+        InputsError::Read(format!("{what} {}: {error}", path.0))
+    };
+    let (mut pipeline, index) = repo
+        .filter_pipeline(None)
+        .map_err(|e| read("prepare filters for", &e))?;
+    let state: &gix::index::State = match &index {
+        gix::worktree::IndexPersistedOrInMemory::Persisted(file) => file,
+        gix::worktree::IndexPersistedOrInMemory::InMemory(file) => file,
+    };
+    let mut outcome = pipeline
+        .convert_to_git(&bytes[..], Path::new(&path.0), state)
+        .map_err(|e| read("filter", &e))?;
+    let mut converted = Vec::with_capacity(bytes.len());
+    outcome
+        .read_to_end(&mut converted)
+        .map_err(|e| read("read filtered", &e))?;
+    Ok(converted)
 }
 
 #[cfg(unix)]

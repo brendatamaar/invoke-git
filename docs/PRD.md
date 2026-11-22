@@ -335,6 +335,7 @@ Build everything that is the product; use libraries only for plumbing that would
 | Git writes and network | Library | System git CLI (≥ 2.40, detected at startup) |
 | Language grammars | Library | tree-sitter grammars |
 | File watching | Library | `notify` |
+| Notes and undo-stack store (task 22) | Library | SQLite through `rusqlite` (approved 2026-11-22); one database in the app data folder, never inside `.git` |
 | Keychain | Library | `keyring` |
 | Async runtime | Library | GPUI executors, `smol` where needed |
 | Process-tree cancel on Windows (job objects) | Library | `windows-sys` (Win32 bindings, Windows only) |
