@@ -20,7 +20,8 @@ use ui::{
 
 use crate::branch_panel::BranchPanel;
 use crate::commit_box::CommitBox;
-use crate::diff_load::{self, Loaded};
+use crate::diff_load::{self, Loaded, Verb};
+use crate::discard::{self, Confirm, What};
 use crate::history_view::HistoryPane;
 use crate::notice::{self, Tone};
 use crate::session::RepoSession;
@@ -56,7 +57,9 @@ pub struct RepoView {
     diff: Entity<DiffView>,
     selected: Option<(Section, RepoPath)>,
     collapsed: HashSet<(Section, String)>,
-    queue: VecDeque<(Section, RepoPath)>,
+    queue: VecDeque<(Verb, Section, RepoPath)>,
+    /// A discard waiting for the user's yes.
+    confirm: Option<Confirm>,
     bulk: Bulk,
     /// Something the app itself has to say (a file that cannot be staged).
     local_notice: Option<String>,
@@ -124,6 +127,7 @@ impl RepoView {
             selected: None,
             collapsed: HashSet::new(),
             queue: VecDeque::new(),
+            confirm: None,
             bulk: Bulk::Idle,
             local_notice: None,
             last_read: None,
@@ -196,6 +200,7 @@ impl RepoView {
     }
 
     fn clear(&mut self, cx: &mut Context<Self>) {
+        self.confirm = None;
         self.selected = None;
         self.request += 1;
         self.diff.update(cx, |diff, cx| {
@@ -204,6 +209,7 @@ impl RepoView {
     }
 
     fn select(&mut self, section: Section, path: RepoPath, cx: &mut Context<Self>) {
+        self.confirm = None;
         self.selected = Some((section, path.clone()));
         self.diff
             .update(cx, |diff, cx| diff.set_content(DiffContent::Loading, cx));
@@ -279,13 +285,29 @@ impl RepoView {
         let Some((section, path)) = self.selected.clone() else {
             return;
         };
-        let part = match event {
-            DiffEvent::Hunk { hunk } => Part::Hunk(*hunk),
-            DiffEvent::Lines { hunk, lines } => Part::Lines {
-                hunk: *hunk,
-                lines: lines.clone(),
-            },
+        let (part, discard) = match event {
+            DiffEvent::Hunk { hunk } => (Part::Hunk(*hunk), false),
+            DiffEvent::Lines { hunk, lines } => (
+                Part::Lines {
+                    hunk: *hunk,
+                    lines: lines.clone(),
+                },
+                false,
+            ),
+            DiffEvent::DiscardFile => (Part::File, true),
+            DiffEvent::DiscardHunk { hunk } => (Part::Hunk(*hunk), true),
+            DiffEvent::DiscardLines { hunk, lines } => (
+                Part::Lines {
+                    hunk: *hunk,
+                    lines: lines.clone(),
+                },
+                true,
+            ),
         };
+        if discard {
+            self.ask_to_discard(&path, &part, cx);
+            return;
+        }
         let request = {
             let view = self.diff.read(cx);
             let Some(data) = view.data() else { return };
@@ -295,6 +317,51 @@ impl RepoView {
         if let Some(request) = request {
             self.deliver(request, cx);
         }
+    }
+
+    /// Builds the discard of `part` of the file on show from the diff as it
+    /// is shown, and asks before sending it.
+    fn ask_to_discard(&mut self, path: &RepoPath, part: &Part, cx: &mut Context<Self>) {
+        let confirm = {
+            let view = self.diff.read(cx);
+            let Some(data) = view.data() else { return };
+            let Some(inputs) = &data.inputs else { return };
+            let Some(event) = staging::discard_request(path, &data.diff, inputs, part) else {
+                return;
+            };
+            let (text, button) = discard::describe(path, &data.diff, inputs, part);
+            Confirm {
+                text,
+                button,
+                what: What::Request(Box::new(event)),
+            }
+        };
+        self.local_notice = None;
+        self.confirm = Some(confirm);
+        cx.notify();
+    }
+
+    /// The user said yes.
+    fn confirm_discard(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirm.take() else {
+            return;
+        };
+        match confirm.what {
+            What::Request(event) => self.deliver(*event, cx),
+            What::Files(files) => self.enqueue_with(
+                files
+                    .into_iter()
+                    .map(|path| (Verb::Discard, Section::Unstaged, path))
+                    .collect(),
+                cx,
+            ),
+        }
+        cx.notify();
+    }
+
+    fn cancel_discard(&mut self, cx: &mut Context<Self>) {
+        self.confirm = None;
+        cx.notify();
     }
 
     fn deliver(&mut self, event: Event, cx: &mut Context<Self>) {
@@ -331,6 +398,19 @@ impl RepoView {
                     .collect(),
                 cx,
             ),
+            TreeAction::DiscardAll => {
+                let files = files_of(&status, Section::Unstaged, None);
+                if !files.is_empty() {
+                    let (text, button) = discard::describe_files(files.len());
+                    self.confirm = Some(Confirm {
+                        text,
+                        button,
+                        what: What::Files(files),
+                    });
+                    self.local_notice = None;
+                    cx.notify();
+                }
+            }
             TreeAction::All { section } => self.enqueue(
                 files_of(&status, section, None)
                     .into_iter()
@@ -342,6 +422,13 @@ impl RepoView {
     }
 
     fn enqueue(&mut self, files: Vec<(Section, RepoPath)>, cx: &mut Context<Self>) {
+        let files = files
+            .into_iter()
+            .map(|(section, path)| (Verb::Toggle, section, path));
+        self.enqueue_with(files.collect(), cx);
+    }
+
+    fn enqueue_with(&mut self, files: Vec<(Verb, Section, RepoPath)>, cx: &mut Context<Self>) {
         self.local_notice = None;
         self.queue.extend(files);
         self.next_in_queue(cx);
@@ -352,7 +439,7 @@ impl RepoView {
         if !matches!(self.bulk, Bulk::Idle) || !self.settled(cx) {
             return;
         }
-        let Some((section, path)) = self.queue.pop_front() else {
+        let Some((verb, section, path)) = self.queue.pop_front() else {
             return;
         };
         self.bulk = Bulk::Preparing;
@@ -362,7 +449,7 @@ impl RepoView {
                 .background_executor()
                 .spawn({
                     let path = path.clone();
-                    async move { diff_load::file_request(&paths, &path, section) }
+                    async move { diff_load::file_request(&paths, &path, section, verb) }
                 })
                 .await;
             this.update(cx, |this, cx| match result {
@@ -376,7 +463,12 @@ impl RepoView {
                     this.next_in_queue(cx);
                 }
                 Err(message) => {
-                    this.local_notice = Some(format!("Cannot stage {}: {message}", path.0));
+                    let what = if verb == Verb::Discard {
+                        "discard"
+                    } else {
+                        "stage"
+                    };
+                    this.local_notice = Some(format!("Cannot {what} {}: {message}", path.0));
                     this.bulk = Bulk::Idle;
                     this.next_in_queue(cx);
                     cx.notify();
@@ -475,6 +567,23 @@ impl Render for RepoView {
 
         let mut banners = div().flex().flex_col().flex_none().gap(px(SPACE_2));
         let mut any = false;
+        if let Some(confirm) = &self.confirm {
+            let (yes, no) = (cx.entity(), cx.entity());
+            banners = banners.child(
+                Banner::new(BannerKind::Warning, confirm.text.clone())
+                    .action(
+                        Button::new("confirm-discard", confirm.button.clone())
+                            .danger()
+                            .on_click(move |_, _, cx| {
+                                yes.update(cx, |view, cx| view.confirm_discard(cx))
+                            }),
+                    )
+                    .action(Button::new("cancel-discard", "Cancel").ghost().on_click(
+                        move |_, _, cx| no.update(cx, |view, cx| view.cancel_discard(cx)),
+                    )),
+            );
+            any = true;
+        }
         if let Some(text) = &self.local_notice {
             banners = banners.child(Banner::new(BannerKind::Warning, text.clone()));
             any = true;

@@ -4,7 +4,7 @@
 //! index moved (rule 5).
 
 use diff::{Direction, Mode, PatchSpec, Pick, TextDiff, build_patch};
-use invoke_core::{Event, Patch, RepoPath, Selection, StageRequest};
+use invoke_core::{DiscardRequest, Event, Patch, RepoPath, Selection, StageRequest};
 use ui::{InputsMeta, Section};
 
 /// What to stage or unstage.
@@ -15,19 +15,15 @@ pub enum Part {
     Lines { hunk: usize, lines: Vec<usize> },
 }
 
-/// Builds the event for `part` of `path`, from the diff as it is shown.
-/// `None` when the selection changes nothing (only context lines).
-pub fn request(
-    section: Section,
+/// What a selection of a diff turns into: the patch and the selection that
+/// names it.
+fn build(
     path: &RepoPath,
     diff: &TextDiff,
     inputs: &InputsMeta,
     part: &Part,
-) -> Option<Event> {
-    let direction = match section {
-        Section::Unstaged => Direction::Stage,
-        Section::Staged => Direction::Unstage,
-    };
+    direction: Direction,
+) -> Option<(Selection, Patch)> {
     let spec = PatchSpec {
         path: &path.0,
         direction,
@@ -58,9 +54,45 @@ pub fn request(
         ),
     };
     let patch = build_patch(diff, &spec, &pick).ok().flatten()?;
+    Some((selection, Patch(patch)))
+}
+
+/// A discard of `part` of the unstaged changes of `path`. The request
+/// carries the index id the diff was made against and the exact bytes of the
+/// worktree file it was made from; the core refuses it when either moved
+/// (rule 5). `None` when the selection changes nothing.
+pub fn discard_request(
+    path: &RepoPath,
+    diff: &TextDiff,
+    inputs: &InputsMeta,
+    part: &Part,
+) -> Option<Event> {
+    let (selection, patch) = build(path, diff, inputs, part, Direction::Discard)?;
+    Some(Event::DiscardRequested(DiscardRequest {
+        selection,
+        patch,
+        based_on: inputs.based_on.clone(),
+        expect_file: inputs.new_blob.clone(),
+    }))
+}
+
+/// Builds the event for `part` of `path`, from the diff as it is shown.
+/// `None` when the selection changes nothing (only context lines).
+pub fn request(
+    section: Section,
+    path: &RepoPath,
+    diff: &TextDiff,
+    inputs: &InputsMeta,
+    part: &Part,
+) -> Option<Event> {
+    let direction = match section {
+        Section::Unstaged => Direction::Stage,
+        Section::Staged => Direction::Unstage,
+    };
+    let (selection, patch) = build(path, diff, inputs, part, direction)?;
     let request = StageRequest {
         selection,
-        patch: Patch(patch),
+        patch,
         based_on: inputs.based_on.clone(),
     };
     Some(match section {
@@ -82,6 +114,7 @@ mod tests {
             executable: false,
             old_exists: true,
             new_exists: true,
+            new_blob: None,
         }
     }
 
@@ -122,6 +155,56 @@ mod tests {
         assert!(request(Section::Unstaged, &path, &diff(), &inputs(), &part).is_none());
     }
 
+    #[test]
+    fn a_discard_carries_what_it_expects_to_find() {
+        let mut meta = inputs();
+        meta.based_on = IndexId::Checksum(Oid::from_hex(&"ab".repeat(20)).unwrap());
+        let blob = Oid::from_hex(&"cd".repeat(20)).unwrap();
+        meta.new_blob = Some(blob.clone());
+        let path = RepoPath("f.txt".into());
+        let Some(Event::DiscardRequested(request)) =
+            discard_request(&path, &diff(), &meta, &Part::File)
+        else {
+            panic!("a discard request")
+        };
+        assert_eq!(request.based_on, meta.based_on);
+        assert_eq!(request.expect_file, Some(blob));
+        assert_eq!(request.selection, Selection::File(path));
+    }
+
+    #[test]
+    fn a_discard_turns_the_selected_added_line_back() {
+        let path = RepoPath("f.txt".into());
+        let diff = diff();
+        let added = diff.hunks[0]
+            .lines
+            .iter()
+            .position(|l| diff.line_text(l) == "d")
+            .unwrap();
+        let part = Part::Lines {
+            hunk: 0,
+            lines: vec![added],
+        };
+        let Some(Event::DiscardRequested(request)) =
+            discard_request(&path, &diff, &inputs(), &part)
+        else {
+            panic!("a discard request")
+        };
+        // The patch applies to the worktree text: the added line goes away,
+        // and the line that was not selected stays as it is.
+        assert!(request.patch.0.contains("-d"), "{}", request.patch.0);
+        assert!(!request.patch.0.contains("-B"), "{}", request.patch.0);
+    }
+
+    #[test]
+    fn discarding_only_context_changes_nothing() {
+        let path = RepoPath("f.txt".into());
+        let part = Part::Lines {
+            hunk: 0,
+            lines: vec![0],
+        };
+        assert!(discard_request(&path, &diff(), &inputs(), &part).is_none());
+    }
     #[test]
     fn a_line_selection_stages_only_those_lines() {
         let path = RepoPath("f.txt".into());

@@ -28,6 +28,7 @@ fn meta(inputs: &DiffInputs) -> InputsMeta {
         executable: inputs.executable,
         old_exists: inputs.old.is_some(),
         new_exists: inputs.new.is_some(),
+        new_blob: inputs.new_blob.clone(),
     }
 }
 
@@ -69,12 +70,22 @@ pub fn load(paths: &RepoPaths, path: &RepoPath, section: Section) -> Loaded {
     }
 }
 
-/// The request that stages (or unstages) the whole file, built from a fresh
-/// read of its sides. `Ok(None)`: the file has nothing to stage.
+/// What to do with a whole file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verb {
+    /// Stage it (from the unstaged section) or unstage it (from the staged one).
+    Toggle,
+    /// Throw away its unstaged changes.
+    Discard,
+}
+
+/// The request for the whole file, built from a fresh read of its sides.
+/// `Ok(None)`: the file has nothing to do.
 pub fn file_request(
     paths: &RepoPaths,
     path: &RepoPath,
     section: Section,
+    verb: Verb,
 ) -> Result<Option<Event>, String> {
     let inputs = read(paths, path, section)?;
     let diff = diff_text(
@@ -82,11 +93,8 @@ pub fn file_request(
         inputs.new.clone().unwrap_or_default(),
         &DiffOptions::default(),
     );
-    Ok(staging::request(
-        section,
-        path,
-        &diff,
-        &meta(&inputs),
-        &Part::File,
-    ))
+    Ok(match verb {
+        Verb::Toggle => staging::request(section, path, &diff, &meta(&inputs), &Part::File),
+        Verb::Discard => staging::discard_request(path, &diff, &meta(&inputs), &Part::File),
+    })
 }

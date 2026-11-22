@@ -6,6 +6,7 @@ mod branch_panel;
 mod commit_box;
 mod commit_pane;
 mod diff_load;
+mod discard;
 mod history_view;
 mod notice;
 mod paths;

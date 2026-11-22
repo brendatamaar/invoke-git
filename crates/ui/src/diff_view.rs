@@ -25,7 +25,7 @@ use tokens::{
 };
 
 use crate::code_text::{expand_tabs, expanded_offset, merge_styles};
-use crate::components::{Banner, BannerKind, Segmented};
+use crate::components::{Banner, BannerKind, Button, Segmented};
 use crate::convert::hsla;
 use crate::diff_rows::{Layout, Row, hunk_header, rows};
 use crate::scrollbar::Scrollbar;
@@ -73,6 +73,8 @@ pub struct InputsMeta {
     pub executable: bool,
     pub old_exists: bool,
     pub new_exists: bool,
+    /// The git blob id of the worktree file's bytes (a discard expects it).
+    pub new_blob: Option<invoke_core::Oid>,
 }
 
 /// A request from the diff: stage or unstage a part of the file.
@@ -82,6 +84,12 @@ pub enum DiffEvent {
     Hunk { hunk: usize },
     /// The selected lines of one hunk.
     Lines { hunk: usize, lines: Vec<usize> },
+    /// Throw away every unstaged change of the file (an unstaged diff only).
+    DiscardFile,
+    /// Throw away the unstaged changes of one hunk.
+    DiscardHunk { hunk: usize },
+    /// Throw away the selected unstaged lines of one hunk.
+    DiscardLines { hunk: usize, lines: Vec<usize> },
 }
 
 pub struct DiffData {
@@ -246,7 +254,17 @@ impl DiffView {
                 );
         }
         let (layout_view, around_view) = (cx.entity(), cx.entity());
+        let discard_view = cx.entity();
+        let can_discard =
+            matches!(&self.content, Content::Text(data) if data.mode == StageMode::Stage);
         bar.child(div().flex_1())
+            .children(can_discard.then(|| {
+                Button::new("diff-discard-file", "Discard file")
+                    .ghost()
+                    .on_click(move |_, _, cx| {
+                        discard_view.update(cx, |_, cx| cx.emit(DiffEvent::DiscardFile))
+                    })
+            }))
             .child(Segmented::new(
                 "diff-around",
                 Around::ALL.iter().map(|a| a.label().into()).collect(),
@@ -435,12 +453,35 @@ fn hunk_row(ctx: &Ctx, hunk: usize) -> Div {
         ));
     }
     let view = ctx.view.clone();
-    row.child(link_button(
+    row = row.child(link_button(
         ("hunk-all", hunk),
         format!("{verb} hunk"),
         p.accent,
         move |cx| view.update(cx, |view, cx| view.request_hunk(hunk, cx)),
-    ))
+    ));
+    // Only unstaged changes can be thrown away.
+    if data.mode == StageMode::Stage {
+        if selected > 0 {
+            let view = ctx.view.clone();
+            row = row.child(link_button(
+                ("hunk-discard-lines", hunk),
+                format!(
+                    "Discard {selected} {}",
+                    if selected == 1 { "line" } else { "lines" }
+                ),
+                p.danger,
+                move |cx| view.update(cx, |view, cx| view.request_discard_lines(hunk, cx)),
+            ));
+        }
+        let view = ctx.view.clone();
+        row = row.child(link_button(
+            ("hunk-discard", hunk),
+            "Discard hunk".to_owned(),
+            p.danger,
+            move |cx| view.update(cx, |view, cx| view.request_discard_hunk(hunk, cx)),
+        ));
+    }
+    row
 }
 
 /// A small text button for a hunk header row (20px tall, like the row).
@@ -770,6 +811,21 @@ impl DiffView {
     fn request_hunk(&mut self, hunk: usize, cx: &mut Context<Self>) {
         self.selection.clear();
         cx.emit(DiffEvent::Hunk { hunk });
+        cx.notify();
+    }
+
+    fn request_discard_hunk(&mut self, hunk: usize, cx: &mut Context<Self>) {
+        self.selection.clear();
+        cx.emit(DiffEvent::DiscardHunk { hunk });
+        cx.notify();
+    }
+
+    fn request_discard_lines(&mut self, hunk: usize, cx: &mut Context<Self>) {
+        let lines = self.selected_lines(hunk);
+        self.selection.clear();
+        if !lines.is_empty() {
+            cx.emit(DiffEvent::DiscardLines { hunk, lines });
+        }
         cx.notify();
     }
 

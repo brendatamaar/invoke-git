@@ -61,6 +61,8 @@ pub enum TreeAction {
     Collapse { section: Section, dir: String },
     /// Stage or unstage the whole section.
     All { section: Section },
+    /// Throw away every unstaged change (the unstaged section only).
+    DiscardAll,
 }
 
 /// The rows for `status`: unstaged first, then staged; a section with no
@@ -214,11 +216,27 @@ impl RenderOnce for StatusTree {
                                     .text_color(hsla(p.ink_muted))
                                     .child(format!("{title} · {count}")),
                             )
-                            .child(Button::new(("tree-all", index), action).ghost().on_click(
-                                move |_, window, cx| {
-                                    on_action(TreeAction::All { section }, window, cx)
-                                },
-                            ))
+                            .child({
+                                let discard = on_action.clone();
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(SPACE_2))
+                                    .children((section == Section::Unstaged).then(|| {
+                                        Button::new(("tree-discard-all", index), "Discard all")
+                                            .ghost()
+                                            .on_click(move |_, window, cx| {
+                                                discard(TreeAction::DiscardAll, window, cx)
+                                            })
+                                    }))
+                                    .child(
+                                        Button::new(("tree-all", index), action).ghost().on_click(
+                                            move |_, window, cx| {
+                                                on_action(TreeAction::All { section }, window, cx)
+                                            },
+                                        ),
+                                    )
+                            })
                             .into_any_element()
                     }
                     TreeRow::Dir {

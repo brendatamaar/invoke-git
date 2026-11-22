@@ -1168,3 +1168,32 @@ fn the_index_id_is_unchanged_so_the_diff_is_still_current_after_a_discard() {
     };
     assert_eq!(failure.class, ErrorClass::PreconditionChanged);
 }
+
+// ---- core.autocrlf (task 13 UI: Git for Windows' default) ----------------
+
+/// With `core.autocrlf=true` the index holds LF and the worktree CRLF. The
+/// diff shown (and so the patch) is made from the filtered text; the discard
+/// must still change only the selected lines and keep the file's CRLF.
+#[test]
+fn a_discard_under_autocrlf_keeps_the_crlf_worktree() {
+    let repo = TempRepo::new();
+    repo.git(&["config", "core.autocrlf", "true"]);
+    let base: String = (0..30).map(|i| format!("line {i}\r\n")).collect();
+    repo.write("w.txt", &base);
+    repo.commit_all("base");
+    let eol = repo.git(&["ls-files", "--eol", "w.txt"]);
+    assert!(eol.contains("i/lf") && eol.contains("w/crlf"), "{eol}");
+    let edited = base
+        .replace("line 2\r\n", "LINE 2\r\n")
+        .replace("line 25\r\n", "line 25\r\nextra\r\n");
+    repo.write("w.txt", &edited);
+    let mut driver = Driver::open(&repo);
+    assert!(driver.discard("w.txt", &Choice::Hunk(1)));
+    let expected = base.replace("line 2\r\n", "LINE 2\r\n");
+    assert_eq!(repo.worktree_bytes("w.txt").unwrap(), expected.as_bytes());
+    driver.undo();
+    assert_eq!(repo.worktree_bytes("w.txt").unwrap(), edited.as_bytes());
+    // The whole file, too.
+    assert!(driver.discard("w.txt", &Choice::File));
+    assert_eq!(repo.worktree_bytes("w.txt").unwrap(), base.as_bytes());
+}
