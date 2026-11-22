@@ -114,7 +114,7 @@ Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are 
 | 11 | Status tree with file, hunk and line staging | Core + UI | 5, 10 | Done (binary files cannot be staged yet; Windows checklist pending; see tasks/011.DONE.md) |
 | 12 | Undo system: reflog and index snapshots | Core | 5 | Done |
 | 13 | Discard file, hunk or lines, undoable | Core + UI | 11, 12 | Core done |
-| 14 | Commit, amend, commit message editor | Core + UI | 11 | Core done |
+| 14 | Commit, amend, commit message editor | Core + UI | 11 | Done (IME and selection checklist pending; see tasks/014.DONE.md) |
 | 15 | Branches: create, switch, rename, delete, detached HEAD | Core + UI | 5 | Core done |
 | 16 | Clone with progress, cancel and in-app auth prompt (`GIT_ASKPASS`) | Shell + UI | 4 | Core done |
 | 17 | Fetch, pull (merge or rebase), push with `--force-with-lease`, set upstream | Shell + UI | 4, 16 | Core done |

@@ -2,6 +2,7 @@
 
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
+mod commit_box;
 mod diff_load;
 mod history_view;
 mod notice;
@@ -25,6 +26,7 @@ use workspace::{
 fn main() {
     gpui_platform::application().run(|cx: &mut App| {
         ui::init(cx);
+        ui::bind_editor_keys(cx);
         // Reads honour the user's git config like git does, so Git for
         // Windows' `core.autocrlf=true` gives the same status and diffs.
         shell::use_user_config(true);

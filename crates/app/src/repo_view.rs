@@ -18,6 +18,7 @@ use ui::{
     StatusTree, Summary, TextStyleExt, ThemeExt, TreeAction, TreeRow, diff_view, tree_rows,
 };
 
+use crate::commit_box::CommitBox;
 use crate::diff_load::{self, Loaded};
 use crate::history_view::HistoryPane;
 use crate::notice::{self, Tone};
@@ -49,6 +50,7 @@ pub struct RepoView {
     pub session: Entity<RepoSession>,
     page: Page,
     history: Entity<HistoryPane>,
+    commit: Entity<CommitBox>,
     diff: Entity<DiffView>,
     selected: Option<(Section, RepoPath)>,
     collapsed: HashSet<(Section, String)>,
@@ -102,6 +104,7 @@ impl RepoView {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|_| DiffView::new());
         let history = cx.new(|cx| HistoryPane::new(session.clone(), cx));
+        let commit = cx.new(|cx| CommitBox::new(session.clone(), cx));
         cx.observe(&session, |this, _, cx| this.session_changed(cx))
             .detach();
         cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| {
@@ -112,6 +115,7 @@ impl RepoView {
             session,
             page: Page::Changes,
             history,
+            commit,
             diff,
             selected: None,
             collapsed: HashSet::new(),
@@ -523,7 +527,8 @@ impl Render for RepoView {
                         .border_color(hsla(p.line))
                         .child(StatusTree::new(rows, selected, move |action, _, cx| {
                             this.update(cx, |this, cx| this.tree_action(action, cx))
-                        })),
+                        }))
+                        .child(self.commit.clone()),
                 )
                 .child(div().flex_1().min_w(px(0.)).child(self.diff.clone())),
         };
