@@ -6,4 +6,9 @@ publish.workspace = true
 description = "Pure commit-graph lane layout and paging for Invoke Git. No IO."
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "layout"
+harness = false

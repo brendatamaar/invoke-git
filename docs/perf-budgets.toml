@@ -1,0 +1,54 @@
+# Performance ceilings for the criterion benchmarks (backlog task 25).
+#
+# `cargo xtask bench-check` runs the benchmarks and fails when a measured
+# median is above its ceiling here, or when a benchmark has no ceiling, or a
+# ceiling has no benchmark. Values are milliseconds.
+#
+# These are absolute ceilings taken from the PRD and the specs, never
+# baselines recorded from a run, so a slow CI machine cannot raise them. Each
+# line says where its number comes from. The PRD gives budgets for the whole
+# app on a mid-range Windows laptop; where it has none for a pure-crate step,
+# the ceiling is derived from one it does have, and says so.
+#
+# Benchmarks that wait for the UI (the diff viewer's first paint, the status
+# tree) are not here yet; they arrive with the rest of task 25.
+
+[budgets_ms]
+
+# Diff engine. Source: docs/spec/diff-engine.md, "a diff that runs past 200 ms
+# on one file is cancelled": a diff call must return within 200 ms even on
+# the worst input, whether it finishes or gives up.
+"diff/histogram_50k_2k" = 200
+"diff/myers_50k_2k" = 200
+"diff/all_changed_50k" = 200
+"diff/repeated_10k" = 200
+"diff/repeated_50k" = 200
+"diff/myers_repeated_50k" = 200
+"diff/reversed_repeated_20k" = 200
+
+# Source: PRD "Open a 10k-line file diff < 50 ms to first visible lines". The
+# benchmark is the diff plus the word diff of the first hunk.
+"diff/open_10k_lines" = 50
+
+# Derived (no PRD number): the viewer's "expand context" rebuilds the hunks
+# of a 50k-line diff, so it must fit in one 60 fps frame (16 ms).
+"diff/hunks_50k_2k" = 16
+
+# Derived (no PRD number): filling the word diff of every hunk of a big diff
+# must fit inside the 50 ms first-lines budget above, so a viewer that filled
+# them all at once would still meet it.
+"diff/word_pairs_1k" = 50
+"diff/fill_inline_all_hunks" = 50
+
+# Commit graph. The PRD asks for 60 fps at minimum with no blank rows at 1M
+# commits, and has no layout number. Derived: one 5000-commit page (PAGE_SIZE)
+# is laid out within one 16 ms frame, so 100k commits (20 pages) within 320 ms.
+"graph/layout_page_5000_wide" = 16
+"graph/layout_100k_linear" = 320
+"graph/layout_100k_merging" = 320
+"graph/layout_100k_wide" = 320
+"graph/layout_100k_octopus" = 320
+
+# Derived: the lanes and edges for the 60 visible rows of one frame are
+# computed within that frame (16 ms).
+"graph/visible_window_60_wide" = 16
