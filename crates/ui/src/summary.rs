@@ -146,6 +146,7 @@ pub struct RepoSummary {
     summary: Summary,
     path: SharedString,
     warning: Option<SharedString>,
+    control: Option<gpui::AnyElement>,
 }
 
 impl RepoSummary {
@@ -154,7 +155,15 @@ impl RepoSummary {
             summary,
             path: path.into(),
             warning: None,
+            control: None,
         }
+    }
+
+    /// A control shown in the header after the branch (the Changes and
+    /// History switch).
+    pub fn control(mut self, control: impl IntoElement) -> Self {
+        self.control = Some(control.into_any_element());
+        self
     }
 
     /// A warning shown above the changes (for example, that the file watcher
@@ -199,7 +208,7 @@ impl RenderOnce for RepoSummary {
             }
         }
 
-        header = header.child(div().flex_1()).child(
+        header = header.children(self.control).child(div().flex_1()).child(
             div()
                 .min_w(px(0.))
                 .truncate()

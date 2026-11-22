@@ -10,6 +10,7 @@ pub mod conflict;
 pub mod discard;
 pub mod discover;
 pub mod git;
+pub mod history;
 pub mod precondition;
 pub mod progress;
 pub mod read;

@@ -16,11 +16,14 @@ pub mod diff_rows;
 pub mod diff_view;
 pub mod focus;
 pub mod fonts;
+pub mod graph_view;
+pub mod ref_labels;
 pub mod scrollbar;
 pub mod summary;
 pub mod tabs;
 pub mod text;
 pub mod theme;
+pub mod time;
 pub mod welcome;
 
 pub use changes::{ChangeList, ListRow, Section, list_rows};
@@ -29,6 +32,7 @@ pub use components::{
     SectionLabel, Segmented,
 };
 pub use diff_view::{Around, Content as DiffContent, DiffData, DiffView};
+pub use graph_view::{GraphEvent, GraphView, RowMeta};
 pub use summary::{RepoSummary, Summary};
 pub use tabs::{TabBar, TabItem};
 pub use text::TextStyleExt;

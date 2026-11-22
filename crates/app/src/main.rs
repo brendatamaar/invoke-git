@@ -3,6 +3,7 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 mod diff_load;
+mod history_view;
 mod paths;
 mod persist;
 mod repo_view;

@@ -11,18 +11,28 @@ use shell::Source;
 use tokens::{SIDEBAR, SPACE_8};
 use ui::convert::hsla;
 use ui::{
-    ChangeList, DiffContent, DiffView, RepoSummary, Section, Summary, ThemeExt, diff_view,
-    list_rows,
+    ChangeList, DiffContent, DiffView, RepoSummary, Section, Segmented, Summary, ThemeExt,
+    diff_view, list_rows,
 };
 
 use crate::diff_load::{self, Loaded};
+use crate::history_view::HistoryPane;
 use crate::session::RepoSession;
 
 /// The changed-file list is a little wider than the repository sidebar.
 const CHANGES_W: f32 = SIDEBAR + 2.0 * SPACE_8;
 
+/// The two pages of a repo tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Page {
+    Changes,
+    History,
+}
+
 pub struct RepoView {
     pub session: Entity<RepoSession>,
+    page: Page,
+    history: Entity<HistoryPane>,
     diff: Entity<DiffView>,
     selected: Option<(Section, RepoPath)>,
     /// The read the list was last reconciled with.
@@ -42,12 +52,24 @@ fn has(status: &StatusSnapshot, section: Section, path: &RepoPath) -> bool {
 }
 
 impl RepoView {
+    fn show(&mut self, page: Page, cx: &mut Context<Self>) {
+        self.page = page;
+        if page == Page::History {
+            self.history
+                .update(cx, |history, cx| history.ensure_started(cx));
+        }
+        cx.notify();
+    }
+
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|_| DiffView::new());
+        let history = cx.new(|cx| HistoryPane::new(session.clone(), cx));
         cx.observe(&session, |this, _, cx| this.session_changed(cx))
             .detach();
         Self {
             session,
+            page: Page::Changes,
+            history,
             diff,
             selected: None,
             last_read: None,
@@ -205,38 +227,66 @@ impl Render for RepoView {
             .as_ref()
             .map(|(section, path)| (*section, path.0.clone().into()));
         let this = cx.entity();
+        let switch = cx.entity();
+        summary = summary.control(Segmented::new(
+            "repo-page",
+            vec!["Changes".into(), "History".into()],
+            match self.page {
+                Page::Changes => 0,
+                Page::History => 1,
+            },
+            move |index, _, cx| {
+                switch.update(cx, |view, cx| {
+                    view.show(
+                        if index == 0 {
+                            Page::Changes
+                        } else {
+                            Page::History
+                        },
+                        cx,
+                    )
+                })
+            },
+        ));
+        let body = match self.page {
+            Page::History => div().flex().flex_1().min_h(px(0.)).child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(self.history.read(cx).graph.clone()),
+            ),
+            Page::Changes => div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_none()
+                        .w(px(CHANGES_W))
+                        .py(px(tokens::SPACE_2))
+                        .bg(hsla(p.bg_panel))
+                        .border_r_1()
+                        .border_color(hsla(p.line))
+                        .child(ChangeList::new(
+                            rows,
+                            selected,
+                            move |section, path, _, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.select(section, RepoPath(path.to_string()), cx)
+                                })
+                            },
+                        )),
+                )
+                .child(div().flex_1().min_w(px(0.)).child(self.diff.clone())),
+        };
         div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.))
             .child(summary)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .w(px(CHANGES_W))
-                            .py(px(tokens::SPACE_2))
-                            .bg(hsla(p.bg_panel))
-                            .border_r_1()
-                            .border_color(hsla(p.line))
-                            .child(ChangeList::new(
-                                rows,
-                                selected,
-                                move |section, path, _, cx| {
-                                    this.update(cx, |this, cx| {
-                                        this.select(section, RepoPath(path.to_string()), cx)
-                                    })
-                                },
-                            )),
-                    )
-                    .child(div().flex_1().min_w(px(0.)).child(self.diff.clone())),
-            )
+            .child(body)
     }
 }

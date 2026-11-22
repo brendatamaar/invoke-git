@@ -9,6 +9,7 @@ description = "GPUI component layer: a thin layer over GPUI that reads every col
 gpui.workspace = true
 tokens = { path = "../tokens" }
 invoke-core = { path = "../core" }
+graph = { path = "../graph" }
 diff = { path = "../diff" }
 highlight = { path = "../highlight" }
 
