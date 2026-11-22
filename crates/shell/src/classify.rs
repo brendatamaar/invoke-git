@@ -76,6 +76,17 @@ const MARKERS: [(ErrorClass, &[&str]); 5] = [
             "Not possible to fast-forward",
             "CONFLICT",
             "Automatic merge failed",
+            // Task 23: the conflict flow. A continue that runs into the next
+            // conflict, one that git turns down, or an abort or skip with
+            // nothing left to do; the snapshot says where things stand.
+            "Could not apply",
+            "unmerged files",
+            "You must edit all merge conflicts",
+            "No changes - did you forget to use 'git add'",
+            "There is no merge to abort",
+            "No rebase in progress",
+            "no cherry-pick or revert in progress",
+            "There is no merge in progress",
             // Branches (task 15): git refuses before it changes anything.
             "is not fully merged",
             "would be overwritten",
@@ -337,6 +348,25 @@ mod tests {
             ("fatal: couldn't find remote ref nope", Expected),
             (
                 "error: cannot pull with rebase: You have unstaged changes.",
+                Expected,
+            ),
+            // Task 23: the conflict flow.
+            (
+                "CONFLICT (content): Merge conflict in a.txt\nerror: could not apply 1a2b3c4... t2\nCould not apply 1a2b3c4... t2",
+                Expected,
+            ),
+            (
+                "error: Committing is not possible because you have unmerged files.",
+                Expected,
+            ),
+            (
+                "fatal: There is no merge to abort (MERGE_HEAD missing).",
+                Expected,
+            ),
+            ("fatal: No rebase in progress?", Expected),
+            ("error: no cherry-pick or revert in progress", Expected),
+            (
+                "No changes - did you forget to use 'git add'?\nIf there is nothing left to stage, chances are that something else\nalready introduced the same changes; you might want to skip this patch.",
                 Expected,
             ),
             ("fatal: something nobody expected", Bug),

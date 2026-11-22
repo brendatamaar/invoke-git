@@ -46,7 +46,7 @@ pub fn plan(disk: &DiskState, amend: bool) -> Result<CommitKind, Refusal> {
             }
         }
         Phase::Merging { .. } if amend => Err(Refusal::Commit(CommitRefusal::AmendDuringMerge)),
-        Phase::Merging { conflicts } if !conflicts.paths.is_empty() => {
+        Phase::Merging { conflicts } if !conflicts.all_resolved() => {
             Err(Refusal::Commit(CommitRefusal::UnresolvedConflicts))
         }
         Phase::Merging { .. } => Ok(CommitKind::ConcludeMerge),

@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::conflict::ConflictRefusal;
 use crate::ids::{BranchName, IndexId, NameProblem, Oid, OpId, ReadId, RefName, RepoId, RepoPath};
 use crate::message::MessageProblem;
 use crate::ops::{AuthPrompt, Failure, OpOutcome, Progress, WriteRequest};
@@ -104,11 +105,8 @@ pub enum Phase {
     },
 }
 
-/// Files with index stages 1–3.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Conflicts {
-    pub paths: Vec<RepoPath>,
-}
+// Task 23: the conflicted files, each Unresolved or Resolved.
+pub use crate::conflict::Conflicts;
 
 /// Index and worktree changes, one entry per path.
 ///
@@ -295,6 +293,11 @@ pub enum Action {
     Fetch,
     Pull,
     SetUpstream,
+    // Task 23.
+    ResolveFile,
+    Continue,
+    Skip,
+    Abort,
 }
 
 /// Why a request was turned down. Every refusal states one.
@@ -336,6 +339,8 @@ pub enum Refusal {
     BranchChanged,
     /// A commit or amend that cannot run (task 14).
     Commit(CommitRefusal),
+    /// Task 23: a conflict request that cannot run on the paused operation.
+    Conflict(ConflictRefusal),
 }
 
 /// Why a commit request was turned down (task 14). These are expected

@@ -51,8 +51,13 @@ fn disk(head: HeadKind, phase: PhaseKind, staged: bool, unstaged: bool) -> DiskS
             unstaged: Some(FileChange::Modified),
         }),
     ];
-    let conflicts = |paths: &[&str]| Conflicts {
-        paths: paths.iter().map(|path| RepoPath((*path).into())).collect(),
+    let conflicts = |paths: &[&str]| {
+        Conflicts::from_parts(
+            paths
+                .iter()
+                .map(|path| (RepoPath((*path).into()), ConflictKind::BothModified)),
+            [],
+        )
     };
     DiskState {
         head: match head {

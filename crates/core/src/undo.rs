@@ -69,6 +69,10 @@ pub enum Irreversible {
     /// would leave the merge's changes staged with `MERGE_HEAD` gone, and a
     /// plain commit of them would silently drop the second parent (task 14).
     MergeConcluded,
+    /// Task 23: continuing a merge, rebase, cherry-pick or revert made
+    /// commits out of a resolution. Undo stops here; abort is the way back
+    /// while the operation is paused.
+    Continued,
 }
 
 /// How an operation is reversed (task 20; recorded in its [`UndoPoint`]).

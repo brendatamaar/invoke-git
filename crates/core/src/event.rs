@@ -2,7 +2,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName};
+use crate::conflict::ResolveChoice;
+use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName, RepoPath};
 use crate::ops::{
     AuthAnswer, AuthPrompt, BranchStart, Failure, GitArgs, OpOutcome, Patch, Progress, PullMode,
     RemoteBranch, StageRequest,
@@ -38,6 +39,16 @@ pub enum Event {
     SetUpstreamRequested {
         upstream: RemoteBranch,
     },
+    // Task 23: the conflict flow. Continue, Skip and Abort act on the
+    // operation paused in the snapshot at the moment of the request; if it
+    // is not the one paused when they run, they are refused.
+    ResolveFileRequested {
+        path: RepoPath,
+        choice: ResolveChoice,
+    },
+    ContinueRequested,
+    SkipRequested,
+    AbortRequested,
     OpCancelRequested(OpId),
     AuthAnswered(OpId, AuthAnswer),
     UndoRequested,

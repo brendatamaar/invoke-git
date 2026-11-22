@@ -34,7 +34,14 @@ fn head() -> impl Strategy<Value = Head> {
 }
 
 fn conflicts() -> impl Strategy<Value = Conflicts> {
-    vec(path(), 0..3).prop_map(|paths| Conflicts { paths })
+    let kind = prop_oneof![
+        Just(ConflictKind::BothModified),
+        Just(ConflictKind::BothAdded),
+        Just(ConflictKind::DeletedByUs),
+        Just(ConflictKind::DeletedByThem),
+    ];
+    (vec((path(), kind), 0..3), vec(path(), 0..3))
+        .prop_map(|(unresolved, resolved)| Conflicts::from_parts(unresolved, resolved))
 }
 
 fn phase() -> impl Strategy<Value = Phase> {
@@ -244,6 +251,15 @@ fn event() -> impl Strategy<Value = Event> {
         1 => stash_oid().prop_map(Event::StashApplyRequested),
         1 => stash_oid().prop_map(Event::StashPopRequested),
         1 => stash_oid().prop_map(Event::StashDropRequested),
+        // Task 23: the conflict flow.
+        2 => (path(), prop_oneof![
+            Just(ResolveChoice::Ours),
+            Just(ResolveChoice::Theirs),
+            Just(ResolveChoice::Manual),
+        ]).prop_map(|(path, choice)| Event::ResolveFileRequested { path, choice }),
+        2 => Just(Event::ContinueRequested),
+        1 => Just(Event::SkipRequested),
+        2 => Just(Event::AbortRequested),
         1 => Just(Event::RefreshRequested),
         1 => Just(Event::NoticeDismissed),
         2 => areas.prop_map(|areas| Event::DiskChanged(ChangeSet(areas))),
@@ -435,6 +451,10 @@ proptest! {
                 Event::StashApplyRequested(_) => Action::StashApply,
                 Event::StashPopRequested(_) => Action::StashPop,
                 Event::StashDropRequested(_) => Action::StashDrop,
+                Event::ResolveFileRequested { .. } => Action::ResolveFile,
+                Event::ContinueRequested => Action::Continue,
+                Event::SkipRequested => Action::Skip,
+                Event::AbortRequested => Action::Abort,
                 _ => return Ok(()),
             };
             let accepted = after.ops.next.0 == before.ops.next.0 + 1

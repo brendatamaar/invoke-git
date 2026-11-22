@@ -19,7 +19,7 @@ use invoke_core::{
 
 use crate::askpass::AskpassServer;
 use crate::classify::{classify, classify_commit, classify_stash_save};
-use crate::git::{Git, invocation};
+use crate::git::{Git, Invocation, invocations};
 use crate::precondition::{self, RepoPaths};
 use crate::progress::{self, Lines};
 use crate::tree::{self, ProcessTree};
@@ -188,11 +188,34 @@ impl Job {
         {
             return OpOutcome::Failed(failure);
         }
-        let run = invocation(&self.args);
+        // Task 23: a request is one git run, except taking a side whole,
+        // which is two; it stops at the first one that fails.
+        let mut outcome = OpOutcome::Succeeded;
+        for run in invocations(&self.args) {
+            if self.cancelled() {
+                return OpOutcome::Cancelled;
+            }
+            outcome = self.run_one(run);
+            if outcome != OpOutcome::Succeeded {
+                break;
+            }
+        }
+        outcome
+    }
+
+    fn run_one(&self, run: Invocation) -> OpOutcome {
         let mut command = self.git.command(&self.paths.workdir);
         command
             .args(&run.args)
             .envs(self.env.iter().map(|(key, value)| (key, value)));
+        // Task 23: continuing makes commits from the prepared message and
+        // must never wait for an editor nobody can see. Set last, so neither
+        // the user's `GIT_EDITOR` nor the extra environment brings one back.
+        if self.args.may_open_editor() {
+            command
+                .env("GIT_EDITOR", "true")
+                .env("GIT_SEQUENCE_EDITOR", "true");
+        }
         let (op, events) = (self.op, self.events.clone());
         let sink: ProgressSink = Box::new(move |update| {
             let _ = events.send(Event::OpProgress(op, update));

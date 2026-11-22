@@ -7,6 +7,7 @@
 pub mod branch;
 pub mod clone;
 pub mod commit;
+pub mod conflict;
 pub mod detect;
 pub mod event;
 pub mod ids;
@@ -18,6 +19,10 @@ mod step;
 pub mod undo;
 pub mod watch;
 
+pub use conflict::{
+    ConflictContent, ConflictFile, ConflictKind, ConflictRefusal, ContinueGate, FileState,
+    Operation, ResolveChoice, Side, StageContent, continue_gate,
+};
 pub use event::{
     Area, ChangeSet, Command, Event, Expect, HeadTarget, IndexEffect, ReadScope, RefValue,
     UndoPoint,

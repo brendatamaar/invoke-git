@@ -4,6 +4,7 @@ use std::mem;
 
 use crate::branch;
 use crate::commit::{self, CommitKind};
+use crate::conflict::{self, ConflictRefusal, Operation};
 use crate::event::{
     ChangeSet, Command, Event, Expect, HeadTarget, IndexEffect, ReadScope, RefValue, UndoPoint,
 };
@@ -49,6 +50,25 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         Event::FetchRequested { remote } => enqueue(&mut state, WriteRequest::Fetch { remote }),
         Event::PullRequested { from, mode } => request_pull(&mut state, from, mode),
         Event::SetUpstreamRequested { upstream } => request_set_upstream(&mut state, upstream),
+        // Task 23: the conflict flow.
+        Event::ResolveFileRequested { path, choice } => {
+            request_conflict(&mut state, Action::ResolveFile, |_| {
+                Ok(WriteRequest::ResolveFile { path, choice })
+            })
+        }
+        Event::ContinueRequested => request_conflict(&mut state, Action::Continue, |operation| {
+            Ok(WriteRequest::Continue { operation })
+        }),
+        Event::SkipRequested => request_conflict(&mut state, Action::Skip, |operation| {
+            if operation.can_skip() {
+                Ok(WriteRequest::Skip { operation })
+            } else {
+                Err(ConflictRefusal::SkipNotAvailable)
+            }
+        }),
+        Event::AbortRequested => request_conflict(&mut state, Action::Abort, |operation| {
+            Ok(WriteRequest::Abort { operation })
+        }),
         Event::UndoRequested => match state.undo.top() {
             Ok(_) => enqueue(&mut state, WriteRequest::Undo),
             Err(reason) => refuse_because(&mut state, Action::Undo, reason),
@@ -227,7 +247,9 @@ fn cancel(state: &mut RepoState, op: OpId, commands: &mut Vec<Command>) {
         // Task 20: `git stash` is not atomic (it saves the stash, then
         // resets the worktree), so a running stash op is never killed:
         // law 13 would not hold. It is local and quick.
-        if is_stash(&running.request) {
+        // Task 23: the same for the conflict flow. Killing an abort or a
+        // continue half way would leave git between two states of its own.
+        if is_stash(&running.request) || is_conflict_flow(&running.request) {
             return;
         }
         if !matches!(running.phase, OpPhase::Cancelling) {
@@ -250,6 +272,16 @@ fn is_stash(request: &WriteRequest) -> bool {
             | WriteRequest::StashApply { .. }
             | WriteRequest::StashPop { .. }
             | WriteRequest::StashDrop { .. }
+    )
+}
+
+fn is_conflict_flow(request: &WriteRequest) -> bool {
+    matches!(
+        request,
+        WriteRequest::ResolveFile { .. }
+            | WriteRequest::Continue { .. }
+            | WriteRequest::Skip { .. }
+            | WriteRequest::Abort { .. }
     )
 }
 
@@ -467,13 +499,21 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                 }
             },
             // Task 17. Fetch and set-upstream move nothing an undo restores.
-            WriteRequest::Fetch { remote } => commands.push(Command::RunGit {
-                op: id,
-                args: GitArgs::Fetch {
-                    remote: remote.clone(),
-                },
-                expect,
-            }),
+            WriteRequest::Fetch { remote } => {
+                // Task 23: network operations are paused while a merge,
+                // rebase, cherry-pick or revert is (PRD -> "State machines").
+                if disk.phase != Phase::Clean {
+                    refuse_because(state, Action::Fetch, Refusal::RepoBusy);
+                    continue;
+                }
+                commands.push(Command::RunGit {
+                    op: id,
+                    args: GitArgs::Fetch {
+                        remote: remote.clone(),
+                    },
+                    expect,
+                });
+            }
             WriteRequest::SetUpstream { local, upstream } => commands.push(Command::RunGit {
                 op: id,
                 args: GitArgs::SetUpstream {
@@ -516,6 +556,11 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     refuse_because(state, Action::Push, reason);
                     continue;
                 }
+                // Task 23: a paused operation cannot be pushed.
+                if disk.phase != Phase::Clean {
+                    refuse_because(state, Action::Push, Refusal::RepoBusy);
+                    continue;
+                }
                 let label = format!("Push '{}' to {}/{}", local.0, to.remote, to.branch.0);
                 let args = GitArgs::Push {
                     local: local.clone(),
@@ -533,6 +578,63 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     (untouched, Irreversible::Push),
                 );
             }
+            // Task 23. Planned against the snapshot the write runs on: a
+            // Continue is refused unless every file is Resolved right now.
+            WriteRequest::ResolveFile { path, choice } => {
+                match conflict::plan_resolve(&disk, path, *choice) {
+                    Ok(args) => commands.push(Command::RunGit {
+                        op: id,
+                        args,
+                        expect,
+                    }),
+                    Err(reason) => {
+                        refuse_conflict(state, Action::ResolveFile, reason);
+                        continue;
+                    }
+                }
+            }
+            WriteRequest::Continue { operation } => {
+                match conflict::plan_continue(&disk, *operation) {
+                    Ok(args) => {
+                        let label = format!("Continue {}", operation_name(*operation));
+                        let rewrites = IndexEffect::Rewrites;
+                        run_with_point(
+                            state,
+                            commands,
+                            (id, label),
+                            (&disk, expect),
+                            args,
+                            (rewrites, Irreversible::Continued),
+                        );
+                    }
+                    Err(reason) => {
+                        refuse_conflict(state, Action::Continue, reason);
+                        continue;
+                    }
+                }
+            }
+            WriteRequest::Skip { operation } => match conflict::plan_skip(&disk, *operation) {
+                Ok(args) => commands.push(Command::RunGit {
+                    op: id,
+                    args,
+                    expect,
+                }),
+                Err(reason) => {
+                    refuse_conflict(state, Action::Skip, reason);
+                    continue;
+                }
+            },
+            WriteRequest::Abort { operation } => match conflict::plan_abort(&disk, *operation) {
+                Ok(args) => commands.push(Command::RunGit {
+                    op: id,
+                    args,
+                    expect,
+                }),
+                Err(reason) => {
+                    refuse_conflict(state, Action::Abort, reason);
+                    continue;
+                }
+            },
             WriteRequest::Undo => match undo::plan(&state.undo, &disk, id) {
                 Ok(replay) => {
                     if let Some(entry) = state.undo.entries.pop_back() {
@@ -700,6 +802,40 @@ fn head_ref(head: &Head) -> RefValue {
             name: name.to_ref(),
             oid: None,
         },
+    }
+}
+
+// Task 23: the conflict flow.
+
+/// Queues a conflict request for the operation paused in the snapshot the
+/// user is looking at. `make` may refuse for its own reasons.
+fn request_conflict(
+    state: &mut RepoState,
+    action: Action,
+    make: impl FnOnce(Operation) -> Result<WriteRequest, ConflictRefusal>,
+) {
+    let Some(disk) = state.snapshot.disk() else {
+        return refuse_because(state, action, Refusal::NotRead);
+    };
+    let Some(operation) = disk.phase.operation() else {
+        return refuse_conflict(state, action, ConflictRefusal::NotInProgress);
+    };
+    match make(operation) {
+        Ok(request) => enqueue(state, request),
+        Err(reason) => refuse_conflict(state, action, reason),
+    }
+}
+
+fn refuse_conflict(state: &mut RepoState, action: Action, reason: ConflictRefusal) {
+    refuse_because(state, action, Refusal::Conflict(reason));
+}
+
+fn operation_name(operation: Operation) -> &'static str {
+    match operation {
+        Operation::Merge => "merge",
+        Operation::Rebase { .. } => "rebase",
+        Operation::CherryPick => "cherry-pick",
+        Operation::Revert => "revert",
     }
 }
 
