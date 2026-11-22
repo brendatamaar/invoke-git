@@ -6412,6 +6412,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ui"
+version = "0.0.0"
+dependencies = [
+ "gpui",
+ "gpui_platform",
+ "proptest",
+ "tokens",
+]
+
+[[package]]
 name = "uluru"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
