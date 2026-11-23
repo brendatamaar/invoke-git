@@ -8,7 +8,9 @@ use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window,
     div, px,
 };
-use invoke_core::{BranchName, BranchStart, Event, NameProblem, Oid, RefName, Snapshot, TagName};
+use invoke_core::{
+    BranchName, BranchStart, CommitMessage, Event, NameProblem, Oid, RefName, Snapshot, TagName,
+};
 use tokens::{SPACE_2, SPACE_3, TEXT_SMALL};
 use ui::convert::hsla;
 use ui::{
@@ -239,6 +241,8 @@ impl BranchPanel {
         match &self.form {
             Form::CreateTag { annotated } => {
                 let annotated = *annotated;
+                let missing_message =
+                    annotated && CommitMessage::parse(self.tag_message.read(cx).text()).is_err();
                 let toggle = cx.entity();
                 let submit = cx.entity();
                 let manage = cx.entity();
@@ -282,7 +286,7 @@ impl BranchPanel {
                             .child(
                                 Button::new("tag-create", "Create")
                                     .primary()
-                                    .disabled(name.is_err())
+                                    .disabled(name.is_err() || missing_message)
                                     .on_click(move |_, _, cx| {
                                         submit.update(cx, |pane, cx| pane.submit(false, cx))
                                     }),
@@ -446,12 +450,17 @@ impl BranchPanel {
         match self.form.clone() {
             Form::None => {}
             Form::CreateTag { annotated } => {
-                if let Ok(name) = self.tag_name(cx) {
+                let message = annotated.then(|| self.tag_message.read(cx).text().to_owned());
+                if let Ok(name) = self.tag_name(cx)
+                    && message
+                        .as_deref()
+                        .is_none_or(|text| CommitMessage::parse(text).is_ok())
+                {
                     self.send_tag(
                         Event::TagCreateRequested {
                             name: name.0,
                             at: BranchStart::Head,
-                            message: annotated.then(|| self.tag_message.read(cx).text().to_owned()),
+                            message,
                         },
                         cx,
                     );
