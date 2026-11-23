@@ -107,26 +107,28 @@ Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are 
 | 4 | Shell: command runner, git CLI wrapper with progress and cancel | Shell | 3 | Done |
 | 5 | Repo discovery and repo-state detection from `.git` | Core | 3 | Done |
 | 6 | File watcher with debounce, emitting refresh events | Shell | 4 | Done |
-| 7 | App window, open and init repo, repo tabs | UI | 2, 5 | Done (Windows checklist pending; see tasks/007.DONE.md) |
+| 7 | App window, open and init repo, repo tabs | UI | 2, 5 | Done (see tasks/007.DONE.md) |
 | 8 | Diff engine: Myers + histogram, hunks, word-level diff | Diff | 1 | Done |
 | 9 | Syntax highlighting layer on tree-sitter | Diff | 8 | Done |
-| 10 | Diff viewer: split and unified, virtualized | UI | 2, 8, 9 | Done (Windows checklist pending; see tasks/010.DONE.md) |
-| 11 | Status tree with file, hunk and line staging | Core + UI | 5, 10 | Done (binary files cannot be staged yet; Windows checklist pending; see tasks/011.DONE.md) |
+| 10 | Diff viewer: split and unified, virtualized | UI | 2, 8, 9 | Done (see tasks/010.DONE.md) |
+| 11 | Status tree with file, hunk and line staging | Core + UI | 5, 10 | Done (binary files cannot be staged yet; see tasks/011.DONE.md) |
 | 12 | Undo system: reflog and index snapshots | Core | 5 | Done |
-| 13 | Discard file, hunk or lines, undoable | Core + UI | 11, 12 | Done (UI checklist pending; see tasks/013.DONE.md) |
-| 14 | Commit, amend, commit message editor | Core + UI | 11 | Done (IME and selection checklist pending; see tasks/014.DONE.md) |
-| 15 | Branches: create, switch, rename, delete, detached HEAD | Core + UI | 5 | Done (UI checklist pending) |
-| 16 | Clone with progress, cancel and in-app auth prompt (`GIT_ASKPASS`) | Shell + UI | 4 | Done (UI checklist pending; see tasks/016.DONE.md) |
-| 17 | Fetch, pull (merge or rebase), push with `--force-with-lease`, set upstream | Shell + UI | 4, 16 | Done (UI checklist pending; see tasks/017.DONE.md) |
-| 18 | Commit graph: lane layout, paging, renderer | Graph | 2 | Done (Windows checklist pending; see tasks/018.DONE.md) |
-| 19 | Commit detail view with its diff | UI | 10, 18 | Done (Windows checklist pending; see tasks/019.DONE.md) |
-| 20 | Stash: save (incl. untracked), apply, pop, drop | Core + UI | 5 | Done (UI checklist pending; see tasks/020.DONE.md) |
-| 21 | Pre-push review screen: outgoing commits, combined and per-commit diffs | UI | 10, 17 | Done (UI checklist pending; see tasks/021.DONE.md) |
-| 22 | Notes and annotations: SQLite store (`rusqlite`, approved 2026-11-22), anchoring, to-do warning on push; also persists the undo stack (task 12 follow-up) | Core + UI | 21 | Done (UI checklist pending; see tasks/022.DONE.md) |
-| 23 | Conflict resolution UI with continue and abort | Core + UI | 10, 17 | Done (UI checklist pending; see tasks/023.DONE.md) |
+| 13 | Discard file, hunk or lines, undoable | Core + UI | 11, 12 | Done (see tasks/013.DONE.md) |
+| 14 | Commit, amend, commit message editor | Core + UI | 11 | Done (see tasks/014.DONE.md) |
+| 15 | Branches: create, switch, rename, delete, detached HEAD | Core + UI | 5 | Done (see tasks/015.DONE.md) |
+| 16 | Clone with progress, cancel and in-app auth prompt (`GIT_ASKPASS`) | Shell + UI | 4 | Done (see tasks/016.DONE.md) |
+| 17 | Fetch, pull (merge or rebase), push with `--force-with-lease`, set upstream | Shell + UI | 4, 16 | Done (see tasks/017.DONE.md) |
+| 18 | Commit graph: lane layout, paging, renderer | Graph | 2 | Done (see tasks/018.DONE.md) |
+| 19 | Commit detail view with its diff | UI | 10, 18 | Done (see tasks/019.DONE.md) |
+| 20 | Stash: save (incl. untracked), apply, pop, drop | Core + UI | 5 | Done (see tasks/020.DONE.md) |
+| 21 | Pre-push review screen: outgoing commits, combined and per-commit diffs | UI | 10, 17 | Done (see tasks/021.DONE.md) |
+| 22 | Notes and annotations: SQLite store (`rusqlite`, approved 2026-11-22), anchoring, to-do warning on push; also persists the undo stack (task 12 follow-up) | Core + UI | 21 | Done (see tasks/022.DONE.md) |
+| 23 | Conflict resolution UI with continue and abort | Core + UI | 10, 17 | Done (see tasks/023.DONE.md) |
 | 24 | Laws as `proptest` tests and the model-based test harness, in CI | Verification | 3, 11, 12 | Done |
 | 25 | Benchmarks with performance budgets, failing CI on regression | Verification | 10, 11, 18 | Done (see tasks/025.DONE.md) |
 | 26 | Two-week dogfood: all git work in Invoke Git (the v0.1 gate) | Release | 1–25 | Not started |
+
+The Windows checklists of tasks 2 to 25 were checked by hand on the reference laptop on 2026-11-23 and passed.
 
 ## After v0.1
 
