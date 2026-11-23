@@ -175,6 +175,40 @@ pub fn invocation(args: &GitArgs) -> Invocation {
                 stdin: None,
             }
         }
+        // P3: tags. `--no-sign` keeps a `tag.gpgSign` setting from asking
+        // for a key (signed tags are out of scope). An annotated message
+        // goes through stdin, already cleaned by the core. The names were
+        // parsed by the core and the start is an object id; `--` ends the
+        // options anyway.
+        GitArgs::CreateTag { name, at, message } => {
+            argv.extend(["tag", "--no-sign"].map(OsString::from));
+            let stdin = message.as_ref().map(|message| {
+                argv.extend(["--annotate", "--file=-", "--cleanup=whitespace"].map(OsString::from));
+                message.as_bytes().to_vec()
+            });
+            argv.push("--".into());
+            argv.push(name.0.clone().into());
+            argv.push(at.to_string().into());
+            Invocation { args: argv, stdin }
+        }
+        GitArgs::DeleteTag { name, .. } => {
+            argv.extend(["tag", "--delete", "--"].map(OsString::from));
+            argv.push(name.0.clone().into());
+            plain(argv)
+        }
+        // The refspec has no `+`: the remote refuses to move an existing tag.
+        GitArgs::PushTag { remote, name, .. } => {
+            argv.extend(["push", "--progress", "--"].map(OsString::from));
+            argv.push(remote.into());
+            argv.push(format!("{0}:{0}", name.to_ref().0).into());
+            plain(argv)
+        }
+        GitArgs::DeleteRemoteTag { remote, name } => {
+            argv.extend(["push", "--progress", "--"].map(OsString::from));
+            argv.push(remote.into());
+            argv.push(format!(":{}", name.to_ref().0).into());
+            plain(argv)
+        }
         // Task 20: stash. The message is one argv element of the form
         // `--message=<text>`, so it can never be taken for an option. The
         // entry is addressed as `stash@{n}`; the runner has checked that

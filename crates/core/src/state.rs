@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::conflict::ConflictRefusal;
-use crate::ids::{BranchName, IndexId, NameProblem, Oid, OpId, ReadId, RefName, RepoId, RepoPath};
+use crate::ids::{
+    BranchName, IndexId, NameProblem, Oid, OpId, ReadId, RefName, RepoId, RepoPath, TagName,
+};
 use crate::message::MessageProblem;
 use crate::ops::{AuthPrompt, Failure, OpOutcome, Progress, WriteRequest};
 use crate::stash::StashEntry;
@@ -24,6 +26,9 @@ pub struct RepoState {
 }
 
 /// What is known about the disk.
+// One value per open repo, almost always `Read`: boxing the snapshot would
+// only add an indirection to every access.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Snapshot {
     /// Nothing read yet (the repo was just opened).
@@ -186,6 +191,42 @@ pub struct RefsSnapshot {
     pub refs: BTreeMap<RefName, Oid>,
     /// Only branches that have an upstream configured (task 15).
     pub upstreams: BTreeMap<BranchName, Upstream>,
+    /// P3: for each annotated tag, the object it finally names (the commit
+    /// a badge belongs on). Lightweight tags are not listed: their ref
+    /// already names the commit.
+    pub peeled_tags: BTreeMap<TagName, Oid>,
+}
+
+/// One tag as the sidebar and the graph show it (P3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagInfo {
+    pub name: TagName,
+    /// What the tag ref holds: the commit, or the tag object when annotated.
+    pub tip: Oid,
+    /// The commit the tag is on.
+    pub target: Oid,
+    pub annotated: bool,
+}
+
+impl RefsSnapshot {
+    /// Every tag, by name. Derived from the refs read from disk, so it can
+    /// never disagree with them.
+    pub fn tags(&self) -> Vec<TagInfo> {
+        self.refs
+            .iter()
+            .filter_map(|(full, tip)| {
+                let short = full.0.strip_prefix("refs/tags/")?;
+                let name = TagName(short.to_owned());
+                let peeled = self.peeled_tags.get(&name);
+                Some(TagInfo {
+                    target: peeled.unwrap_or(tip).clone(),
+                    annotated: peeled.is_some(),
+                    tip: tip.clone(),
+                    name,
+                })
+            })
+            .collect()
+    }
 }
 
 /// The branch a local branch tracks.
@@ -286,6 +327,11 @@ pub enum Action {
     SwitchBranch,
     RenameBranch,
     DeleteBranch,
+    // P3.
+    CreateTag,
+    DeleteTag,
+    PushTag,
+    DeleteRemoteTag,
     // Task 20.
     StashSave,
     StashApply,
@@ -337,6 +383,9 @@ pub enum Refusal {
     /// A branch request that cannot run on the snapshot it was checked
     /// against (task 15).
     Branch(BranchRefusal),
+    /// A tag request that cannot run on the snapshot it was checked
+    /// against (P3).
+    Tag(TagRefusal),
     // Task 17.
     /// Nothing has been read from disk yet, so there is nothing to act on.
     NotRead,
@@ -405,6 +454,23 @@ pub enum BranchRefusal {
     IsCurrent(BranchName),
     /// Renaming a branch to its own name.
     SameName,
+}
+
+/// Why a tag request was turned down (P3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TagRefusal {
+    InvalidName(NameProblem),
+    /// The message of an annotated tag cannot be used (empty, only
+    /// whitespace, NUL).
+    Message(MessageProblem),
+    /// `HEAD` names a branch with no commits: nothing to tag.
+    NoCommitsYet,
+    AlreadyExists(TagName),
+    /// A tag whose name is a folder of the new one or the other way round.
+    NameConflict(TagName),
+    NoSuchTag(TagName),
+    /// No remote was named.
+    NoRemote,
 }
 
 /// What moved since the operation, as found when an undo was planned.

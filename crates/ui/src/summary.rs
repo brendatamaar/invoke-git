@@ -330,6 +330,7 @@ mod tests {
         let refs = RefsSnapshot {
             refs: BTreeMap::new(),
             upstreams,
+            ..RefsSnapshot::default()
         };
         let state = state_with(disk(
             Head::Branch {
@@ -400,7 +401,7 @@ mod tests {
                 name: RefName("refs/remotes/origin/main".to_owned()),
                 tracking: Tracking::Apart { ahead, behind },
             });
-            let refs = RefsSnapshot { refs: BTreeMap::new(), upstreams };
+            let refs = RefsSnapshot { refs: BTreeMap::new(), upstreams, ..RefsSnapshot::default() };
             let state = state_with(disk(
                 Head::Branch { name: main_branch(), oid: oid() },
                 Phase::Clean,

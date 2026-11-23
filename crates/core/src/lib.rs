@@ -17,6 +17,7 @@ pub mod ops;
 pub mod stash;
 pub mod state;
 mod step;
+pub mod tag;
 pub mod undo;
 pub mod undo_codec;
 pub mod watch;
@@ -31,6 +32,7 @@ pub use event::{
 };
 pub use ids::{
     BranchName, IndexId, NameProblem, Oid, OidError, OpId, ReadId, RefName, RepoId, RepoPath,
+    TagName,
 };
 pub use message::{CommitMessage, MessageProblem, SubjectHint, SubjectLevel};
 pub use ops::{
@@ -42,7 +44,8 @@ pub use stash::StashEntry;
 pub use state::{
     Action, BranchRefusal, CommitRefusal, Conflicts, DiskState, FileChange, Freshness, Head,
     LockState, Notice, OpPhase, OpQueue, Phase, QueuedOp, Reads, RefsSnapshot, Refusal, RepoState,
-    RunningOp, Snapshot, StatusEntry, StatusSnapshot, Tracking, UndoMoved, Upstream,
+    RunningOp, Snapshot, StatusEntry, StatusSnapshot, TagInfo, TagRefusal, Tracking, UndoMoved,
+    Upstream,
 };
 pub use step::{open, step};
 pub use undo::{

@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::conflict::ResolveChoice;
-use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName, RepoPath};
+use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName, RepoPath, TagName};
 use crate::ops::{
     AuthAnswer, AuthPrompt, BranchStart, DiscardRequest, Failure, GitArgs, OpOutcome, Patch,
     Progress, PullMode, RemoteBranch, StageRequest,
@@ -75,6 +75,23 @@ pub enum Event {
         force: bool,
     },
     // Task 20: stash. Apply, pop and drop name the entry by commit id.
+    // P3: tags. A new name and message arrive as typed and are parsed in
+    // the core; existing tags are named by their parsed name.
+    TagCreateRequested {
+        name: String,
+        at: BranchStart,
+        /// `Some`: an annotated tag with this message.
+        message: Option<String>,
+    },
+    TagDeleteRequested(TagName),
+    TagPushRequested {
+        remote: String,
+        name: TagName,
+    },
+    RemoteTagDeleteRequested {
+        remote: String,
+        name: TagName,
+    },
     StashSaveRequested {
         message: String,
         include_untracked: bool,

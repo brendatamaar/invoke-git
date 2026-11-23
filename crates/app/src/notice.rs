@@ -4,7 +4,7 @@
 
 use invoke_core::{
     Action, BranchRefusal, CommitRefusal, ConflictRefusal, ErrorClass, Failure, Notice, OpOutcome,
-    Refusal, UndoMoved,
+    Refusal, TagRefusal, UndoMoved,
 };
 
 /// How to draw a notice.
@@ -34,6 +34,10 @@ fn action_name(action: Action) -> &'static str {
         Action::SwitchBranch => "Switch branch",
         Action::RenameBranch => "Rename branch",
         Action::DeleteBranch => "Delete branch",
+        Action::CreateTag => "Create tag",
+        Action::DeleteTag => "Delete tag",
+        Action::PushTag => "Push tag",
+        Action::DeleteRemoteTag => "Delete remote tag",
         Action::StashSave => "Stash",
         Action::StashApply => "Apply stash",
         Action::StashPop => "Pop stash",
@@ -83,6 +87,7 @@ fn refusal_text(reason: &Refusal) -> String {
         }
         Refusal::StashGone(_) => "That stash entry is gone. The list has been refreshed.".into(),
         Refusal::Branch(problem) => branch_text(problem),
+        Refusal::Tag(problem) => tag_text(problem),
         Refusal::NotRead => "The repository has not been read yet. Try again in a moment.".into(),
         Refusal::NoBranch => "This needs a checked-out branch, and HEAD is detached.".into(),
         Refusal::NoRemoteValue(_) => {
@@ -112,6 +117,20 @@ fn conflict_text(problem: &ConflictRefusal) -> String {
         ConflictRefusal::SkipNotAvailable => "Skip is only for a rebase.".into(),
         ConflictRefusal::NotConflicted => "That file is not conflicted any more.".into(),
         ConflictRefusal::AlreadyResolved => "That file is already resolved.".into(),
+    }
+}
+
+fn tag_text(problem: &TagRefusal) -> String {
+    match problem {
+        TagRefusal::InvalidName(_) => "That is not a valid tag name.".into(),
+        TagRefusal::Message(_) => "An annotated tag needs a message.".into(),
+        TagRefusal::NoCommitsYet => "There are no commits to tag yet.".into(),
+        TagRefusal::AlreadyExists(name) => format!("A tag named {} already exists.", name.0),
+        TagRefusal::NameConflict(name) => {
+            format!("The tag {} would conflict with that name.", name.0)
+        }
+        TagRefusal::NoSuchTag(name) => format!("There is no tag named {}.", name.0),
+        TagRefusal::NoRemote => "No remote was chosen.".into(),
     }
 }
 

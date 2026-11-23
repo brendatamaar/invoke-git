@@ -170,9 +170,16 @@ pub fn check_refs(paths: &RepoPaths, expected: &[RefValue]) -> Result<(), Failur
     for item in expected {
         let found = match repo.try_find_reference(item.name.0.as_str()) {
             Ok(Some(mut reference)) => {
-                let id = reference
-                    .peel_to_id()
-                    .map_err(|error| bug(format!("read {}: {error}", item.name.0)))?;
+                // The same value `read_refs` records: a direct ref's own
+                // target (for an annotated tag, the tag object, not the
+                // commit under it), a symbolic ref's final id.
+                let id = match reference.try_id() {
+                    Some(id) => id.detach(),
+                    None => reference
+                        .peel_to_id()
+                        .map_err(|error| bug(format!("read {}: {error}", item.name.0)))?
+                        .detach(),
+                };
                 Some(oid(&id).map_err(bug)?)
             }
             Ok(None) => None,

@@ -8,7 +8,7 @@ use crate::conflict::{self, ConflictRefusal, Operation};
 use crate::event::{
     ChangeSet, Command, Event, Expect, HeadTarget, IndexEffect, ReadScope, RefValue, UndoPoint,
 };
-use crate::ids::{BranchName, Oid, OpId, ReadId, RefName, RepoId};
+use crate::ids::{BranchName, Oid, OpId, ReadId, RefName, RepoId, TagName};
 use crate::message::CommitMessage;
 use crate::ops::{
     ErrorClass, Failure, GitArgs, Lease, OpOutcome, PullMode, RemoteBranch, StageRequest,
@@ -17,8 +17,9 @@ use crate::ops::{
 use crate::stash;
 use crate::state::{
     Action, BranchRefusal, CommitRefusal, DiskState, Freshness, Head, LockState, Notice, OpPhase,
-    Phase, QueuedOp, Refusal, RepoState, RunningOp, Snapshot,
+    Phase, QueuedOp, Refusal, RepoState, RunningOp, Snapshot, TagRefusal,
 };
+use crate::tag;
 use crate::undo::{self, Irreversible, Reversal, Reversible, UndoEntry, UndoPending};
 
 /// Opens a repo: the initial state plus the first full read.
@@ -152,6 +153,36 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         },
         Event::BranchDeleteRequested { name, force } => {
             enqueue(&mut state, WriteRequest::DeleteBranch { name, force });
+        }
+        // P3: tags. Names and messages are parsed here; what depends on the
+        // disk is checked when the request is dispatched.
+        Event::TagCreateRequested { name, at, message } => {
+            match (
+                TagName::parse(&name),
+                message.as_deref().map(CommitMessage::parse),
+            ) {
+                (Err(problem), _) => refuse_because(
+                    &mut state,
+                    Action::CreateTag,
+                    Refusal::Tag(TagRefusal::InvalidName(problem)),
+                ),
+                (_, Some(Err(problem))) => refuse_because(
+                    &mut state,
+                    Action::CreateTag,
+                    Refusal::Tag(TagRefusal::Message(problem)),
+                ),
+                (Ok(name), message) => {
+                    let message = message.and_then(Result::ok);
+                    enqueue(&mut state, WriteRequest::CreateTag { name, at, message });
+                }
+            }
+        }
+        Event::TagDeleteRequested(name) => enqueue(&mut state, WriteRequest::DeleteTag { name }),
+        Event::TagPushRequested { remote, name } => {
+            enqueue(&mut state, WriteRequest::PushTag { remote, name });
+        }
+        Event::RemoteTagDeleteRequested { remote, name } => {
+            enqueue(&mut state, WriteRequest::DeleteRemoteTag { remote, name });
         }
         Event::OpCancelRequested(op) => cancel(&mut state, op, &mut commands),
         Event::AuthAnswered(op, answer) => {
@@ -797,6 +828,42 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     continue;
                 }
             },
+            // P3: tags. A local tag has an undo point that restores its ref;
+            // one that reaches a remote only leaves the irreversible marker.
+            tag_request if tag::action_of(tag_request).is_some() => {
+                let Some(planned) = tag::plan(tag_request, &disk) else {
+                    continue;
+                };
+                match planned {
+                    Ok(planned) if tag::is_remote(tag_request) => {
+                        // Network operations pause with the repo (as push).
+                        run_with_point(
+                            state,
+                            commands,
+                            (id, planned.label),
+                            (&disk, expect),
+                            planned.args,
+                            (IndexEffect::Untouched, Irreversible::Push),
+                        );
+                    }
+                    Ok(planned) => {
+                        let point = planned.point(id);
+                        commands.push(Command::SnapshotForUndo(point.clone()));
+                        commands.push(Command::RunGit {
+                            op: id,
+                            args: planned.args,
+                            expect,
+                        });
+                        state.undo.pending = UndoPending::Recording { point };
+                    }
+                    Err(reason) => {
+                        if let Some(action) = tag::action_of(tag_request) {
+                            refuse_because(state, action, reason);
+                        }
+                        continue;
+                    }
+                }
+            }
             branch_request => match branch::plan(branch_request, &disk, id) {
                 Some(Ok((args, point))) => {
                     commands.push(Command::SnapshotForUndo(point.clone()));

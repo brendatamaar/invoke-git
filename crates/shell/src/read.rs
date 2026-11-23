@@ -10,7 +10,7 @@ use invoke_core::detect::{Markers, RebaseFiles, detect_phase};
 use invoke_core::message;
 use invoke_core::{
     BranchName, Command, ConflictKind, Conflicts, DiskState, ErrorClass, Event, Failure, LockState,
-    Oid, Phase, ReadId, RefName, RefsSnapshot, RepoPath, StashEntry, Tracking, Upstream,
+    Oid, Phase, ReadId, RefName, RefsSnapshot, RepoPath, StashEntry, TagName, Tracking, Upstream,
 };
 
 use crate::precondition::{self, RepoPaths};
@@ -234,7 +234,44 @@ fn read_refs(repo: &gix::Repository) -> Result<RefsSnapshot, String> {
         refs.insert(RefName(name), precondition::oid(&id)?);
     }
     let upstreams = read_upstreams(repo, &refs)?;
-    Ok(RefsSnapshot { refs, upstreams })
+    let peeled_tags = read_peeled_tags(repo, &refs)?;
+    Ok(RefsSnapshot {
+        refs,
+        upstreams,
+        peeled_tags,
+    })
+}
+
+/// P3: for each annotated tag (a tag ref that names a tag object, not a
+/// commit), the commit it finally names. Lightweight tags are left out.
+fn read_peeled_tags(
+    repo: &gix::Repository,
+    refs: &BTreeMap<RefName, Oid>,
+) -> Result<BTreeMap<TagName, Oid>, String> {
+    let mut peeled = BTreeMap::new();
+    for (name, tip) in refs {
+        let Some(short) = name.0.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        let id = gix::ObjectId::from_hex(tip.as_hex().as_bytes())
+            .map_err(|error| format!("{name:?}: {error}"))?;
+        let object = repo
+            .find_object(id)
+            .map_err(|error| format!("read tag {short}: {error}"))?;
+        if object.kind != gix::object::Kind::Tag {
+            continue;
+        }
+        // Annotated tags may point to a blob or tree (e.g. a PGP key tag);
+        // only commit targets are recorded for graph badges.
+        let Ok(target) = object.peel_to_kind(gix::object::Kind::Commit) else {
+            continue;
+        };
+        peeled.insert(
+            TagName(short.to_owned()),
+            precondition::oid(&target.id().detach())?,
+        );
+    }
+    Ok(peeled)
 }
 
 /// Each local branch's configured upstream and how far apart the two are.
