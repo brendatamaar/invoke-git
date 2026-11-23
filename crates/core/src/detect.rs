@@ -22,6 +22,8 @@ pub struct Markers {
 pub struct RebaseFiles {
     pub step: Option<String>,
     pub total: Option<String>,
+    pub edit: bool,
+    pub origin: Option<crate::RebaseOrigin>,
 }
 
 /// Parses a counter file: a decimal number, optionally surrounded by
@@ -50,6 +52,16 @@ pub fn detect_phase(markers: &Markers, conflicts: Conflicts) -> Phase {
         return Phase::Rebasing {
             step: files.step.as_deref().and_then(parse_counter).unwrap_or(0),
             total: files.total.as_deref().and_then(parse_counter).unwrap_or(0),
+            pause: if !conflicts.all_resolved() {
+                crate::RebasePause::Conflict
+            } else if files.edit {
+                crate::RebasePause::Edit
+            } else if !conflicts.files().is_empty() {
+                crate::RebasePause::Conflict
+            } else {
+                crate::RebasePause::Other
+            },
+            origin: files.origin.clone(),
             conflicts,
         };
     }
@@ -73,9 +85,11 @@ mod tests {
 
     fn files() -> impl Strategy<Value = Option<RebaseFiles>> {
         let text = proptest::option::of("\\PC{0,6}");
-        proptest::option::of(
-            (text.clone(), text).prop_map(|(step, total)| RebaseFiles { step, total }),
-        )
+        proptest::option::of((text.clone(), text).prop_map(|(step, total)| RebaseFiles {
+            step,
+            total,
+            ..RebaseFiles::default()
+        }))
     }
 
     fn markers() -> impl Strategy<Value = Markers> {
@@ -174,6 +188,7 @@ mod tests {
             let dir = Some(RebaseFiles {
                 step: Some(format!("{step}\n")),
                 total: Some(format!("{total}\n")),
+                ..RebaseFiles::default()
             });
             let markers = if use_apply {
                 Markers { rebase_apply: dir, ..Markers::default() }
@@ -182,15 +197,15 @@ mod tests {
             };
             prop_assert_eq!(
                 detect_phase(&markers, Conflicts::default()),
-                Phase::Rebasing { step, total, conflicts: Conflicts::default() }
+                Phase::Rebasing { step, total, conflicts: Conflicts::default(), pause: Default::default(), origin: None }
             );
         }
 
         #[test]
         fn rebase_merge_wins_over_rebase_apply(step in any::<u32>(), other in any::<u32>()) {
             let markers = Markers {
-                rebase_merge: Some(RebaseFiles { step: Some(step.to_string()), total: None }),
-                rebase_apply: Some(RebaseFiles { step: Some(other.to_string()), total: None }),
+                rebase_merge: Some(RebaseFiles { step: Some(step.to_string()), total: None, ..RebaseFiles::default() }),
+                rebase_apply: Some(RebaseFiles { step: Some(other.to_string()), total: None, ..RebaseFiles::default() }),
                 ..Markers::default()
             };
             let Phase::Rebasing { step: found, .. } = detect_phase(&markers, Conflicts::default())
@@ -212,7 +227,9 @@ mod tests {
             Phase::Rebasing {
                 step: 0,
                 total: 0,
-                conflicts: Conflicts::default()
+                conflicts: Conflicts::default(),
+                pause: Default::default(),
+                origin: None
             }
         );
     }

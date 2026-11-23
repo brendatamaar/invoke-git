@@ -21,6 +21,7 @@ pub struct RepoState {
     pub reads: Reads,
     pub ops: OpQueue,
     pub undo: UndoStack,
+    pub rebase: crate::RebaseState,
     /// The newest thing the user should be told; replaced by the next one.
     pub notice: Option<Notice>,
 }
@@ -101,6 +102,8 @@ pub enum Phase {
         step: u32,
         total: u32,
         conflicts: Conflicts,
+        pause: crate::RebasePause,
+        origin: Option<crate::RebaseOrigin>,
     },
     CherryPicking {
         conflicts: Conflicts,
@@ -349,6 +352,7 @@ pub enum Action {
     // P2.
     CherryPick,
     Revert,
+    InteractiveRebase,
     // Task 17: the user asked to remove a leftover `index.lock`.
     RemoveLock,
 }
@@ -498,6 +502,7 @@ impl RepoState {
                 queued: VecDeque::new(),
             },
             undo: UndoStack::default(),
+            rebase: crate::RebaseState::Idle,
             notice: None,
         }
     }

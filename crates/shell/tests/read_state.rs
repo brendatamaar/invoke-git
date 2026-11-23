@@ -337,7 +337,9 @@ fn stopped_rebase_reports_step_and_total() {
         Phase::Rebasing {
             step: 2,
             total: 3,
-            conflicts: conflict_paths(&["a.txt"])
+            conflicts: conflict_paths(&["a.txt"]),
+            pause: Default::default(),
+            origin: None
         }
     );
     // During a rebase HEAD is detached.
@@ -360,7 +362,9 @@ fn stopped_apply_rebase_reads_next_and_last() {
         Phase::Rebasing {
             step: 2,
             total: 3,
-            conflicts: conflict_paths(&["a.txt"])
+            conflicts: conflict_paths(&["a.txt"]),
+            pause: Default::default(),
+            origin: None
         }
     );
 }

@@ -45,7 +45,7 @@ pub fn action_of(request: &WriteRequest) -> Option<Action> {
         | WriteRequest::Abort { .. }
         // P2.
         | WriteRequest::CherryPick { .. }
-        | WriteRequest::Revert { .. } => None,
+        | WriteRequest::Revert { .. } | WriteRequest::InteractiveRebase { .. } => None,
     }
 }
 
@@ -226,7 +226,7 @@ fn check(
         | WriteRequest::Abort { .. }
         // P2.
         | WriteRequest::CherryPick { .. }
-        | WriteRequest::Revert { .. } => Err(Refusal::NotYetSupported { task: 15 }),
+        | WriteRequest::Revert { .. } | WriteRequest::InteractiveRebase { .. } => Err(Refusal::NotYetSupported { task: 15 }),
     }
 }
 

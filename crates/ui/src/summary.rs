@@ -95,6 +95,7 @@ impl Summary {
                 step,
                 total,
                 conflicts,
+                ..
             } => Some(format!(
                 "Rebasing {step}/{total}{}",
                 conflicts_text(conflicts.unresolved_count())
@@ -375,6 +376,8 @@ mod tests {
                 step: 3,
                 total: 7,
                 conflicts,
+                pause: Default::default(),
+                origin: None,
             },
             RefsSnapshot::default(),
         )));

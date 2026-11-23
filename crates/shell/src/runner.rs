@@ -41,6 +41,7 @@ pub struct GitRunner {
     /// The `askpass` helper binary; set, network operations can prompt
     /// (task 17, reusing task 16's server).
     askpass_program: Option<PathBuf>,
+    rebase_editor: Option<PathBuf>,
     ops: Arc<Mutex<HashMap<OpId, Arc<Control>>>>,
 }
 
@@ -48,13 +49,16 @@ pub struct GitRunner {
 #[derive(Default)]
 pub(crate) struct Control {
     cancelled: AtomicBool,
+    defer_cancellation: bool,
     /// The credential prompt server of a running network operation.
     askpass: Mutex<Option<Arc<AskpassServer>>>,
 }
 
 impl Control {
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        if !self.defer_cancellation {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -81,6 +85,7 @@ impl GitRunner {
             paths,
             env: Vec::new(),
             askpass_program: None,
+            rebase_editor: crate::rebase::default_editor(),
             ops: Arc::default(),
         }
     }
@@ -99,6 +104,12 @@ impl GitRunner {
         self
     }
 
+    /// Uses a native editor executable with a shell-safe basename.
+    pub fn with_rebase_editor(mut self, program: impl Into<PathBuf>) -> Self {
+        self.rebase_editor = Some(program.into());
+        self
+    }
+
     /// Passes the user's answer to the helper waiting for it
     /// (`Command::AnswerAuth`).
     pub fn answer(&self, op: OpId, answer: AuthAnswer) {
@@ -113,7 +124,10 @@ impl GitRunner {
     /// Starts one operation in the background. Events go to `events`; the
     /// last one for `op` is always `OpFinished`.
     pub fn run(&self, op: OpId, args: GitArgs, expect: Expect, events: Sender<Event>) {
-        let control = Arc::new(Control::default());
+        let control = Arc::new(Control {
+            defer_cancellation: crate::rebase::is_sequencer(&args),
+            ..Control::default()
+        });
         lock(&self.ops).insert(op, Arc::clone(&control));
         let job = Job {
             op,
@@ -123,6 +137,7 @@ impl GitRunner {
             paths: self.paths.clone(),
             env: self.env.clone(),
             askpass_program: self.askpass_program.clone(),
+            rebase_editor: self.rebase_editor.clone(),
             control,
             events: events.clone(),
         };
@@ -161,6 +176,7 @@ struct Job {
     paths: RepoPaths,
     env: Vec<(OsString, OsString)>,
     askpass_program: Option<PathBuf>,
+    rebase_editor: Option<PathBuf>,
     control: Arc<Control>,
     events: Sender<Event>,
 }
@@ -188,6 +204,9 @@ impl Job {
         {
             return OpOutcome::Failed(failure);
         }
+        if let Err(failure) = crate::rebase::check(&self.paths, &self.args, &self.expect) {
+            return OpOutcome::Failed(failure);
+        }
         // Task 23: a request is one git run, except taking a side whole,
         // which is two; it stops at the first one that fails.
         let mut outcome = OpOutcome::Succeeded;
@@ -212,10 +231,36 @@ impl Job {
         // must never wait for an editor nobody can see. Set last, so neither
         // the user's `GIT_EDITOR` nor the extra environment brings one back.
         if self.args.may_open_editor() {
+            // Git treats ":" as a no-op itself. Rebase needs no shell or
+            // external "true" executable even when accepting a squash message.
+            let editor = if crate::rebase::is_sequencer(&self.args) {
+                ":"
+            } else {
+                "true"
+            };
             command
-                .env("GIT_EDITOR", "true")
-                .env("GIT_SEQUENCE_EDITOR", "true");
+                .env("GIT_EDITOR", editor)
+                .env("GIT_SEQUENCE_EDITOR", editor);
         }
+        let _todo = if let GitArgs::InteractiveRebase(plan) = &self.args {
+            let Some(program) = &self.rebase_editor else {
+                return failed(
+                    ErrorClass::Environment,
+                    "rebase editor executable unavailable".into(),
+                );
+            };
+            match crate::rebase::TodoFile::prepare(&mut command, program, plan) {
+                Ok(todo) => Some(todo),
+                Err(error) => {
+                    return failed(
+                        ErrorClass::Environment,
+                        format!("prepare rebase editor: {error}"),
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let (op, events) = (self.op, self.events.clone());
         let sink: ProgressSink = Box::new(move |update| {
             let _ = events.send(Event::OpProgress(op, update));
@@ -249,6 +294,11 @@ impl Job {
         let trace = matches!(self.args, GitArgs::Commit { .. }).then(|| TraceFile::new(op));
         if let Some(trace) = &trace {
             command.env("GIT_TRACE2_EVENT", &trace.path);
+        }
+        if crate::rebase::is_sequencer(&self.args)
+            && let Err(failure) = precondition::check(&self.paths, &self.expect)
+        {
+            return OpOutcome::Failed(failure);
         }
         let outcome = match run_child(command, run.stdin, Some(sink), &self.control) {
             Ok(done) if done.killed && !done.success => OpOutcome::Cancelled,

@@ -43,7 +43,9 @@ fn paused() -> impl Strategy<Value = Phase> {
         (0..6u32, 0..6u32, conflicts()).prop_map(|(step, total, conflicts)| Phase::Rebasing {
             step,
             total,
-            conflicts
+            conflicts,
+            pause: Default::default(),
+            origin: None
         }),
         conflicts().prop_map(|conflicts| Phase::CherryPicking { conflicts }),
         conflicts().prop_map(|conflicts| Phase::Reverting { conflicts }),
@@ -60,6 +62,8 @@ fn with_conflicts(phase: &Phase, conflicts: Conflicts) -> Phase {
             step: *step,
             total: *total,
             conflicts,
+            pause: Default::default(),
+            origin: None,
         },
     }
 }
@@ -421,6 +425,8 @@ fn a_request_for_one_rebase_step_is_refused_on_the_next() {
         step,
         total: 3,
         conflicts: Conflicts::from_parts([(path_named("a.txt"), ConflictKind::BothModified)], []),
+        pause: Default::default(),
+        origin: None,
     };
     for event in [Event::SkipRequested, Event::AbortRequested] {
         let mut locked = disk(at(1), LockState::HeldByOther);
