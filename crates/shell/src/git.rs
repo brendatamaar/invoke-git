@@ -287,6 +287,18 @@ pub fn invocation(args: &GitArgs) -> Invocation {
         GitArgs::Continue { operation } => sequencer(argv, *operation, "--continue"),
         GitArgs::Skip { operation } => sequencer(argv, *operation, "--skip"),
         GitArgs::Abort { operation } => sequencer(argv, *operation, "--abort"),
+        // P2. `--no-edit` keeps revert from opening an editor; the commit is
+        // an object id and `--` ends the options anyway.
+        GitArgs::CherryPick { commit } => {
+            argv.extend(["cherry-pick", "--"].map(OsString::from));
+            argv.push(commit.to_string().into());
+            plain(argv)
+        }
+        GitArgs::Revert { commit } => {
+            argv.extend(["revert", "--no-edit", "--"].map(OsString::from));
+            argv.push(commit.to_string().into());
+            plain(argv)
+        }
     }
 }
 
@@ -758,6 +770,23 @@ mod tests {
 
     fn rel(name: &str) -> RepoPath {
         RepoPath(name.into())
+    }
+
+    #[test]
+    fn cherry_pick_and_revert_name_the_commit_after_the_options() {
+        let commit = invoke_core::Oid::from_hex(&"b".repeat(40)).unwrap();
+        let pick = GitArgs::CherryPick {
+            commit: commit.clone(),
+        };
+        assert_eq!(argv(&pick).join(" "), format!("cherry-pick -- {commit}"));
+        let revert = GitArgs::Revert {
+            commit: commit.clone(),
+        };
+        assert_eq!(
+            argv(&revert).join(" "),
+            format!("revert --no-edit -- {commit}")
+        );
+        assert!(pick.may_open_editor() && revert.may_open_editor());
     }
 
     #[test]

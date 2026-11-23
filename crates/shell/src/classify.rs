@@ -87,6 +87,10 @@ const MARKERS: [(ErrorClass, &[&str]); 5] = [
             "No rebase in progress",
             "no cherry-pick or revert in progress",
             "There is no merge in progress",
+            // P2: a merge commit needs `-m`, and a commit that is gone.
+            "is a merge but no -m option was given",
+            "bad revision",
+            "empty, possibly due to conflict resolution",
             // Branches (task 15): git refuses before it changes anything.
             "is not fully merged",
             "would be overwritten",
