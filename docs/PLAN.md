@@ -29,3 +29,7 @@
 | P10 | Worktrees, Submodules & Git LFS | todo | P1 | P4b, P5, P6, P7, P8, P9, P11 |
 | P11 | Bundled MinGit Fallback (Windows) | todo | P1 | P2, P3, P4a, P4b, P5, P6, P7, P8, P9, P10 |
 | P12 | Pre-Release Dogfood & Public Release Gate | todo | P1b, P3, P4b, P5, P6, P7, P9, P10, P11 | - |
+
+## Review Windows
+
+P2, P3, P5, P6, dan P7 memiliki implementasi core, shell, dan UI. `cargo xtask check` lulus sebelum perubahan UI dengan 256 urutan model-based, dan lulus pada gabungan akhir dengan `INVOKE_HARNESS_CASES=16`. `cargo build -p app` dan smoke test pembukaan repo fixture dengan profil terisolasi juga lulus. Checklist interaksi GPUI native ada di Handoff notes tiap fase.

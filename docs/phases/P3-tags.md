@@ -32,9 +32,10 @@ Memungkinkan user melihat tag di sidebar & commit graph, membuat tag (lightweigh
 - `crates/app/src/notice.rs` ditambah teks notice tag; `RefsSnapshot` literal di `ui/summary.rs` dan `app/review.rs` diberi `..RefsSnapshot::default()` (tidak dikompilasi di Linux).
 
 ### Lanjutan Windows
+- Saat dilanjutkan, sidebar dan graph sudah menampilkan tag ringan. Sidebar masih pasif, dan badge annotated tag memakai ID tag object. Implementasi Windows menambahkan aksi dan memperbaiki penempatan badge.
 - `+ Tag` membuat tag pada HEAD. Klik tag yang ada atau buka Manage tags untuk push, hapus lokal, atau hapus remote. Masukkan nama remote pada form dan konfirmasi nama tag serta remote sebelum penghapusan remote.
 - Badge di graph menggunakan `TagInfo::target`, termasuk untuk annotated tag. Tes regresi memberi tag object dan commit target ID yang berbeda.
-- Tes `tag_props` (6) dan `tags` (8) serta Clippy app/UI lulus di Windows. Verifikasi klik manual masih terbuka.
+- Tes `tag_props` (6), `tags` (8), regresi badge, dan `cargo xtask check` pada gabungan akhir lulus di Windows. Verifikasi klik manual masih terbuka.
 
 ### Windows verification checklist
 1. `cargo xtask check` (fmt, clippy, test, build ui/app) lulus tanpa warning; pastikan `RefsSnapshot` literal ui/app masih compile.

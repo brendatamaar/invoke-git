@@ -33,7 +33,7 @@ Menyediakan aksi cherry-pick dan revert commit dengan alur konflik terpadu (reso
 
 ### Lanjutan Windows
 - Klik kanan baris graph atau gunakan tombol di detail commit. Keduanya mengirim event yang sama dengan OID commit terpilih dan menonaktifkan aksi saat fase repo bukan `Clean`. Repo view membuka tampilan konflik yang sama untuk resolve, Continue, dan Abort.
-- Tes `conflict_props` (24) dan `conflicts` (27) serta Clippy untuk app/UI lulus di Windows. Gate workspace dan verifikasi klik manual masih terbuka.
+- Tes `conflict_props` (24), `conflicts` (27), harness model-based, dan `cargo xtask check` pada gabungan akhir lulus di Windows. Verifikasi klik manual masih terbuka.
 
 ### Pertanyaan spec / di luar scope (diusulkan, tidak ditebak)
 1. Pick/revert yang menghasilkan commit kosong (perubahan sudah ada) berhenti dengan `CHERRY_PICK_HEAD` tanpa file konflik; Continue gagal ("nothing to commit"), hanya Abort yang jalan. `Skip` hanya untuk rebase (PRD). Usul: izinkan Skip (`git cherry-pick --skip`, git >= 2.23) untuk cherry-pick/revert, atau tampilkan pesan khusus. Menunggu keputusan.
@@ -42,7 +42,7 @@ Menyediakan aksi cherry-pick dan revert commit dengan alur konflik terpadu (reso
 4. Multi-commit range: di luar scope (sesuai fase).
 
 ### Windows verification checklist
-- [ ] `cargo xtask check` penuh lulus di Windows.
+- [x] `cargo xtask check` penuh lulus di Windows. Konfigurasi harness dicatat pada bagian Review Windows di PLAN.md.
 - [ ] Buka menu klik kanan di History dan pastikan kedua aksi memakai OID baris yang diklik. Coba juga kedua tombol di detail commit.
 - [ ] Cherry-pick bersih: commit baru muncul di graph, branch lain tidak bergerak, Undo mengembalikan ref dan index.
 - [ ] Revert bersih: commit `Revert "..."` muncul; Undo mengembalikan.

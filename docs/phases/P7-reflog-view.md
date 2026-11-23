@@ -24,7 +24,8 @@ Menampilkan reflog lokal (`HEAD` dan branch reflog) agar user dapat meninjau riw
 ## Handoff notes
 - **Integrasi undo stack SQLite (`P1`)**: `Event::ResetRequested` (`ResetMode::Soft` dan `ResetMode::Mixed`) menggunakan `Reversal::Refs` dengan `IndexEffect::Untouched` / `IndexEffect::Rewrites`, sedangkan pemulihan branch memakai `Event::BranchCreateRequested` (`BranchStart::Commit(oid)`). Format `undo_codec` (`u1`), skema SQLite `P1`, dan `shell::undo::reconcile` tetap kompatibel penuh tanpa migrasi — diverifikasi end-to-end (save → load → reconcile → `Event::UndoStackRestored` → undo) di `crates/shell/tests/reflog.rs::sqlite_undo_stack_survives_restart_after_reflog_recovery`.
 - **Lanjutan Windows:** halaman Reflog menampilkan HEAD dan branch lokal, memperbarui isi saat snapshot berubah, dan membatalkan pengiriman hasil baca saat pindah target, halaman, atau tab. Detail entri menampilkan kedua OID. Form pemulihan dapat membuat branch dan opsional melakukan switch. Konfirmasi reset menyebut branch aktif atau HEAD detached serta target OID. Jika HEAD atau index berubah saat konfirmasi terbuka, pengguna harus membuka konfirmasi baru.
-- `reflog_props` (9), `reflog` (8), dan Clippy app/UI lulus di Windows. Verifikasi klik manual masih terbuka.
+- `reflog_props` (9), `reflog` (8), dan `cargo xtask check` pada gabungan akhir lulus di Windows. Verifikasi klik manual masih terbuka.
+- Reflog dimuat kembali saat halaman dibuka atau snapshot repo berganti. Gunakan F5 setelah perubahan yang hanya menyentuh log, misalnya `git reflog expire`, karena watcher mengabaikan `.git/logs/`.
 - **Windows verification checklist (GPUI UI + full workspace)**:
   1. Jalankan `cargo xtask check` (full workspace termasuk `ui`, `app`, dan `crates/app/src/notice.rs`) dan pastikan lulus tanpa warning.
   2. Verifikasi selector, hash, badge aksi, actor, timestamp dan kedua OID pada detail.

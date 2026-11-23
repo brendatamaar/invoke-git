@@ -36,4 +36,4 @@ Lanjutan Windows: query otomatis berjalan setelah jeda input 180 ms. UI menyimpa
 - [ ] Uji pesan multi-baris, nama dan email penulis, hash penuh/prefix, path dengan spasi dan subdirektori, perbedaan kapitalisasi Git di Windows, serta root, delete, dan repo shallow.
 - [ ] Pilih hasil dekat dan jauh. Verifikasi graph scroll ke ID yang tepat dan membuka commit detail, termasuk ketika halaman graph yang memuat ID tersebut belum tiba.
 - [ ] Uji cancel, penggantian query cepat, pindah/tutup tab, serta refresh watcher setelah ref berubah. Abaikan halaman dari query atau repo lama dan ulangi scan dari disk saat referensi berubah.
-- [ ] Jalankan `cargo xtask check` di Windows dan verifikasi UI manual dengan GPUI yang dipin. Pemeriksaan source di VPS menemukan bahwa tipe dan signature publik history yang dipakai app tetap sama.
+- [x] Jalankan `cargo xtask check` di Windows pada gabungan akhir.
