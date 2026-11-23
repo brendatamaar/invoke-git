@@ -4,6 +4,7 @@
 //! the boundary between git's text and the core's types.
 
 pub mod askpass;
+pub mod blame;
 pub mod classify;
 pub mod clone;
 pub mod commit_detail;
@@ -25,6 +26,7 @@ mod tree;
 pub mod undo;
 pub mod watch;
 
+pub use blame::{BlameLine, BlameReader, FileCommit, ReadError};
 pub use clone::CloneRunner;
 pub use conflict::{read_conflict_content, read_worktree_file, write_worktree_file};
 pub use discard::DiscardRunner;
