@@ -90,7 +90,12 @@ impl RenderOnce for ReflogView {
                                 .text_style(&TEXT_CODE_SMALL, cx)
                                 .child(crate::short_hash(entry.new_oid.as_hex()).to_owned()),
                         )
-                        .child(Pill::new(action.to_owned()))
+                        .child(
+                            div()
+                                .max_w(px(SPACE_8 * 5.))
+                                .overflow_hidden()
+                                .child(Pill::new(action.to_owned())),
+                        )
                         .child(
                             div()
                                 .flex_1()

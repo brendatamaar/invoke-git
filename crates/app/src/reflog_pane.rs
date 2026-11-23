@@ -6,8 +6,9 @@ use std::sync::{
 };
 
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Task,
-    UniformListScrollHandle, Window, div, px, uniform_list,
+    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Task, UniformListScrollHandle, Window, div, px,
+    uniform_list,
 };
 use invoke_core::{
     BranchName, Event, Expect, Freshness, Head, Phase, ReadId, ReflogEntry, ReflogTarget,
@@ -441,7 +442,13 @@ impl Render for ReflogPane {
                 .border_color(hsla(p.line))
                 .text_style(&TEXT_SMALL, cx)
                 .text_color(hsla(p.ink))
-                .child(div().child(format!("{} · {}", entry.selector, entry.message)))
+                .child(
+                    div()
+                        .id("reflog-entry-message")
+                        .max_h(px(ROW_LIST * 3.))
+                        .overflow_y_scroll()
+                        .child(format!("{} · {}", entry.selector, entry.message)),
+                )
                 .child(
                     div()
                         .text_style(&TEXT_CODE_SMALL, cx)
