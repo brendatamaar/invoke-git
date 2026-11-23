@@ -1,0 +1,2 @@
+// GPUI's Windows backend loads icon resource 1 for the window class.
+1 ICON "invoke-git.ico"
