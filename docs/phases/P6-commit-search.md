@@ -1,5 +1,5 @@
 # P6 - Commit Search
-Status: in-progress
+Status: review
 Depends on: P1
 Parallel-safe with: P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11
 
@@ -25,6 +25,7 @@ Menyediakan pencarian commit berdasarkan pesan, penulis, hash (penuh/prefix), da
 - Filter dipilih melalui `SearchField`. Message mencari seluruh pesan. Author mencari nama atau email. Hash mencocokkan awal ID heksadesimal. Path membandingkan ID dan mode entri Git terhadap parent pertama, konsisten dengan commit detail. Root dibandingkan dengan tree kosong. Perubahan path pada batas shallow tidak dapat ditentukan. Path memakai slash dan peka huruf besar/kecil.
 - Tes properti mencakup batas prefix hash, pencocokan field teks, dan perubahan identitas entri path. Ketiganya gagal saat matcher sengaja diubah, lalu matcher asli dipulihkan.
 - Self-review menemukan bahwa gix dapat melewati parent shallow yang seharusnya tetap terjangkau dari ref lain. Fixture membuktikan regresi. Untuk repo shallow, walk memotong edge parent hanya dari boundary commit dan tetap mengeluarkan halaman secara inkremental.
+- Verifikasi VPS lulus untuk `cargo xtask check --core` tanpa warning, `cargo test -p invoke-core --test search_props`, dan `cargo test -p shell --test search`. Target bersama memakai fingerprint artefak khusus worktree pada pengulangan gate untuk mencegah tabrakan antar-checkout.
 
 ### Windows verification checklist
 
