@@ -97,7 +97,9 @@ pub(crate) fn check(paths: &RepoPaths, args: &GitArgs, expect: &Expect) -> Resul
     if expected_origin.is_some_and(|expected| *expected != origin) {
         return Err(changed("the rebase origin changed"));
     }
-    if let Some(branch) = origin.branch {
+    if expected_origin.is_none()
+        && let Some(branch) = origin.branch
+    {
         precondition::check_refs(
             paths,
             &[RefValue {

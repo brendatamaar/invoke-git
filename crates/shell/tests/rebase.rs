@@ -236,6 +236,11 @@ fn edit_can_amend_and_continue_or_abort_to_the_original_tree() {
                 ..
             }
         ));
+        if abort {
+            repo.write("a", "amended contents\n");
+            repo.git(&["add", "a"]);
+            repo.deliver(Event::RefreshRequested);
+        }
         repo.deliver(Event::CommitRequested {
             amend: true,
             message: "amended a".into(),
@@ -249,6 +254,7 @@ fn edit_can_amend_and_continue_or_abort_to_the_original_tree() {
         repo.succeeded();
         if abort {
             assert_eq!(repo.picture(), before);
+            assert_eq!(fs::read(repo.paths.workdir.join("a")).unwrap(), b"a\n");
             assert_eq!(repo.state.rebase, RebaseState::Aborted);
             assert!(repo.state.undo.entries.is_empty());
         } else {
@@ -367,4 +373,27 @@ fn shell_refuses_a_late_lock_or_a_moved_paused_branch() {
     ));
     assert_eq!(repo.git(&["rev-parse", "main"]), base.as_hex());
     assert!(repo.paths.git_dir.join("rebase-merge").is_dir());
+}
+
+#[test]
+fn a_plan_must_cover_the_entire_range() {
+    let mut repo = Repo::new();
+    let base = repo.commit("base", "base\n", "base");
+    repo.commit("a", "a\n", "first");
+    let b = repo.commit("b", "b\n", "second");
+    let before = repo.picture();
+    repo.start(base, vec![(b, RebaseAction::Pick)]);
+    assert!(matches!(
+        repo.state.notice,
+        Some(Notice::OpEnded {
+            outcome: OpOutcome::Failed(Failure {
+                class: ErrorClass::Expected,
+                ..
+            }),
+            ..
+        })
+    ));
+    assert_eq!(repo.picture(), before);
+    assert!(repo.state.undo.entries.is_empty());
+    assert!(!repo.paths.git_dir.join("rebase-merge").exists());
 }

@@ -373,8 +373,12 @@ impl GitArgs {
             // P2: `HEAD` and the index are what these expect.
             | GitArgs::CherryPick { .. }
             | GitArgs::Revert { .. }
-            | GitArgs::InteractiveRebase(_)
-            | GitArgs::GuardedRebase { .. } => Vec::new(),
+            | GitArgs::InteractiveRebase(_) => Vec::new(),
+            GitArgs::GuardedRebase { origin, .. } => origin
+                .branch
+                .iter()
+                .map(|branch| at(branch, Some(&origin.tip)))
+                .collect(),
             GitArgs::CreateBranch { name, .. } => vec![at(name, None)],
             GitArgs::CreateTag { name, .. } => vec![tag_at(name, None)],
             GitArgs::DeleteTag { name, tip } | GitArgs::PushTag { name, tip, .. } => {
