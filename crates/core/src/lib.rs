@@ -14,6 +14,7 @@ pub mod ids;
 pub mod message;
 pub mod notes;
 pub mod ops;
+pub mod search;
 pub mod stash;
 pub mod state;
 mod step;
