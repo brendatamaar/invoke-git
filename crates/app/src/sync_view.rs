@@ -4,8 +4,8 @@
 //! a rejected push. The decisions are in `sync`; the work is the core's.
 
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window,
-    div, px,
+    AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled,
+    Subscription, Window, div, px,
 };
 use invoke_core::{Event, Notice, OpId, OpPhase, PullMode, RunningOp};
 use tokens::{SPACE_2, SPACE_3, TEXT_SMALL};
@@ -24,11 +24,20 @@ fn deliver(session: &Entity<RepoSession>, event: Event, cx: &mut gpui::App) {
     session.update(cx, |session, cx| session.deliver(event, cx));
 }
 
-/// Fetch, Pull and Push for the branch that is checked out.
+/// What the buttons ask the tab to do besides running git.
+pub enum SyncEvent {
+    /// Open the pre-push review (task 21); the review has the Push button.
+    Review,
+}
+
+/// Fetch, Pull and Push for the branch that is checked out. Push opens the
+/// review first.
 pub struct SyncButtons {
     session: Entity<RepoSession>,
     _observe: Subscription,
 }
+
+impl EventEmitter<SyncEvent> for SyncButtons {}
 
 impl SyncButtons {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
@@ -58,9 +67,9 @@ impl Render for SyncButtons {
             "Pull".to_owned()
         };
         let push_label = if publishes && can_push {
-            "Publish branch".to_owned()
+            "Review and publish".to_owned()
         } else if ahead > 0 {
-            format!("Push ↑{ahead}")
+            format!("Review and push ↑{ahead}")
         } else {
             "Push".to_owned()
         };
@@ -72,18 +81,17 @@ impl Render for SyncButtons {
                 }
             }
         };
-        let (fetch, pull, rebase, push) = (
+        let (fetch, pull, rebase) = (
             run(&plan, |plan| Some(plan.fetch())),
             run(&plan, |plan| plan.pull(PullMode::Merge)),
             run(&plan, |plan| plan.pull(PullMode::Rebase)),
-            run(&plan, |plan| plan.push(false)),
         );
-        let (s1, s2, s3, s4) = (
-            self.session.clone(),
+        let (s1, s2, s3) = (
             self.session.clone(),
             self.session.clone(),
             self.session.clone(),
         );
+        let review = cx.entity();
         let mut row = div()
             .flex()
             .items_center()
@@ -108,7 +116,7 @@ impl Render for SyncButtons {
         row.child(
             Button::new("sync-push", push_label)
                 .disabled(!ready || !can_push)
-                .on_click(move |_, _, cx| push(&s4, cx)),
+                .on_click(move |_, _, cx| review.update(cx, |_, cx| cx.emit(SyncEvent::Review))),
         )
     }
 }

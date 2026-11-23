@@ -14,6 +14,8 @@ mod notice;
 mod paths;
 mod persist;
 mod repo_view;
+mod review;
+mod review_view;
 mod session;
 mod setup;
 mod staging;

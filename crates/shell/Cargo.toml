@@ -8,7 +8,7 @@ description = "IO for Invoke Git: runs the core's commands through gix and the g
 [dependencies]
 invoke-core = { path = "../core" }
 askpass = { path = "../askpass" }
-gix = { workspace = true, features = ["index", "excludes", "status", "max-performance"] }
+gix = { workspace = true, features = ["index", "excludes", "status", "revision", "max-performance"] }
 graph = { path = "../graph" }
 notify = "8"
 

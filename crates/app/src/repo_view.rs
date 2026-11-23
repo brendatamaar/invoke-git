@@ -24,9 +24,10 @@ use crate::diff_load::{self, Loaded, Verb};
 use crate::discard::{self, Confirm, What};
 use crate::history_view::HistoryPane;
 use crate::notice::{self, Tone};
+use crate::review_view::{ReviewEvent, ReviewPane};
 use crate::session::RepoSession;
 use crate::staging::{self, Part};
-use crate::sync_view::{SyncButtons, SyncStrip};
+use crate::sync_view::{SyncButtons, SyncEvent, SyncStrip};
 
 /// The changed-file tree is a little wider than the repository sidebar.
 const CHANGES_W: f32 = SIDEBAR + 2.0 * SPACE_8;
@@ -36,6 +37,8 @@ const CHANGES_W: f32 = SIDEBAR + 2.0 * SPACE_8;
 enum Page {
     Changes,
     History,
+    /// The pre-push review, opened by the Push button.
+    Review,
 }
 
 /// Files to stage or unstage one after another. Each stage is built from a
@@ -57,6 +60,7 @@ pub struct RepoView {
     branches: Entity<BranchPanel>,
     sync_buttons: Entity<SyncButtons>,
     sync_strip: Entity<SyncStrip>,
+    review: Entity<ReviewPane>,
     diff: Entity<DiffView>,
     selected: Option<(Section, RepoPath)>,
     collapsed: HashSet<(Section, String)>,
@@ -101,7 +105,13 @@ fn files_of(status: &StatusSnapshot, section: Section, dir: Option<&str>) -> Vec
 
 impl RepoView {
     fn show(&mut self, page: Page, cx: &mut Context<Self>) {
+        if self.page == Page::Review && page != Page::Review {
+            self.review.update(cx, |review, _| review.close());
+        }
         self.page = page;
+        if page == Page::Review {
+            self.review.update(cx, |review, cx| review.open(cx));
+        }
         if page == Page::History {
             self.history
                 .update(cx, |history, cx| history.ensure_started(cx));
@@ -116,6 +126,18 @@ impl RepoView {
         let branches = cx.new(|cx| BranchPanel::new(session.clone(), cx));
         let sync_buttons = cx.new(|cx| SyncButtons::new(session.clone(), cx));
         let sync_strip = cx.new(|cx| SyncStrip::new(session.clone(), cx));
+        let review = cx.new(|cx| ReviewPane::new(session.clone(), cx));
+        cx.subscribe(&review, |this, _, event: &ReviewEvent, cx| match event {
+            ReviewEvent::Back => this.show(Page::Changes, cx),
+        })
+        .detach();
+        cx.subscribe(
+            &sync_buttons,
+            |this, _, event: &SyncEvent, cx| match event {
+                SyncEvent::Review => this.show(Page::Review, cx),
+            },
+        )
+        .detach();
         cx.observe(&session, |this, _, cx| this.session_changed(cx))
             .detach();
         cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| {
@@ -130,6 +152,7 @@ impl RepoView {
             branches,
             sync_buttons,
             sync_strip,
+            review,
             diff,
             selected: None,
             collapsed: HashSet::new(),
@@ -542,6 +565,8 @@ impl Render for RepoView {
             match self.page {
                 Page::Changes => 0,
                 Page::History => 1,
+                // Neither is chosen while the review is open.
+                Page::Review => 2,
             },
             move |index, _, cx| {
                 switch.update(cx, |view, cx| {
@@ -632,6 +657,11 @@ impl Render for RepoView {
         });
 
         let body = match self.page {
+            Page::Review => div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .child(self.review.clone()),
             Page::History => div()
                 .flex()
                 .flex_1()
@@ -678,7 +708,7 @@ impl Render for RepoView {
                     .flex()
                     .flex_1()
                     .min_h(px(0.))
-                    .child(sidebar)
+                    .children((self.page != Page::Review).then_some(sidebar))
                     .child(body),
             )
     }

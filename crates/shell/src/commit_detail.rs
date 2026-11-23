@@ -55,7 +55,7 @@ pub struct CommitSides {
     pub new: Option<String>,
 }
 
-fn tree_of<'r>(commit: &gix::Commit<'r>) -> Result<gix::Tree<'r>, String> {
+pub(crate) fn tree_of<'r>(commit: &gix::Commit<'r>) -> Result<gix::Tree<'r>, String> {
     commit.tree().map_err(|e| format!("read tree: {e}"))
 }
 
@@ -75,18 +75,18 @@ fn parent_tree<'r>(
     }
 }
 
-pub fn read_commit(paths: &RepoPaths, id: &CommitId) -> Result<CommitDetail, String> {
+/// The files that differ between two trees, sorted by path. Directories are
+/// listed through the files inside them; renames are not detected.
+pub(crate) fn changed_files(
+    repo: &gix::Repository,
+    old_tree: &gix::Tree<'_>,
+    new_tree: &gix::Tree<'_>,
+) -> Result<Vec<ChangedFile>, String> {
     use gix::object::tree::diff::ChangeDetached as C;
-    let repo = precondition::open(paths)?;
-    let commit = repo
-        .find_commit(*id)
-        .map_err(|e| format!("read commit {id}: {e}"))?;
-    let new_tree = tree_of(&commit)?;
-    let old_tree = parent_tree(&repo, &commit)?;
     let changes = repo
         .diff_tree_to_tree(
-            &old_tree,
-            &new_tree,
+            old_tree,
+            new_tree,
             gix::diff::Options::default().with_rewrites(None),
         )
         .map_err(|e| format!("diff trees: {e}"))?;
@@ -132,6 +132,17 @@ pub fn read_commit(paths: &RepoPaths, id: &CommitId) -> Result<CommitDetail, Str
         })
         .collect();
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+pub fn read_commit(paths: &RepoPaths, id: &CommitId) -> Result<CommitDetail, String> {
+    let repo = precondition::open(paths)?;
+    let commit = repo
+        .find_commit(*id)
+        .map_err(|e| format!("read commit {id}: {e}"))?;
+    let new_tree = tree_of(&commit)?;
+    let old_tree = parent_tree(&repo, &commit)?;
+    let files = changed_files(&repo, &old_tree, &new_tree)?;
     let author = commit.author().map_err(|e| format!("read author: {e}"))?;
     let time = author.time().map_err(|e| format!("read time: {e}"))?;
     Ok(CommitDetail {
@@ -167,7 +178,7 @@ pub fn read_commit_sides(
     })
 }
 
-fn side(tree: &gix::Tree<'_>, path: &RepoPath) -> Result<Option<String>, InputsError> {
+pub(crate) fn side(tree: &gix::Tree<'_>, path: &RepoPath) -> Result<Option<String>, InputsError> {
     use gix::object::tree::EntryKind;
     let read = |e: String| InputsError::Read(e);
     let Some(entry) = tree

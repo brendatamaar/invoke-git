@@ -121,7 +121,7 @@ Twenty-six tasks take Invoke Git from an empty repo to a daily driver; rows are 
 | 18 | Commit graph: lane layout, paging, renderer | Graph | 2 | Done (Windows checklist pending; see tasks/018.DONE.md) |
 | 19 | Commit detail view with its diff | UI | 10, 18 | Done (Windows checklist pending; see tasks/019.DONE.md) |
 | 20 | Stash: save (incl. untracked), apply, pop, drop | Core + UI | 5 | Done (UI checklist pending; see tasks/020.DONE.md) |
-| 21 | Pre-push review screen: outgoing commits, combined and per-commit diffs | UI | 10, 17 | Not started |
+| 21 | Pre-push review screen: outgoing commits, combined and per-commit diffs | UI | 10, 17 | Done (UI checklist pending; see tasks/021.DONE.md) |
 | 22 | Notes and annotations: SQLite store (`rusqlite`, approved 2026-11-22), anchoring, to-do warning on push; also persists the undo stack (task 12 follow-up) | Core + UI | 21 | Not started |
 | 23 | Conflict resolution UI with continue and abort | Core + UI | 10, 17 | Core done |
 | 24 | Laws as `proptest` tests and the model-based test harness, in CI | Verification | 3, 11, 12 | Done |
