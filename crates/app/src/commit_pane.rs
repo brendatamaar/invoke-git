@@ -21,10 +21,29 @@ use ui::{
 };
 
 use crate::file_insights::{FileMode, FileVersion, file_actions};
+use crate::rebase_view::rebase_target_allowed;
 use crate::session::RepoSession;
 
 pub struct InspectFile(pub FileVersion, pub FileMode);
 impl EventEmitter<InspectFile> for CommitPane {}
+
+pub struct StartRebase(pub Oid);
+impl EventEmitter<StartRebase> for CommitPane {}
+
+pub(crate) fn rebase_button(
+    oid: Oid,
+    session: &RepoSession,
+    on_start: impl Fn(Oid, &mut gpui::App) + 'static,
+) -> Button {
+    let allowed = matches!(
+        &session.state.snapshot,
+        Snapshot::Read { disk, .. } if rebase_target_allowed(disk, &oid)
+    );
+    Button::new("interactive-rebase-onto", "Interactive rebase onto…")
+        .ghost()
+        .disabled(!allowed)
+        .on_click(move |_, _, cx| on_start(oid.clone(), cx))
+}
 
 pub(crate) fn replay_buttons(
     oid: Oid,
@@ -287,9 +306,16 @@ impl Render for CommitPane {
                 let hash = info.hash.to_string();
                 let session = self.session.clone();
                 let actions = Oid::from_hex(&hash).ok().map(|oid| {
+                    let rebase_ent = cx.entity();
+                    let rebase =
+                        rebase_button(oid.clone(), self.session.read(cx), move |id, cx| {
+                            rebase_ent.update(cx, |_, cx| cx.emit(StartRebase(id)));
+                        });
                     replay_buttons(oid, self.session.read(cx), move |event, cx| {
                         session.update(cx, |session, cx| session.deliver(event, cx));
                     })
+                    .into_iter()
+                    .chain(std::iter::once(rebase))
                 });
                 let file = selected.and_then(|ix| info.files.get(ix)).and_then(|file| {
                     let revision = if matches!(file.change, FileChange::Deleted) {

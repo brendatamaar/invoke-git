@@ -10,7 +10,10 @@ use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window,
     div, px,
 };
-use invoke_core::{Event, FileChange, Notice, ReadId, RepoPath, Snapshot, StatusSnapshot};
+use invoke_core::{
+    Event, FileChange, Notice, Phase, ReadId, RebasePause, RebaseState, RepoPath, Snapshot,
+    StatusSnapshot,
+};
 use tokens::{SIDEBAR, SPACE_2, SPACE_8, TEXT_SMALL};
 use ui::convert::hsla;
 use ui::{
@@ -20,13 +23,14 @@ use ui::{
 
 use crate::branch_panel::BranchPanel;
 use crate::commit_box::CommitBox;
-use crate::commit_pane::InspectFile;
+use crate::commit_pane::{InspectFile, StartRebase};
 use crate::conflict_view::ConflictPane;
 use crate::diff_load::{self, Loaded, Verb};
 use crate::discard::{self, Confirm, What};
 use crate::file_insights::{FileInsights, FileInsightsEvent, FileMode, FileVersion, file_actions};
 use crate::history_view::HistoryPane;
 use crate::notice::{self, Tone};
+use crate::rebase_view::{RebaseView, RebaseViewEvent, origin_label, paused_heading};
 use crate::reflog_pane::ReflogPane;
 use crate::review_view::{ReviewEvent, ReviewPane};
 use crate::session::RepoSession;
@@ -46,6 +50,8 @@ enum Page {
     Review,
     /// The resolver of a paused merge, rebase, cherry-pick or revert (task 23).
     Conflicts,
+    /// Interactive rebase editor and paused-rebase controls (P4b).
+    Rebase,
     FileInsights(FileBack),
 }
 
@@ -79,8 +85,11 @@ pub struct RepoView {
     sync_strip: Entity<SyncStrip>,
     review: Entity<ReviewPane>,
     conflicts: Entity<ConflictPane>,
+    rebase: Entity<RebaseView>,
     /// An operation was paused the last time the session moved.
     was_paused: bool,
+    /// The paused operation was an interactive rebase `edit` pause (no conflicts).
+    was_rebase_edit: bool,
     diff: Entity<DiffView>,
     selected: Option<(Section, RepoPath)>,
     collapsed: HashSet<(Section, String)>,
@@ -170,9 +179,19 @@ impl RepoView {
         let sync_strip = cx.new(|cx| SyncStrip::new(session.clone(), cx));
         let review = cx.new(|cx| ReviewPane::new(session.clone(), cx));
         let conflicts = cx.new(|cx| ConflictPane::new(session.clone(), cx));
+        let rebase = cx.new(|cx| RebaseView::new(session.clone(), cx));
         cx.subscribe(&review, |this, _, event: &ReviewEvent, cx| match event {
             ReviewEvent::Back => this.show(Page::Changes, cx),
         })
+        .detach();
+        cx.subscribe(
+            &rebase,
+            |this, _, event: &RebaseViewEvent, cx| match event {
+                RebaseViewEvent::BackToHistory => this.show(Page::History, cx),
+                RebaseViewEvent::OpenChanges => this.show(Page::Changes, cx),
+                RebaseViewEvent::OpenConflicts => this.show(Page::Conflicts, cx),
+            },
+        )
         .detach();
         cx.subscribe(
             &sync_buttons,
@@ -189,6 +208,12 @@ impl RepoView {
         .detach();
         cx.subscribe(&history, |this, _, event: &InspectFile, cx| {
             this.inspect_file(event.0.clone(), event.1, FileBack::History, cx);
+        })
+        .detach();
+        cx.subscribe(&history, |this, _, event: &StartRebase, cx| {
+            this.rebase
+                .update(cx, |rebase, cx| rebase.open(event.0.clone(), cx));
+            this.show(Page::Rebase, cx);
         })
         .detach();
         cx.subscribe(
@@ -222,7 +247,9 @@ impl RepoView {
             sync_strip,
             review,
             conflicts,
+            rebase,
             was_paused: false,
+            was_rebase_edit: false,
             diff,
             selected: None,
             collapsed: HashSet::new(),
@@ -285,18 +312,59 @@ impl RepoView {
 
     /// The session moved. Only a new read can change the list or the diff.
     fn session_changed(&mut self, cx: &mut Context<Self>) {
-        let paused = matches!(
-            &self.session.read(cx).state.snapshot,
-            Snapshot::Read { disk, .. } if disk.phase.operation().is_some()
-        );
+        let (paused, rebase_edit, rebase_done) = {
+            let state = &self.session.read(cx).state;
+            let paused = matches!(
+                &state.snapshot,
+                Snapshot::Read { disk, .. } if disk.phase.operation().is_some()
+            );
+            let rebase_edit = matches!(
+                &state.snapshot,
+                Snapshot::Read { disk, .. }
+                    if matches!(
+                        &disk.phase,
+                        Phase::Rebasing {
+                            pause: RebasePause::Edit,
+                            conflicts,
+                            ..
+                        } if conflicts.unresolved_count() == 0
+                    )
+            );
+            (paused, rebase_edit, state.rebase == RebaseState::Done)
+        };
         if paused && !self.was_paused {
             self.was_paused = true;
-            self.show(Page::Conflicts, cx);
+            self.was_rebase_edit = rebase_edit;
+            self.show(
+                if rebase_edit {
+                    Page::Rebase
+                } else {
+                    Page::Conflicts
+                },
+                cx,
+            );
+        } else if paused && self.was_paused {
+            if self.was_rebase_edit != rebase_edit {
+                self.was_rebase_edit = rebase_edit;
+                self.show(
+                    if rebase_edit {
+                        Page::Rebase
+                    } else {
+                        Page::Conflicts
+                    },
+                    cx,
+                );
+            }
         } else if !paused && self.was_paused {
             self.was_paused = false;
+            self.was_rebase_edit = false;
             if self.page == Page::Conflicts {
                 self.show(Page::Changes, cx);
+            } else if self.page == Page::Rebase {
+                self.show(Page::History, cx);
             }
+        } else if !paused && self.page == Page::Rebase && rebase_done {
+            self.show(Page::History, cx);
         }
         if matches!(self.bulk, Bulk::Running) && self.settled(cx) {
             self.bulk = Bulk::Idle;
@@ -647,7 +715,7 @@ impl Render for RepoView {
             Summary::of(&session.state),
             session.discovered.paths.workdir.display().to_string(),
         );
-        if self.page == Page::Conflicts {
+        if matches!(self.page, Page::Conflicts | Page::Rebase) {
             summary = summary.without_phase();
         }
         if let Some(error) = &session.watch_error {
@@ -680,40 +748,39 @@ impl Render for RepoView {
         let switch = cx.entity();
         let undo = cx.entity();
         let dismiss = cx.entity();
-        let page_switch = Segmented::new(
-            "repo-page",
-            if self.was_paused {
-                vec![
-                    "Changes".into(),
-                    "History".into(),
-                    "Reflog".into(),
-                    "Conflicts".into(),
-                ]
-            } else {
-                vec!["Changes".into(), "History".into(), "Reflog".into()]
-            },
-            match self.page {
-                Page::Changes => 0,
-                Page::History => 1,
-                Page::Reflog => 2,
-                Page::Conflicts => 3,
-                // None is chosen while the review is open.
-                Page::Review | Page::FileInsights(_) => usize::MAX,
-            },
-            move |index, _, cx| {
-                switch.update(cx, |view, cx| {
-                    view.show(
-                        match index {
-                            0 => Page::Changes,
-                            1 => Page::History,
-                            2 => Page::Reflog,
-                            _ => Page::Conflicts,
-                        },
-                        cx,
-                    )
-                })
-            },
-        );
+        let show_rebase_tab = self.page == Page::Rebase
+            || self.was_rebase_edit
+            || matches!(
+                session.state.rebase,
+                RebaseState::Editing { .. }
+                    | RebaseState::Queued(_)
+                    | RebaseState::Running { .. }
+                    | RebaseState::Reading { .. }
+            );
+        let mut page_tabs: Vec<(SharedString, Page)> = vec![
+            ("Changes".into(), Page::Changes),
+            ("History".into(), Page::History),
+            ("Reflog".into(), Page::Reflog),
+        ];
+        if self.was_paused && !self.was_rebase_edit {
+            page_tabs.push(("Conflicts".into(), Page::Conflicts));
+        }
+        if show_rebase_tab {
+            page_tabs.push(("Rebase".into(), Page::Rebase));
+        }
+        let active_tab = page_tabs
+            .iter()
+            .position(|(_, page)| *page == self.page)
+            .unwrap_or(usize::MAX);
+        let tab_labels: Vec<SharedString> =
+            page_tabs.iter().map(|(label, _)| label.clone()).collect();
+        let tab_targets: Vec<Page> = page_tabs.into_iter().map(|(_, page)| page).collect();
+        let page_switch =
+            Segmented::new("repo-page", tab_labels, active_tab, move |index, _, cx| {
+                if let Some(&target) = tab_targets.get(index) {
+                    switch.update(cx, |view, cx| view.show(target, cx));
+                }
+            });
         let mut controls = div()
             .flex()
             .items_center()
@@ -739,6 +806,63 @@ impl Render for RepoView {
 
         let mut banners = div().flex().flex_col().flex_none().gap(px(SPACE_2));
         let mut any = false;
+        if !matches!(self.page, Page::Conflicts | Page::Rebase)
+            && let Some(disk) = session.state.snapshot.disk()
+            && let Phase::Rebasing {
+                step,
+                total,
+                conflicts,
+                pause,
+                ..
+            } = &disk.phase
+        {
+            let branch = origin_label(disk);
+            let heading = paused_heading(*step, *total, *pause, &branch);
+            let busy = session.state.ops.running.is_some();
+            let ready = matches!(
+                invoke_core::continue_gate(&disk.phase),
+                invoke_core::ContinueGate::Ready
+            );
+            let (cont, skip, open) = (cx.entity(), cx.entity(), cx.entity());
+            let mut banner = Banner::new(BannerKind::Warning, heading);
+            if conflicts.unresolved_count() > 0 {
+                banner = banner.action(
+                    Button::new("banner-open-conflicts", "Open Conflicts")
+                        .primary()
+                        .on_click(move |_, _, cx| {
+                            open.update(cx, |view, cx| view.show(Page::Conflicts, cx))
+                        }),
+                );
+            } else {
+                banner = banner
+                    .action(
+                        Button::new("banner-rebase-continue", "Continue rebase")
+                            .primary()
+                            .disabled(!ready || busy)
+                            .on_click(move |_, _, cx| {
+                                cont.update(cx, |view, cx| {
+                                    view.deliver(Event::ContinueRequested, cx)
+                                })
+                            }),
+                    )
+                    .action(
+                        Button::new("banner-rebase-skip", "Skip")
+                            .disabled(busy)
+                            .on_click(move |_, _, cx| {
+                                skip.update(cx, |view, cx| view.deliver(Event::SkipRequested, cx))
+                            }),
+                    )
+                    .action(
+                        Button::new("banner-open-rebase", "Rebase")
+                            .ghost()
+                            .on_click(move |_, _, cx| {
+                                open.update(cx, |view, cx| view.show(Page::Rebase, cx))
+                            }),
+                    );
+            }
+            banners = banners.child(banner);
+            any = true;
+        }
         if let Some(confirm) = &self.confirm {
             let (yes, no) = (cx.entity(), cx.entity());
             banners = banners.child(
@@ -805,6 +929,11 @@ impl Render for RepoView {
                 .flex_1()
                 .min_h(px(0.))
                 .child(self.conflicts.clone()),
+            Page::Rebase => div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .child(self.rebase.clone()),
             Page::Review => div()
                 .flex()
                 .flex_1()
@@ -878,7 +1007,8 @@ impl Render for RepoView {
                     .flex_1()
                     .min_h(px(0.))
                     .children(
-                        (!matches!(self.page, Page::Review | Page::Conflicts)).then_some(sidebar),
+                        (!matches!(self.page, Page::Review | Page::Conflicts | Page::Rebase))
+                            .then_some(sidebar),
                     )
                     .child(body),
             )

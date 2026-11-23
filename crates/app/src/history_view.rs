@@ -20,7 +20,7 @@ use ui::{GraphEvent, GraphView, RowMeta, ref_labels::ref_labels};
 use ui::ThemeExt;
 use ui::convert::hsla;
 
-use crate::commit_pane::{CommitPane, InspectFile, replay_buttons};
+use crate::commit_pane::{CommitPane, InspectFile, StartRebase, rebase_button, replay_buttons};
 use crate::commit_search::{CommitSearch, CommitSelected};
 use crate::session::RepoSession;
 
@@ -41,6 +41,7 @@ pub struct HistoryPane {
 }
 
 impl EventEmitter<InspectFile> for HistoryPane {}
+impl EventEmitter<StartRebase> for HistoryPane {}
 
 /// What a row shows for `meta`, with the date relative to `now`.
 pub fn row_meta(meta: &CommitMeta, now: i64) -> RowMeta {
@@ -70,6 +71,9 @@ impl HistoryPane {
             }),
             cx.subscribe(&detail, |_, _, event: &InspectFile, cx| {
                 cx.emit(InspectFile(event.0.clone(), event.1));
+            }),
+            cx.subscribe(&detail, |_, _, event: &StartRebase, cx| {
+                cx.emit(StartRebase(event.0.clone()));
             }),
             cx.subscribe(&graph, |this, graph, event: &GraphEvent, cx| match event {
                 GraphEvent::NeedMeta(range) => this.load_meta(range.clone(), cx),
@@ -259,6 +263,16 @@ impl Render for HistoryPane {
         let p = cx.palette();
         let menu = self.row_menu.clone().map(|(oid, position)| {
             let pane = cx.entity().downgrade();
+            let rebase_pane = cx.entity().downgrade();
+            let rebase = rebase_button(oid.clone(), self.session.read(cx), move |target, cx| {
+                rebase_pane
+                    .update(cx, |pane, cx| {
+                        pane.row_menu = None;
+                        cx.emit(StartRebase(target));
+                        cx.notify();
+                    })
+                    .ok();
+            });
             let buttons = replay_buttons(oid, self.session.read(cx), move |event, cx| {
                 pane.update(cx, |pane, cx| {
                     pane.row_menu = None;
@@ -284,7 +298,8 @@ impl Render for HistoryPane {
                             pane.row_menu = None;
                             cx.notify();
                         }))
-                        .children(buttons),
+                        .children(buttons)
+                        .child(rebase),
                 ),
             )
         });
