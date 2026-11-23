@@ -392,6 +392,10 @@ impl Sim {
             | GitArgs::Pull { .. }
             | GitArgs::Push { .. }
             | GitArgs::SetUpstream { .. }
+            | GitArgs::CreateTag { .. }
+            | GitArgs::DeleteTag { .. }
+            | GitArgs::PushTag { .. }
+            | GitArgs::DeleteRemoteTag { .. }
             // Task 23.
             | GitArgs::ResolveTakeSide { .. }
             | GitArgs::ResolveRemove { .. }

@@ -29,6 +29,11 @@ pub fn action_of(request: &WriteRequest) -> Option<Action> {
         | WriteRequest::StashApply { .. }
         | WriteRequest::StashPop { .. }
         | WriteRequest::StashDrop { .. }
+        // P3: planned by `tag::plan`.
+        | WriteRequest::CreateTag { .. }
+        | WriteRequest::DeleteTag { .. }
+        | WriteRequest::PushTag { .. }
+        | WriteRequest::DeleteRemoteTag { .. }
         | WriteRequest::Fetch { .. }
         | WriteRequest::Pull { .. }
         | WriteRequest::Push { .. }
@@ -202,6 +207,11 @@ fn check(
         | WriteRequest::StashApply { .. }
         | WriteRequest::StashPop { .. }
         | WriteRequest::StashDrop { .. }
+        // P3: planned by `tag::plan`.
+        | WriteRequest::CreateTag { .. }
+        | WriteRequest::DeleteTag { .. }
+        | WriteRequest::PushTag { .. }
+        | WriteRequest::DeleteRemoteTag { .. }
         | WriteRequest::Fetch { .. }
         | WriteRequest::Pull { .. }
         | WriteRequest::Push { .. }

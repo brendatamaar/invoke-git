@@ -407,6 +407,7 @@ mod tests {
                     },
                 },
             )]),
+            ..RefsSnapshot::default()
         }
     }
 

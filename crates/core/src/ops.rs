@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::conflict::{Operation, ResolveChoice, Side};
 use crate::event::RefValue;
-use crate::ids::{BranchName, IndexId, Oid, RefName, RepoPath};
+use crate::ids::{BranchName, IndexId, Oid, RefName, RepoPath, TagName};
 use crate::message::CommitMessage;
 
 /// A write the user asked for, waiting in or running from the op queue.
@@ -40,6 +40,27 @@ pub enum WriteRequest {
         name: BranchName,
         /// Delete even if the branch is not fully merged.
         force: bool,
+    },
+    // P3: tags. Checked against the fresh snapshot at dispatch.
+    CreateTag {
+        name: TagName,
+        at: BranchStart,
+        /// `Some` makes it an annotated tag with this message.
+        message: Option<CommitMessage>,
+    },
+    DeleteTag {
+        name: TagName,
+    },
+    /// Sends one local tag to a remote. Irreversible (law 9).
+    PushTag {
+        remote: String,
+        name: TagName,
+    },
+    /// Deletes a tag on a remote (`git push <remote> :refs/tags/<name>`).
+    /// Irreversible (law 9); the local tag is untouched.
+    DeleteRemoteTag {
+        remote: String,
+        name: TagName,
     },
     // Task 20: stash. Apply, pop and drop name the stash by commit id.
     StashSave {
@@ -193,6 +214,29 @@ pub enum GitArgs {
         tip: Oid,
         force: bool,
     },
+    // P3: tags. Each carries the tag ref value it expects (see
+    // `GitArgs::expected_refs`).
+    CreateTag {
+        name: TagName,
+        at: Oid,
+        /// Cleaned message of an annotated tag.
+        message: Option<String>,
+    },
+    DeleteTag {
+        name: TagName,
+        /// What the tag ref holds now (the tag object when annotated).
+        tip: Oid,
+    },
+    PushTag {
+        remote: String,
+        name: TagName,
+        /// What the local tag ref holds now.
+        tip: Oid,
+    },
+    DeleteRemoteTag {
+        remote: String,
+        name: TagName,
+    },
     // Task 20: stash. `index` is the position (`stash@{index}`) the core
     // found `stash` at; the shell checks that the entry there still has that
     // id and refuses otherwise (rule 5).
@@ -274,6 +318,10 @@ impl GitArgs {
             name: name.to_ref(),
             oid: oid.cloned(),
         };
+        let tag_at = |name: &TagName, oid: Option<&Oid>| RefValue {
+            name: name.to_ref(),
+            oid: oid.cloned(),
+        };
         match self {
             GitArgs::Commit { .. }
             | GitArgs::StashSave { .. }
@@ -294,6 +342,11 @@ impl GitArgs {
             | GitArgs::Skip { .. }
             | GitArgs::Abort { .. } => Vec::new(),
             GitArgs::CreateBranch { name, .. } => vec![at(name, None)],
+            GitArgs::CreateTag { name, .. } => vec![tag_at(name, None)],
+            GitArgs::DeleteTag { name, tip } | GitArgs::PushTag { name, tip, .. } => {
+                vec![tag_at(name, Some(tip))]
+            }
+            GitArgs::DeleteRemoteTag { .. } => Vec::new(),
             GitArgs::SwitchBranch { name, tip } | GitArgs::DeleteBranch { name, tip, .. } => {
                 vec![at(name, Some(tip))]
             }
@@ -317,7 +370,11 @@ impl GitArgs {
     pub fn is_network(&self) -> bool {
         matches!(
             self,
-            GitArgs::Fetch { .. } | GitArgs::Pull { .. } | GitArgs::Push { .. }
+            GitArgs::Fetch { .. }
+                | GitArgs::Pull { .. }
+                | GitArgs::Push { .. }
+                | GitArgs::PushTag { .. }
+                | GitArgs::DeleteRemoteTag { .. }
         )
     }
 }

@@ -60,6 +60,11 @@ pub enum IndexId {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BranchName(pub String);
 
+/// A short tag name such as `v1.0` or `release/2.1`. Same rules as a branch
+/// name (`git check-ref-format`), so one parser decides both.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TagName(pub String);
+
 /// A full ref name such as `refs/heads/main` or `refs/remotes/origin/main`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RefName(pub String);
@@ -73,6 +78,19 @@ impl BranchName {
     /// `git check-ref-format --branch`, made a little stricter where git
     /// would accept something nobody means (a leading `-`, the name `HEAD`).
     /// Anything accepted here is accepted by git.
+    pub fn parse(text: &str) -> Result<Self, NameProblem> {
+        check_branch_name(text)?;
+        Ok(Self(text.to_owned()))
+    }
+}
+
+impl TagName {
+    pub fn to_ref(&self) -> RefName {
+        RefName(format!("refs/tags/{}", self.0))
+    }
+
+    /// Parses a name typed by the user (P3). Anything accepted here is
+    /// accepted by `git check-ref-format refs/tags/<name>`.
     pub fn parse(text: &str) -> Result<Self, NameProblem> {
         check_branch_name(text)?;
         Ok(Self(text.to_owned()))
@@ -192,6 +210,12 @@ mod tests {
         #[test]
         fn dotted_and_slashed_names_follow_the_rules(text in "[a-c./-]{0,8}(\\.lock)?") {
             prop_assert_eq!(BranchName::parse(&text).is_err(), forbidden(&text));
+        }
+
+        /// P3: a tag name is valid exactly when a branch name is.
+        #[test]
+        fn tag_names_follow_the_branch_rules(text in "[a-c./@{}~^:?*\\[ \\-]{0,8}(\\.lock)?") {
+            prop_assert_eq!(TagName::parse(&text).is_err(), forbidden(&text));
         }
 
         #[test]
