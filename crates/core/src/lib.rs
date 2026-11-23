@@ -14,6 +14,7 @@ pub mod ids;
 pub mod message;
 pub mod notes;
 pub mod ops;
+pub mod reflog;
 pub mod stash;
 pub mod state;
 mod step;
@@ -40,6 +41,7 @@ pub use ops::{
     Lease, OpOutcome, Patch, Progress, PullMode, RemoteBranch, Selection, StageRequest,
     WriteRequest,
 };
+pub use reflog::{ReflogEntry, ReflogTarget, ResetMode};
 pub use stash::StashEntry;
 pub use state::{
     Action, BranchRefusal, CommitRefusal, Conflicts, DiskState, FileChange, Freshness, Head,

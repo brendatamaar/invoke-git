@@ -8,6 +8,7 @@ use crate::ops::{
     AuthAnswer, AuthPrompt, BranchStart, DiscardRequest, Failure, GitArgs, OpOutcome, Patch,
     Progress, PullMode, RemoteBranch, StageRequest,
 };
+use crate::reflog::ResetMode;
 use crate::state::{DiskState, Head};
 use crate::undo::{Reversal, UndoEntry, UndoReplay};
 
@@ -53,6 +54,12 @@ pub enum Event {
     // onto the `HEAD` in the snapshot at the moment of the request.
     CherryPickRequested(Oid),
     RevertRequested(Oid),
+    // P7: reset the `HEAD` in the snapshot at the moment of the request to
+    // `target` (for example an entry from the reflog), with an undo snapshot.
+    ResetRequested {
+        target: Oid,
+        mode: ResetMode,
+    },
     SkipRequested,
     AbortRequested,
     OpCancelRequested(OpId),
