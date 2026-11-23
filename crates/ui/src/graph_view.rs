@@ -15,9 +15,9 @@ use std::ops::Range;
 
 use gpui::{
     AnyElement, BorderStyle, Bounds, Context, Corners, Div, Edges, EventEmitter, FontWeight, Hsla,
-    InteractiveElement, IntoElement, ParentElement, PathBuilder, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, canvas, div,
-    fill, point, px, quad, size, uniform_list,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, PathBuilder, Pixels, Point,
+    Render, SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
+    canvas, div, fill, point, px, quad, size, uniform_list,
 };
 use graph::{Edge, Layout, Row};
 use tokens::{
@@ -75,6 +75,10 @@ pub enum GraphEvent {
     NeedMeta(Range<usize>),
     /// The user selected a row.
     Selected(usize),
+    RowMenu {
+        row: usize,
+        position: Point<Pixels>,
+    },
 }
 
 enum Status {
@@ -355,6 +359,7 @@ impl<I: Copy + Eq + Display + 'static> GraphView<I> {
                 let labels = self.labels.get(&key).cloned().unwrap_or_default();
                 let meta = self.meta[index].clone();
                 let (select, hover) = (this.clone(), this.clone());
+                let menu = this.clone();
                 let mut line = div()
                     .id(("graph-row", index))
                     .flex()
@@ -364,6 +369,15 @@ impl<I: Copy + Eq + Display + 'static> GraphView<I> {
                     .px(px(SPACE_2))
                     .cursor_pointer()
                     .on_click(move |_, _, cx| select.update(cx, |view, cx| view.select(index, cx)))
+                    .on_mouse_down(MouseButton::Right, move |event, _, cx| {
+                        menu.update(cx, |view, cx| {
+                            view.select(index, cx);
+                            cx.emit(GraphEvent::RowMenu {
+                                row: index,
+                                position: event.position,
+                            });
+                        });
+                    })
                     .on_hover(move |hovered: &bool, _, cx| {
                         hover.update(cx, |view, cx| view.set_hover(index, *hovered, cx))
                     });

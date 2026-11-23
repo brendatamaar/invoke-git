@@ -80,6 +80,7 @@ pub struct CommitDetail {
     selected: Option<usize>,
     on_select: OnSelect,
     on_copy: OnCopy,
+    actions: Vec<AnyElement>,
     diff: Option<AnyElement>,
 }
 
@@ -95,8 +96,15 @@ impl CommitDetail {
             selected,
             on_select: Rc::new(on_select),
             on_copy: Rc::new(on_copy),
+            actions: Vec::new(),
             diff: None,
         }
+    }
+
+    pub fn actions(mut self, actions: impl IntoIterator<Item = Button>) -> Self {
+        self.actions
+            .extend(actions.into_iter().map(IntoElement::into_any_element));
+        self
     }
 
     /// The diff of the chosen file, shown below the list.
@@ -304,7 +312,14 @@ impl RenderOnce for CommitDetail {
             .child(header)
             .child(facts)
             .child(files_block)
-            .child(div().flex().flex_none().child(copy_hash))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .gap(px(SPACE_2))
+                    .child(copy_hash)
+                    .children(self.actions),
+            )
             .child(
                 div()
                     .flex()

@@ -7,11 +7,12 @@ use gpui::{
     AppContext, ClipboardItem, Context, Entity, IntoElement, ParentElement, Render, Styled, Window,
     div, px,
 };
-use invoke_core::{FileChange, RepoPath};
+use invoke_core::{Event, FileChange, Oid, RepoPath, Snapshot};
 use shell::InputsError;
 use shell::commit_detail::{Change, CommitDetail as Detail, read_commit, read_commit_sides};
 use shell::history::CommitId;
 use tokens::TEXT_BODY;
+use ui::components::Button;
 use ui::convert::hsla;
 use ui::time::format_date_time;
 use ui::{
@@ -20,6 +21,32 @@ use ui::{
 };
 
 use crate::session::RepoSession;
+
+pub(crate) fn replay_buttons(
+    oid: Oid,
+    session: &RepoSession,
+    send: impl Fn(Event, &mut gpui::App) + Clone + 'static,
+) -> [Button; 2] {
+    let clean = matches!(
+        &session.state.snapshot,
+        Snapshot::Read { disk, .. } if disk.phase == invoke_core::Phase::Clean
+    );
+    [
+        (
+            "cherry-pick-commit",
+            "Cherry-pick",
+            Event::CherryPickRequested(oid.clone()),
+        ),
+        ("revert-commit", "Revert", Event::RevertRequested(oid)),
+    ]
+    .map(|(id, label, event)| {
+        let send = send.clone();
+        Button::new(id, label)
+            .ghost()
+            .disabled(!clean)
+            .on_click(move |_, _, cx| send(event.clone(), cx))
+    })
+}
 
 /// Phases are an enum: a pane that is loading has no commit to show.
 enum Phase {
@@ -254,12 +281,19 @@ impl Render for CommitPane {
             Phase::Ready { info, selected } => {
                 let this = cx.entity();
                 let hash = info.hash.to_string();
+                let session = self.session.clone();
+                let actions = Oid::from_hex(&hash).ok().map(|oid| {
+                    replay_buttons(oid, self.session.read(cx), move |event, cx| {
+                        session.update(cx, |session, cx| session.deliver(event, cx));
+                    })
+                });
                 CommitDetail::new(
                     info.clone(),
                     *selected,
                     move |index, _, cx| this.update(cx, |pane, cx| pane.select_file(index, cx)),
                     move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(hash.clone())),
                 )
+                .actions(actions.into_iter().flatten())
                 .diff(self.diff.clone())
                 .into_any_element()
             }

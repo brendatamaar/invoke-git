@@ -10,7 +10,7 @@ Menyediakan aksi cherry-pick dan revert commit dengan alur konflik terpadu (reso
 - [x] Tulis property & integration tests untuk cherry-pick dan revert (clean, conflict → resolve → continue, conflict → abort, undo) di `crates/core/tests/conflict_props.rs`, `crates/shell/tests/conflicts.rs`, dan tambahkan transisi cherry-pick/revert ke model-based harness di `crates/harness/src/`.
 - [x] Tambah event, command, dan state transition untuk `CherryPick` dan `Revert` (termasuk menyimpulkan konflik via `ConcludeCherryPick` / `ConcludeRevert` dan undo point) di `crates/core/src/event.rs`, `crates/core/src/ops.rs`, `crates/core/src/conflict.rs`, dan `crates/core/src/step.rs`.
 - [x] Tambah eksekusi CLI `git cherry-pick` dan `git revert` (`--continue`, `--abort`) dengan expected-ref/lock guard di `crates/shell/src/git.rs` dan `crates/shell/src/conflict.rs`.
-- [ ] (ditunda ke Windows, lihat Handoff notes) Tambah aksi Cherry-pick dan Revert di context menu/detail commit (`crates/app/src/history_view.rs`, `crates/app/src/conflict_view.rs`, `crates/ui/src/commit_detail.rs`) + Windows checklist di Handoff notes.
+- [x] Tambah aksi Cherry-pick dan Revert di menu konteks riwayat dan detail commit. Pakai alur konflik yang sudah terhubung di repo view.
 
 ## Definition of Done
 - `cargo xtask check --core` (VPS/CI) atau `cargo xtask check` (Windows) lulus.
@@ -31,15 +31,19 @@ Menyediakan aksi cherry-pick dan revert commit dengan alur konflik terpadu (reso
 - **Temuan harness:** git memulai cherry-pick/revert walau file tracked punya edit unstaged, lalu `--abort` menimpa edit itu. Karena itu core menolak saat ada perubahan pada file tracked (staged atau unstaged); file untracked tidak masalah. Dicatat di DECISIONS.md.
 - **UI ditunda (butuh Windows):** hanya `crates/app/src/notice.rs` yang disentuh (arm string untuk `Action`/`Refusal` baru, tanpa GPUI). Belum ada menu konteks Cherry-pick / Revert di `history_view.rs`, `commit_detail.rs`, `conflict_view.rs`; judul/label konflik cherry-pick & revert sudah ada dari P1 (`crates/app/src/conflict.rs`).
 
+### Lanjutan Windows
+- Klik kanan baris graph atau gunakan tombol di detail commit. Keduanya mengirim event yang sama dengan OID commit terpilih dan menonaktifkan aksi saat fase repo bukan `Clean`. Repo view membuka tampilan konflik yang sama untuk resolve, Continue, dan Abort.
+- Tes `conflict_props` (24) dan `conflicts` (27) serta Clippy untuk app/UI lulus di Windows. Gate workspace dan verifikasi klik manual masih terbuka.
+
 ### Pertanyaan spec / di luar scope (diusulkan, tidak ditebak)
 1. Pick/revert yang menghasilkan commit kosong (perubahan sudah ada) berhenti dengan `CHERRY_PICK_HEAD` tanpa file konflik; Continue gagal ("nothing to commit"), hanya Abort yang jalan. `Skip` hanya untuk rebase (PRD). Usul: izinkan Skip (`git cherry-pick --skip`, git >= 2.23) untuk cherry-pick/revert, atau tampilkan pesan khusus. Menunggu keputusan.
 2. Merge commit butuh `-m <parent>`: sekarang ditolak git (`Expected`, repo tidak berubah). Usul: pemilih parent di UI.
 3. Guard `UncommittedChanges` hanya dari snapshot; edit tersimpan setelah baca dan sebelum git jalan tidak terlindungi oleh `Expect` (git sendiri menolak bila tumpang tindih).
 4. Multi-commit range: di luar scope (sesuai fase).
 
-### Windows verification checklist (belum dijalankan, UI tidak dibangun di Linux)
-- [ ] `cargo xtask check` penuh lulus di Windows (termasuk `ui`/`app`; `notice.rs` kini punya arm `Action::CherryPick/Revert` dan `Refusal::UncommittedChanges`).
-- [ ] Tambah item "Cherry-pick" dan "Revert" di menu konteks riwayat (`history_view.rs`) dan tombol di detail commit (`commit_detail.rs`), kirim `Event::CherryPickRequested(oid)` / `RevertRequested(oid)` mengikuti pola `deliver` yang ada; nonaktifkan saat fase bukan `Clean`.
+### Windows verification checklist
+- [ ] `cargo xtask check` penuh lulus di Windows.
+- [ ] Buka menu klik kanan di History dan pastikan kedua aksi memakai OID baris yang diklik. Coba juga kedua tombol di detail commit.
 - [ ] Cherry-pick bersih: commit baru muncul di graph, branch lain tidak bergerak, Undo mengembalikan ref dan index.
 - [ ] Revert bersih: commit `Revert "..."` muncul; Undo mengembalikan.
 - [ ] Konflik: layar konflik membuka dengan judul "Cherry-picking onto ..." / "Reverting on ..."; Continue terkunci sampai semua file resolved; Abort memulihkan semuanya.

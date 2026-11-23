@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Task,
-    Window, div, px,
+    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, Point,
+    Render, Styled, Subscription, Task, Window, anchored, deferred, div, px,
 };
-use invoke_core::{Head, RefsSnapshot, Snapshot};
+use invoke_core::{Head, Oid, RefsSnapshot, Snapshot};
 use shell::history::{CommitId, CommitMeta, HistoryEvent, read_meta, walk};
 use ui::time::relative;
 use ui::{GraphEvent, GraphView, RowMeta, ref_labels::ref_labels};
@@ -20,7 +20,7 @@ use ui::{GraphEvent, GraphView, RowMeta, ref_labels::ref_labels};
 use ui::ThemeExt;
 use ui::convert::hsla;
 
-use crate::commit_pane::CommitPane;
+use crate::commit_pane::{CommitPane, replay_buttons};
 use crate::session::RepoSession;
 
 /// The width of the commit detail beside the graph.
@@ -33,6 +33,7 @@ pub struct HistoryPane {
     cancel: Arc<AtomicBool>,
     started: bool,
     last_refs: Option<(Head, RefsSnapshot)>,
+    row_menu: Option<(Oid, Point<Pixels>)>,
     _walk: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -61,8 +62,18 @@ impl HistoryPane {
             cx.subscribe(&graph, |this, graph, event: &GraphEvent, cx| match event {
                 GraphEvent::NeedMeta(range) => this.load_meta(range.clone(), cx),
                 GraphEvent::Selected(row) => {
+                    this.row_menu = None;
                     let id = graph.read(cx).id_at(*row).copied();
                     this.detail.update(cx, |detail, cx| detail.show(id, cx));
+                    cx.notify();
+                }
+                GraphEvent::RowMenu { row, position } => {
+                    this.row_menu = graph
+                        .read(cx)
+                        .id_at(*row)
+                        .and_then(|id| Oid::from_hex(&id.to_string()).ok())
+                        .map(|oid| (oid, *position));
+                    cx.notify();
                 }
             }),
             cx.observe(&session, |this, _, cx| this.session_changed(cx)),
@@ -74,6 +85,7 @@ impl HistoryPane {
             cancel: Arc::new(AtomicBool::new(false)),
             started: false,
             last_refs: None,
+            row_menu: None,
             _walk: None,
             _subscriptions: subscriptions,
         }
@@ -115,11 +127,14 @@ impl HistoryPane {
     }
 
     fn session_changed(&mut self, cx: &mut Context<Self>) {
+        self.detail.update(cx, |_, cx| cx.notify());
+        cx.notify();
         if !self.started {
             return;
         }
         let Some(now) = self.refs(cx) else { return };
         if self.last_refs.as_ref() != Some(&now) {
+            self.row_menu = None;
             self.sync_refs(cx);
             self.start_walk(true, cx);
         }
@@ -213,6 +228,37 @@ impl Drop for HistoryPane {
 impl Render for HistoryPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
+        let menu = self.row_menu.clone().map(|(oid, position)| {
+            let pane = cx.entity().downgrade();
+            let buttons = replay_buttons(oid, self.session.read(cx), move |event, cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.row_menu = None;
+                    pane.session
+                        .update(cx, |session, cx| session.deliver(event, cx));
+                    cx.notify();
+                })
+                .ok();
+            });
+            deferred(
+                anchored().position(position).snap_to_window().child(
+                    div()
+                        .id("commit-row-menu")
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .p(px(tokens::SPACE_1))
+                        .rounded(px(tokens::RADIUS_MD))
+                        .border_1()
+                        .border_color(hsla(p.line))
+                        .bg(hsla(p.bg_panel))
+                        .on_mouse_down_out(cx.listener(|pane, _, _, cx| {
+                            pane.row_menu = None;
+                            cx.notify();
+                        }))
+                        .children(buttons),
+                ),
+            )
+        });
         div()
             .flex()
             .size_full()
@@ -225,6 +271,7 @@ impl Render for HistoryPane {
                     .border_color(hsla(p.line))
                     .child(self.detail.clone()),
             )
+            .children(menu)
     }
 }
 
