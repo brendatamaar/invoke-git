@@ -105,7 +105,11 @@ fn check(request: &WriteRequest, disk: &DiskState) -> Result<Planned, Refusal> {
             if let Some(other) = conflicting(disk, name) {
                 return refuse(TagRefusal::NameConflict(other));
             }
-            let kind = if message.is_some() { "annotated tag" } else { "tag" };
+            let kind = if message.is_some() {
+                "annotated tag"
+            } else {
+                "tag"
+            };
             Ok(planned(
                 GitArgs::CreateTag {
                     name: name.clone(),

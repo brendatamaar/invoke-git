@@ -61,10 +61,16 @@ impl Fx {
             root,
             env,
         };
-        fx.git(&fx.root, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
+        fx.git(
+            &fx.root,
+            &["init", "-q", "--bare", "-b", "main", "origin.git"],
+        );
         let w = fx.paths.workdir.clone();
         fx.git(&w, &["init", "-q", "-b", "main"]);
-        fx.git(&w, &["remote", "add", "origin", fx.origin().to_str().unwrap()]);
+        fx.git(
+            &w,
+            &["remote", "add", "origin", fx.origin().to_str().unwrap()],
+        );
         fx.commit("a.txt", "one\n", "c1");
         fx.commit("a.txt", "two\n", "c2");
         fx
@@ -315,7 +321,13 @@ fn create_annotated_makes_a_tag_object_that_peels_to_the_commit() {
 
     driver.undo();
     assert!(driver.succeeded(), "{:?}", driver.state.notice);
-    assert!(fx.try_git(&fx.paths.workdir, &["rev-parse", "-q", "--verify", "refs/tags/v2"]).is_none());
+    assert!(
+        fx.try_git(
+            &fx.paths.workdir,
+            &["rev-parse", "-q", "--verify", "refs/tags/v2"]
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -375,12 +387,18 @@ fn refusals_name_the_reason_and_write_nothing() {
     driver.create("v1", None);
     assert_eq!(
         driver.refusal(),
-        Some((Action::CreateTag, Refusal::Tag(TagRefusal::AlreadyExists(tag("v1")))))
+        Some((
+            Action::CreateTag,
+            Refusal::Tag(TagRefusal::AlreadyExists(tag("v1")))
+        ))
     );
     driver.create("v1/x", None);
     assert_eq!(
         driver.refusal(),
-        Some((Action::CreateTag, Refusal::Tag(TagRefusal::NameConflict(tag("v1")))))
+        Some((
+            Action::CreateTag,
+            Refusal::Tag(TagRefusal::NameConflict(tag("v1")))
+        ))
     );
     driver.create("bad name", None);
     assert!(matches!(
@@ -390,12 +408,18 @@ fn refusals_name_the_reason_and_write_nothing() {
     driver.delete("nope");
     assert_eq!(
         driver.refusal(),
-        Some((Action::DeleteTag, Refusal::Tag(TagRefusal::NoSuchTag(tag("nope")))))
+        Some((
+            Action::DeleteTag,
+            Refusal::Tag(TagRefusal::NoSuchTag(tag("nope")))
+        ))
     );
     driver.push("nope");
     assert_eq!(
         driver.refusal(),
-        Some((Action::PushTag, Refusal::Tag(TagRefusal::NoSuchTag(tag("nope")))))
+        Some((
+            Action::PushTag,
+            Refusal::Tag(TagRefusal::NoSuchTag(tag("nope")))
+        ))
     );
     assert_eq!(fx.local_refs(), before);
 }

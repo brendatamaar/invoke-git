@@ -15,11 +15,11 @@ use crate::ops::{
     WriteRequest,
 };
 use crate::stash;
-use crate::tag;
 use crate::state::{
     Action, BranchRefusal, CommitRefusal, DiskState, Freshness, Head, LockState, Notice, OpPhase,
     Phase, QueuedOp, Refusal, RepoState, RunningOp, Snapshot, TagRefusal,
 };
+use crate::tag;
 use crate::undo::{self, Irreversible, Reversal, Reversible, UndoEntry, UndoPending};
 
 /// Opens a repo: the initial state plus the first full read.
@@ -146,7 +146,10 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         // P3: tags. Names and messages are parsed here; what depends on the
         // disk is checked when the request is dispatched.
         Event::TagCreateRequested { name, at, message } => {
-            match (TagName::parse(&name), message.as_deref().map(CommitMessage::parse)) {
+            match (
+                TagName::parse(&name),
+                message.as_deref().map(CommitMessage::parse),
+            ) {
                 (Err(problem), _) => refuse_because(
                     &mut state,
                     Action::CreateTag,
