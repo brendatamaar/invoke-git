@@ -60,7 +60,7 @@ pub(crate) fn tree_of<'r>(commit: &gix::Commit<'r>) -> Result<gix::Tree<'r>, Str
 }
 
 /// The first parent's tree, or the empty tree for a root commit.
-fn parent_tree<'r>(
+pub(crate) fn parent_tree<'r>(
     repo: &'r gix::Repository,
     commit: &gix::Commit<'r>,
 ) -> Result<gix::Tree<'r>, String> {
