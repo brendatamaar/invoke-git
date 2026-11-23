@@ -8,7 +8,7 @@ use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window,
     div, px,
 };
-use invoke_core::{BranchName, BranchStart, Event, NameProblem, Oid, RefName, Snapshot};
+use invoke_core::{BranchName, BranchStart, Event, NameProblem, Oid, RefName, Snapshot, TagName};
 use tokens::{SPACE_2, SPACE_3, TEXT_SMALL};
 use ui::convert::hsla;
 use ui::{
@@ -27,6 +27,14 @@ enum Form {
     Delete {
         name: BranchName,
         force: bool,
+    },
+    CreateTag {
+        annotated: bool,
+    },
+    ManageTag,
+    DeleteRemoteTag {
+        remote: String,
+        name: TagName,
     },
     /// Save the local changes as a stash.
     Stash {
@@ -89,6 +97,9 @@ pub struct BranchPanel {
     editor: Entity<TextEditor>,
     /// The stash message.
     message: Entity<TextEditor>,
+    tag_name: Entity<TextEditor>,
+    tag_message: Entity<TextEditor>,
+    tag_remote: Entity<TextEditor>,
     form: Form,
     _subscriptions: Vec<Subscription>,
 }
@@ -97,7 +108,10 @@ impl BranchPanel {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| TextEditor::new("Branch name", 1, cx).single_line());
         let message = cx.new(|cx| TextEditor::new("Message (optional)", 1, cx).single_line());
-        let subscriptions = vec![
+        let tag_name = cx.new(|cx| TextEditor::new("Tag name", 1, cx).single_line());
+        let tag_message = cx.new(|cx| TextEditor::new("Tag message", 3, cx));
+        let tag_remote = cx.new(|cx| TextEditor::new("Remote name", 1, cx).single_line());
+        let mut subscriptions = vec![
             cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| match event {
                 EditorEvent::Changed => cx.notify(),
                 EditorEvent::Submit => this.submit(false, cx),
@@ -108,10 +122,16 @@ impl BranchPanel {
             }),
             cx.observe(&session, |_, _, cx| cx.notify()),
         ];
+        for field in [&tag_name, &tag_message, &tag_remote] {
+            subscriptions.push(cx.subscribe(field, |_, _, _: &EditorEvent, cx| cx.notify()));
+        }
         Self {
             session,
             editor,
             message,
+            tag_name,
+            tag_message,
+            tag_remote,
             form: Form::None,
             _subscriptions: subscriptions,
         }
@@ -180,6 +200,201 @@ impl BranchPanel {
             SideAction::StashApply(index) => self.stash(index, StashOp::Apply, cx),
             SideAction::StashPop(index) => self.stash(index, StashOp::Pop, cx),
             SideAction::StashDrop(index) => self.ask_to_drop(index, cx),
+            SideAction::ManageTag(name) => self.open_tag(Form::ManageTag, &name, cx),
+        }
+    }
+
+    fn open_tag(&mut self, form: Form, name: &str, cx: &mut Context<Self>) {
+        self.tag_name
+            .update(cx, |editor, cx| editor.set_text(name, cx));
+        self.tag_message
+            .update(cx, |editor, cx| editor.set_text("", cx));
+        self.form = form;
+        cx.notify();
+    }
+
+    fn tag_name(&self, cx: &Context<Self>) -> Result<TagName, NameProblem> {
+        TagName::parse(self.tag_name.read(cx).text().trim())
+    }
+
+    fn tag_remote(&self, cx: &Context<Self>) -> String {
+        self.tag_remote.read(cx).text().trim().to_owned()
+    }
+
+    fn send_tag(&mut self, event: Event, cx: &mut Context<Self>) {
+        self.deliver(event, cx);
+        self.close(cx);
+    }
+
+    fn render_tag_form(&self, cancel: Button, cx: &mut Context<Self>) -> gpui::Div {
+        let p = cx.palette();
+        let label = |text: String| {
+            div()
+                .text_style(&TEXT_SMALL, cx)
+                .text_color(hsla(p.ink))
+                .child(text)
+        };
+        let name = self.tag_name(cx);
+        let form = div().flex().flex_col().gap(px(SPACE_2));
+        match &self.form {
+            Form::CreateTag { annotated } => {
+                let annotated = *annotated;
+                let toggle = cx.entity();
+                let submit = cx.entity();
+                let manage = cx.entity();
+                form.child(self.tag_name.clone())
+                    .children(
+                        name.as_ref()
+                            .err()
+                            .filter(|_| !self.tag_name.read(cx).text().is_empty())
+                            .map(|problem| label(name_problem_text(*problem).into())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_2))
+                            .child(
+                                Checkbox::new(
+                                    "tag-annotated",
+                                    if annotated {
+                                        CheckState::Checked
+                                    } else {
+                                        CheckState::Unchecked
+                                    },
+                                )
+                                .on_click(move |_, _, cx| {
+                                    toggle.update(cx, |pane, cx| {
+                                        pane.form = Form::CreateTag {
+                                            annotated: !annotated,
+                                        };
+                                        cx.notify();
+                                    })
+                                }),
+                            )
+                            .child(label("Annotated tag".into())),
+                    )
+                    .children(annotated.then_some(self.tag_message.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(SPACE_2))
+                            .child(
+                                Button::new("tag-create", "Create")
+                                    .primary()
+                                    .disabled(name.is_err())
+                                    .on_click(move |_, _, cx| {
+                                        submit.update(cx, |pane, cx| pane.submit(false, cx))
+                                    }),
+                            )
+                            .child(cancel),
+                    )
+                    .child(
+                        Button::new("tag-manage-open", "Manage tags")
+                            .ghost()
+                            .on_click(move |_, _, cx| {
+                                manage.update(cx, |pane, cx| {
+                                    pane.form = Form::ManageTag;
+                                    cx.notify();
+                                })
+                            }),
+                    )
+            }
+            Form::ManageTag => {
+                let local = name
+                    .as_ref()
+                    .ok()
+                    .and_then(|name| self.oid_of(&format!("refs/tags/{}", name.0), cx))
+                    .is_some();
+                let remote = self.tag_remote(cx);
+                let no_remote = remote.is_empty();
+                let push = cx.entity();
+                let delete = cx.entity();
+                let remote_delete = cx.entity();
+                form.child(self.tag_name.clone())
+                    .children(
+                        name.as_ref()
+                            .err()
+                            .filter(|_| !self.tag_name.read(cx).text().is_empty())
+                            .map(|problem| label(name_problem_text(*problem).into())),
+                    )
+                    .child(self.tag_remote.clone())
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(SPACE_2))
+                            .child(
+                                Button::new("tag-push", "Push")
+                                    .disabled(!local || no_remote)
+                                    .on_click(move |_, _, cx| {
+                                        push.update(cx, |pane, cx| {
+                                            if let Ok(name) = pane.tag_name(cx) {
+                                                let remote = pane.tag_remote(cx);
+                                                pane.send_tag(
+                                                    Event::TagPushRequested { remote, name },
+                                                    cx,
+                                                );
+                                            }
+                                        })
+                                    }),
+                            )
+                            .child(
+                                Button::new("tag-delete", "Delete local")
+                                    .danger()
+                                    .disabled(!local)
+                                    .on_click(move |_, _, cx| {
+                                        delete.update(cx, |pane, cx| {
+                                            if let Ok(name) = pane.tag_name(cx) {
+                                                pane.send_tag(Event::TagDeleteRequested(name), cx);
+                                            }
+                                        })
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(SPACE_2))
+                            .child(
+                                Button::new("tag-remote-delete", "Delete remote")
+                                    .danger()
+                                    .disabled(name.is_err() || no_remote)
+                                    .on_click(move |_, _, cx| {
+                                        remote_delete.update(cx, |pane, cx| {
+                                            if let Ok(name) = pane.tag_name(cx) {
+                                                pane.form = Form::DeleteRemoteTag {
+                                                    remote: pane.tag_remote(cx),
+                                                    name,
+                                                };
+                                                cx.notify();
+                                            }
+                                        })
+                                    }),
+                            )
+                            .child(cancel),
+                    )
+            }
+            Form::DeleteRemoteTag { remote, name } => {
+                let confirm = cx.entity();
+                form.child(label(format!(
+                    "Delete tag {} on {remote}? This cannot be undone.",
+                    name.0
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(SPACE_2))
+                        .child(
+                            Button::new("tag-confirm-delete", "Delete remote")
+                                .danger()
+                                .on_click(move |_, _, cx| {
+                                    confirm.update(cx, |pane, cx| pane.submit(false, cx))
+                                }),
+                        )
+                        .child(cancel),
+                )
+            }
+            _ => unreachable!("only tag forms are rendered here"),
         }
     }
 
@@ -230,6 +445,22 @@ impl BranchPanel {
         let text = self.editor.read(cx).text().trim().to_owned();
         match self.form.clone() {
             Form::None => {}
+            Form::CreateTag { annotated } => {
+                if let Ok(name) = self.tag_name(cx) {
+                    self.send_tag(
+                        Event::TagCreateRequested {
+                            name: name.0,
+                            at: BranchStart::Head,
+                            message: annotated.then(|| self.tag_message.read(cx).text().to_owned()),
+                        },
+                        cx,
+                    );
+                }
+            }
+            Form::ManageTag => {}
+            Form::DeleteRemoteTag { remote, name } => {
+                self.send_tag(Event::RemoteTagDeleteRequested { remote, name }, cx);
+            }
             Form::Create => {
                 if BranchName::parse(&text).is_ok() {
                     self.deliver(
@@ -288,6 +519,7 @@ impl Render for BranchPanel {
         let this = cx.entity();
         let new = cx.entity();
         let stash = cx.entity();
+        let tag = cx.entity();
         let mut panel = div()
             .flex()
             .flex_col()
@@ -316,6 +548,17 @@ impl Render for BranchPanel {
                                 },
                             )),
                     ),
+            )
+            .child(
+                div().px(px(SPACE_3)).pb(px(SPACE_2)).child(
+                    Button::new("new-tag", "+ Tag")
+                        .ghost()
+                        .on_click(move |_, _, cx| {
+                            tag.update(cx, |pane, cx| {
+                                pane.open_tag(Form::CreateTag { annotated: false }, "", cx)
+                            });
+                        }),
+                ),
             );
 
         let text = self.editor.read(cx).text().trim().to_owned();
@@ -326,6 +569,9 @@ impl Render for BranchPanel {
             .on_click(move |_, _, cx| close.update(cx, |this, cx| this.close(cx)));
         let form = match self.form.clone() {
             Form::None => None,
+            Form::CreateTag { .. } | Form::ManageTag | Form::DeleteRemoteTag { .. } => {
+                Some(self.render_tag_form(cancel, cx))
+            }
             Form::Create => Some(
                 div()
                     .flex()

@@ -10,7 +10,7 @@ Memungkinkan user melihat tag di sidebar & commit graph, membuat tag (lightweigh
 - [x] Tulis property test validasi nama tag & state transition di `crates/core/tests/tag_props.rs` dan integration test CLI/gix di `crates/shell/tests/tags.rs`.
 - [x] Tambah tipe `TagName`, daftar tag di `RepoState`, serta event/command create, delete, dan push tag di `crates/core/src/ids.rs`, `crates/core/src/state.rs`, `crates/core/src/tag.rs`, dan `crates/core/src/step.rs`.
 - [x] Baca daftar tag melalui `gix` di `crates/shell/src/read.rs` dan jalankan `git tag` / `git push <remote> refs/tags/<name>` / delete di `crates/shell/src/git.rs`.
-- [ ] (DITUNDA ke Windows, lihat Handoff notes) Tampilkan section Tags di sidebar (`crates/ui/src/sidebar.rs`, `crates/app/src/branch_panel.rs`) dan badge tag di commit graph (`crates/ui/src/ref_labels.rs`) beserta form create/push/delete + Windows checklist di Handoff notes.
+- [x] Tampilkan aksi Tags di sidebar dan badge tag di commit graph, dengan form create, push, dan delete.
 
 ## Definition of Done
 - `cargo xtask check --core` (VPS/CI) atau `cargo xtask check` (Windows) lulus.
@@ -31,10 +31,10 @@ Memungkinkan user melihat tag di sidebar & commit graph, membuat tag (lightweigh
 - Push tag tidak memakai `+` (remote menolak memindah tag yang sudah ada; hasil `Expected`). Operasi tag diblokir saat fase bukan `Clean` (merge/rebase/dll).
 - `crates/app/src/notice.rs` ditambah teks notice tag; `RefsSnapshot` literal di `ui/summary.rs` dan `app/review.rs` diberi `..RefsSnapshot::default()` (tidak dikompilasi di Linux).
 
-### Ditunda (butuh Windows/GPUI) - sisa task 4
-- Section Tags di `crates/ui/src/sidebar.rs` + `crates/app/src/branch_panel.rs` (daftar via `disk.refs.tags()`, aksi: create (lightweight/annotated, pesan), push (pilih remote), delete lokal, delete remote dengan konfirmasi irreversible).
-- Badge tag di `crates/ui/src/ref_labels.rs` memakai `TagInfo::target` (bukan `tip`) agar tag annotated muncul di commit target. Warna/spasi dari `crates/tokens`.
-- Event siap dipakai UI: `Event::TagCreateRequested{name,at,message}`, `TagDeleteRequested`, `TagPushRequested{remote,name}`, `RemoteTagDeleteRequested{remote,name}`.
+### Lanjutan Windows
+- `+ Tag` membuat tag pada HEAD. Klik tag yang ada atau buka Manage tags untuk push, hapus lokal, atau hapus remote. Masukkan nama remote pada form dan konfirmasi nama tag serta remote sebelum penghapusan remote.
+- Badge di graph menggunakan `TagInfo::target`, termasuk untuk annotated tag. Tes regresi memberi tag object dan commit target ID yang berbeda.
+- Tes `tag_props` (6) dan `tags` (8) serta Clippy app/UI lulus di Windows. Verifikasi klik manual masih terbuka.
 
 ### Windows verification checklist
 1. `cargo xtask check` (fmt, clippy, test, build ui/app) lulus tanpa warning; pastikan `RefsSnapshot` literal ui/app masih compile.

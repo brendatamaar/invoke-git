@@ -3,7 +3,6 @@
 //! and tags, in sections. The rows are pure (refs in, rows out); the
 //! component draws them and reports what the user asked for.
 
-use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use gpui::{
@@ -49,6 +48,7 @@ pub enum SideAction {
     /// Create a local branch from the remote branch (`origin/main`) and
     /// switch to it.
     CheckOutRemote(String),
+    ManageTag(String),
     /// Apply, pop or drop the stash entry at this position.
     StashApply(usize),
     StashPop(usize),
@@ -72,7 +72,6 @@ pub fn sidebar_rows(refs: &RefsSnapshot, head: &Head, stashes: &[StashEntry]) ->
     };
     let mut locals: Vec<(&str, Option<String>)> = Vec::new();
     let mut remotes: Vec<(&str, &str)> = Vec::new(); // (remote, branch)
-    let mut tags: BTreeSet<&str> = BTreeSet::new();
     for name in refs.refs.keys() {
         let full = name.0.as_str();
         if let Some(branch) = full.strip_prefix("refs/heads/") {
@@ -81,14 +80,11 @@ pub fn sidebar_rows(refs: &RefsSnapshot, head: &Head, stashes: &[StashEntry]) ->
                 .get(&invoke_core::BranchName(branch.to_owned()))
                 .map(|upstream| tracking_text(upstream.tracking));
             locals.push((branch, tracking));
-        } else if let Some(rest) = full.strip_prefix("refs/remotes/") {
-            if let Some((remote, branch)) = rest.split_once('/')
-                && branch != "HEAD"
-            {
-                remotes.push((remote, branch));
-            }
-        } else if let Some(tag) = full.strip_prefix("refs/tags/") {
-            tags.insert(tag);
+        } else if let Some(rest) = full.strip_prefix("refs/remotes/")
+            && let Some((remote, branch)) = rest.split_once('/')
+            && branch != "HEAD"
+        {
+            remotes.push((remote, branch));
         }
     }
     // An unborn branch has no ref yet but is still the current one.
@@ -122,9 +118,10 @@ pub fn sidebar_rows(refs: &RefsSnapshot, head: &Head, stashes: &[StashEntry]) ->
         }
         rows.push(SideRow::Remote(format!("{remote}/{branch}")));
     }
+    let tags = refs.tags();
     if !tags.is_empty() {
         rows.push(SideRow::Header("TAGS".to_owned()));
-        rows.extend(tags.into_iter().map(|t| SideRow::Tag(t.to_owned())));
+        rows.extend(tags.into_iter().map(|tag| SideRow::Tag(tag.name.0)));
     }
     if !stashes.is_empty() {
         rows.push(SideRow::Header("STASHES".to_owned()));
@@ -375,7 +372,14 @@ impl RenderOnce for Sidebar {
                                 .into_any_element()
                         }
                         SideRow::Tag(name) => {
+                            let on_action = on_action.clone();
+                            let tag = name.clone();
                             base_row(ElementId::from(("side-tag", index)), window, cx, ring)
+                                .hover(move |style| style.bg(hover))
+                                .cursor_pointer()
+                                .on_click(move |_, window, cx| {
+                                    on_action(SideAction::ManageTag(tag.clone()), window, cx)
+                                })
                                 .text_color(hsla(p.ink_muted))
                                 .child(div().flex_1().min_w(px(0.)).truncate().child(name.clone()))
                                 .into_any_element()

@@ -49,11 +49,6 @@ pub fn ref_labels(refs: &RefsSnapshot, head: &Head) -> HashMap<String, Vec<RefLa
                 name: remote.to_owned(),
                 kind: LabelKind::Remote,
             }
-        } else if let Some(tag) = full.strip_prefix("refs/tags/") {
-            RefLabel {
-                name: tag.to_owned(),
-                kind: LabelKind::Tag,
-            }
         } else {
             continue;
         };
@@ -61,6 +56,15 @@ pub fn ref_labels(refs: &RefsSnapshot, head: &Head) -> HashMap<String, Vec<RefLa
             .entry(oid.as_hex().to_owned())
             .or_default()
             .push(label);
+    }
+    for tag in refs.tags() {
+        labels
+            .entry(tag.target.to_string())
+            .or_default()
+            .push(RefLabel {
+                name: tag.name.0,
+                kind: LabelKind::Tag,
+            });
     }
     for list in labels.values_mut() {
         list.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
@@ -119,6 +123,17 @@ mod tests {
         let snapshot = refs(&[("refs/remotes/origin/HEAD", 'a'), ("refs/stash", 'b')]);
         let head = Head::Detached(oid('a'));
         assert!(ref_labels(&snapshot, &head).is_empty());
+    }
+
+    #[test]
+    fn an_annotated_tag_labels_its_commit() {
+        let mut snapshot = refs(&[("refs/tags/v1", 'a')]);
+        snapshot
+            .peeled_tags
+            .insert(invoke_core::TagName("v1".into()), oid('b'));
+        let labels = ref_labels(&snapshot, &Head::Detached(oid('b')));
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[oid('b').as_hex()][0].name, "v1");
     }
 
     #[test]
