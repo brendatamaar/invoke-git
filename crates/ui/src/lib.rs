@@ -8,6 +8,7 @@
 //! active colours and `.text_style(&tokens::TEXT_BODY, cx)` sets a token
 //! text style on any element.
 
+pub mod blame_view;
 pub mod changes;
 pub mod code_text;
 pub mod commit_detail;
@@ -20,6 +21,7 @@ pub mod focus;
 pub mod fonts;
 pub mod graph_view;
 pub mod ref_labels;
+pub mod reflog_view;
 pub mod scrollbar;
 pub mod sidebar;
 pub mod status_tree;
@@ -49,4 +51,3 @@ pub use text::TextStyleExt;
 pub use text_editor::{EditorEvent, TextEditor, bind_keys as bind_editor_keys};
 pub use theme::{ThemeExt, UiTheme, init, set_theme};
 pub use welcome::Welcome;
-pub mod blame_view;

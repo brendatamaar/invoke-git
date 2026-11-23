@@ -27,6 +27,7 @@ use crate::discard::{self, Confirm, What};
 use crate::file_insights::{FileInsights, FileInsightsEvent, FileMode, FileVersion, file_actions};
 use crate::history_view::HistoryPane;
 use crate::notice::{self, Tone};
+use crate::reflog_pane::ReflogPane;
 use crate::review_view::{ReviewEvent, ReviewPane};
 use crate::session::RepoSession;
 use crate::staging::{self, Part};
@@ -40,6 +41,7 @@ const CHANGES_W: f32 = SIDEBAR + 2.0 * SPACE_8;
 enum Page {
     Changes,
     History,
+    Reflog,
     /// The pre-push review, opened by the Push button.
     Review,
     /// The resolver of a paused merge, rebase, cherry-pick or revert (task 23).
@@ -69,6 +71,7 @@ pub struct RepoView {
     page: Page,
     tab_visible: bool,
     history: Entity<HistoryPane>,
+    reflog: Entity<ReflogPane>,
     file_insights: Entity<FileInsights>,
     commit: Entity<CommitBox>,
     branches: Entity<BranchPanel>,
@@ -150,11 +153,15 @@ impl RepoView {
         let history_visible = self.tab_visible && self.page == Page::History;
         self.history
             .update(cx, |history, cx| history.set_visible(history_visible, cx));
+        let reflog_visible = self.tab_visible && self.page == Page::Reflog;
+        self.reflog
+            .update(cx, |reflog, cx| reflog.set_visible(reflog_visible, cx));
     }
 
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|_| DiffView::new());
         let history = cx.new(|cx| HistoryPane::new(session.clone(), cx));
+        let reflog = cx.new(|cx| ReflogPane::new(session.clone(), cx));
         let reader = session.read(cx).blame.clone();
         let file_insights = cx.new(|_| FileInsights::new(reader));
         let commit = cx.new(|cx| CommitBox::new(session.clone(), cx));
@@ -207,6 +214,7 @@ impl RepoView {
             page: Page::Changes,
             tab_visible: false,
             history,
+            reflog,
             file_insights,
             commit,
             branches,
@@ -675,14 +683,20 @@ impl Render for RepoView {
         let page_switch = Segmented::new(
             "repo-page",
             if self.was_paused {
-                vec!["Changes".into(), "History".into(), "Conflicts".into()]
+                vec![
+                    "Changes".into(),
+                    "History".into(),
+                    "Reflog".into(),
+                    "Conflicts".into(),
+                ]
             } else {
-                vec!["Changes".into(), "History".into()]
+                vec!["Changes".into(), "History".into(), "Reflog".into()]
             },
             match self.page {
                 Page::Changes => 0,
                 Page::History => 1,
-                Page::Conflicts => 2,
+                Page::Reflog => 2,
+                Page::Conflicts => 3,
                 // None is chosen while the review is open.
                 Page::Review | Page::FileInsights(_) => usize::MAX,
             },
@@ -692,6 +706,7 @@ impl Render for RepoView {
                         match index {
                             0 => Page::Changes,
                             1 => Page::History,
+                            2 => Page::Reflog,
                             _ => Page::Conflicts,
                         },
                         cx,
@@ -775,6 +790,11 @@ impl Render for RepoView {
         });
 
         let body = match self.page {
+            Page::Reflog => div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .child(self.reflog.clone()),
             Page::FileInsights(_) => div()
                 .flex()
                 .flex_1()

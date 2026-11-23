@@ -18,6 +18,7 @@ mod notes_db;
 mod notice;
 mod paths;
 mod persist;
+mod reflog_pane;
 mod repo_view;
 mod review;
 mod review_view;
