@@ -7,6 +7,7 @@ mod branch_panel;
 mod clone_view;
 mod commit_box;
 mod commit_pane;
+mod commit_search;
 mod conflict;
 mod conflict_view;
 mod diff_load;

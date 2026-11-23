@@ -9,7 +9,7 @@ Menyediakan pencarian commit berdasarkan pesan, penulis, hash (penuh/prefix), da
 ## Tasks
 - [x] Tulis unit/property test parser query & matcher pencarian di `crates/core/tests/search_props.rs` dan integration test pada fixture repo di `crates/shell/tests/search.rs`.
 - [x] Tambah model filter pencarian (`SearchQuery`: message, author, hash prefix, path) di `crates/core/src/search.rs` dan implementasikan scan bertahap (paged & cancellable via `gix`) di `crates/shell/src/search.rs`.
-- [ ] Tambah search bar + daftar hasil yang langsung melompat/memilih commit pada graph & detail view di `crates/app/src/history_view.rs` dan komponen UI di `crates/ui/` + Windows checklist di Handoff notes.
+- [x] Tambah search bar, pemilih filter, dan daftar virtualized yang membuka detail commit dan melompat ke baris graph.
 
 ## Definition of Done
 - `cargo xtask check --core` (VPS/CI) atau `cargo xtask check` (Windows) lulus.
@@ -29,8 +29,10 @@ Menyediakan pencarian commit berdasarkan pesan, penulis, hash (penuh/prefix), da
 
 ### Windows verification checklist
 
-- [ ] Tambahkan pemilih mode dan search bar di `crates/app/src/history_view.rs`, serta komponen daftar hasil berbasis token di `crates/ui/`. Tampilkan validasi `QueryError`, progres, hasil kosong, dan kegagalan baca.
-- [ ] Hubungkan worker ke executor UI tanpa menunggu kanal pada thread UI. Batasi hasil yang disimpan atau dirender dan pastikan input, scroll graph, dan tab tetap responsif pada repo besar.
+Lanjutan Windows: query otomatis berjalan setelah jeda input 180 ms. UI menyimpan maksimal 500 hasil, dan pemilihan langsung membaca detail commit sambil menunggu baris graph bila halaman belum tiba. Perubahan refs mengulang pencarian dari disk. Mengganti query, keluar dari History, atau pindah tab menghentikan pembacaan sebelumnya. Tes `search_props` dan `search` masing-masing lulus 4 kasus. Verifikasi klik manual masih terbuka.
+
+- [ ] Coba tiap mode dan amati validasi input, progres, hasil kosong, dan kegagalan baca.
+- [ ] Pastikan input, scroll graph, dan pindah tab tetap responsif pada repo besar, termasuk saat batas 500 hasil tercapai.
 - [ ] Uji pesan multi-baris, nama dan email penulis, hash penuh/prefix, path dengan spasi dan subdirektori, perbedaan kapitalisasi Git di Windows, serta root, delete, dan repo shallow.
 - [ ] Pilih hasil dekat dan jauh. Verifikasi graph scroll ke ID yang tepat dan membuka commit detail, termasuk ketika halaman graph yang memuat ID tersebut belum tiba.
 - [ ] Uji cancel, penggantian query cepat, pindah/tutup tab, serta refresh watcher setelah ref berubah. Abaikan halaman dari query atau repo lama dan ulangi scan dari disk saat referensi berubah.

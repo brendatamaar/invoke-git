@@ -3,15 +3,18 @@
 use std::{ops::Range, rc::Rc, sync::Arc};
 
 use gpui::{
-    App, HighlightStyle, IntoElement, ParentElement, RenderOnce, SharedString, Styled, StyledText,
-    UniformListScrollHandle, Window, div, px, uniform_list,
+    App, ElementId, HighlightStyle, InteractiveElement, IntoElement, ParentElement, RenderOnce,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, UniformListScrollHandle, Window,
+    div, px, uniform_list,
 };
-use tokens::{ROW_DIFF, ROW_LIST, SPACE_2, SPACE_4, SPACE_8, TEXT_CODE_SMALL, TEXT_SMALL};
+use tokens::{
+    RADIUS_SM, ROW_DIFF, ROW_LIST, SPACE_2, SPACE_4, SPACE_8, TEXT_CODE_SMALL, TEXT_SMALL,
+};
 
 use crate::commit_detail::short_hash;
 use crate::convert::hsla;
 use crate::scrollbar::Scrollbar;
-use crate::{Button, TextStyleExt, ThemeExt};
+use crate::{Button, TextStyleExt, ThemeExt, focus};
 
 pub struct BlameRow {
     pub commit: Option<SharedString>,
@@ -254,14 +257,26 @@ impl RenderOnce for CommitList {
         let rows = self.rows;
         let open = self.open;
         let count = rows.len();
-        let list = uniform_list("commit-list", count, move |range, _, cx| {
+        let list = uniform_list("commit-list", count, move |range, window, cx| {
             let p = cx.palette();
+            let hover = hsla(p.bg_hover);
+            let ring = focus::ring_color(cx);
             range
                 .map(|ix| {
                     let row = &rows[ix];
                     let id = row.id.clone();
                     let open = open.clone();
+                    let element_id = ElementId::from(("commit-list-row", ix));
+                    let handle = focus::handle(&element_id, window, cx);
                     div()
+                        .id(element_id)
+                        .track_focus(&handle)
+                        .tab_stop(true)
+                        .cursor_pointer()
+                        .rounded(px(RADIUS_SM))
+                        .hover(move |style| style.bg(hover))
+                        .focus_visible(move |style| focus::ring(style, ring))
+                        .on_click(move |_, window, cx| open(id.clone(), window, cx))
                         .flex()
                         .items_center()
                         .h(px(ROW_LIST))
@@ -270,9 +285,10 @@ impl RenderOnce for CommitList {
                         .text_style(&TEXT_SMALL, cx)
                         .text_color(hsla(p.ink))
                         .child(
-                            Button::new(("commit-list-hash", ix), short_hash(&id).to_owned())
-                                .ghost()
-                                .on_click(move |_, window, cx| open(id.clone(), window, cx)),
+                            div()
+                                .flex_none()
+                                .text_style(&TEXT_CODE_SMALL, cx)
+                                .child(short_hash(&row.id).to_owned()),
                         )
                         .child(
                             div()

@@ -98,6 +98,7 @@ pub struct GraphView<I> {
     labels: HashMap<String, Vec<RefLabel>>,
     head: Option<I>,
     selected: Option<(usize, I)>,
+    pending_selection: Option<I>,
     hover: Option<usize>,
     /// A refresh walk is running: the old graph stays until its first page.
     refreshing: bool,
@@ -125,6 +126,7 @@ impl<I: Copy + Eq + Display + 'static> GraphView<I> {
             labels: HashMap::new(),
             head: None,
             selected: None,
+            pending_selection: None,
             hover: None,
             refreshing: false,
             status: Status::Loading,
@@ -198,6 +200,13 @@ impl<I: Copy + Eq + Display + 'static> GraphView<I> {
             self.scroll_to_row(row);
         }
         self.status = Status::Ready;
+        if let Some(id) = self.pending_selection
+            && let Some(offset) = commits.iter().position(|commit| commit.id == id)
+        {
+            let row = before + offset;
+            self.select(row, cx);
+            self.scroll_to_row(row);
+        }
         cx.notify();
     }
 
@@ -240,9 +249,28 @@ impl<I: Copy + Eq + Display + 'static> GraphView<I> {
 
     pub fn select(&mut self, row: usize, cx: &mut Context<Self>) {
         if let Some(id) = self.ids.get(row) {
+            self.pending_selection = None;
             self.selected = Some((row, *id));
             cx.emit(GraphEvent::Selected(row));
             cx.notify();
+        }
+    }
+
+    /// Select immediately when the row is loaded, or as soon as its page arrives.
+    pub fn reveal(&mut self, id: I, cx: &mut Context<Self>) {
+        match self.ids.iter().position(|candidate| *candidate == id) {
+            Some(row) => {
+                self.select(row, cx);
+                self.scroll_to_row(row);
+                if self.refreshing {
+                    self.pending_selection = Some(id);
+                }
+            }
+            None => {
+                self.selected = None;
+                self.pending_selection = Some(id);
+                cx.notify();
+            }
         }
     }
 

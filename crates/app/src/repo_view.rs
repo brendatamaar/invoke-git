@@ -67,6 +67,7 @@ enum Bulk {
 pub struct RepoView {
     pub session: Entity<RepoSession>,
     page: Page,
+    tab_visible: bool,
     history: Entity<HistoryPane>,
     file_insights: Entity<FileInsights>,
     commit: Entity<CommitBox>,
@@ -129,6 +130,7 @@ impl RepoView {
                 .update(cx, |insights, _| insights.close());
         }
         self.page = page;
+        self.sync_visibility(cx);
         if page == Page::Review {
             self.review.update(cx, |review, cx| review.open(cx));
         }
@@ -137,6 +139,17 @@ impl RepoView {
                 .update(cx, |history, cx| history.ensure_started(cx));
         }
         cx.notify();
+    }
+
+    pub fn set_tab_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.tab_visible = visible;
+        self.sync_visibility(cx);
+    }
+
+    fn sync_visibility(&self, cx: &mut Context<Self>) {
+        let history_visible = self.tab_visible && self.page == Page::History;
+        self.history
+            .update(cx, |history, cx| history.set_visible(history_visible, cx));
     }
 
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
@@ -192,6 +205,7 @@ impl RepoView {
         Self {
             session,
             page: Page::Changes,
+            tab_visible: false,
             history,
             file_insights,
             commit,

@@ -45,6 +45,7 @@ enum Notice {
 pub struct Workspace {
     git: Result<Git, SetupError>,
     tabs: Tabs<Entity<RepoView>>,
+    active_repo: Option<Entity<RepoView>>,
     notice: Option<Notice>,
     /// The clone dialog, shown in place of the welcome screen.
     cloning: Option<(Entity<CloneView>, Subscription)>,
@@ -57,6 +58,7 @@ impl Workspace {
         let mut workspace = Self {
             git: Git::detect("git"),
             tabs: Tabs::new(),
+            active_repo: None,
             notice: None,
             cloning: None,
             focus: cx.focus_handle(),
@@ -129,6 +131,16 @@ impl Workspace {
 
     /// Remembers the tabs and repaints.
     fn changed(&mut self, cx: &mut Context<Self>) {
+        let active = self.tabs.active_item().cloned();
+        if self.active_repo != active {
+            if let Some(previous) = self.active_repo.take() {
+                previous.update(cx, |repo, cx| repo.set_tab_visible(false, cx));
+            }
+            self.active_repo = active;
+            if let Some(active) = &self.active_repo {
+                active.update(cx, |repo, cx| repo.set_tab_visible(true, cx));
+            }
+        }
         persist::save(&self.saved(cx));
         cx.notify();
     }

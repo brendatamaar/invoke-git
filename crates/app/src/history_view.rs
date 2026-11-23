@@ -21,6 +21,7 @@ use ui::ThemeExt;
 use ui::convert::hsla;
 
 use crate::commit_pane::{CommitPane, InspectFile, replay_buttons};
+use crate::commit_search::{CommitSearch, CommitSelected};
 use crate::session::RepoSession;
 
 /// The width of the commit detail beside the graph.
@@ -30,6 +31,7 @@ pub struct HistoryPane {
     session: Entity<RepoSession>,
     pub graph: Entity<GraphView<CommitId>>,
     detail: Entity<CommitPane>,
+    search: Entity<CommitSearch>,
     cancel: Arc<AtomicBool>,
     started: bool,
     last_refs: Option<(Head, RefsSnapshot)>,
@@ -60,7 +62,12 @@ impl HistoryPane {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
         let graph = cx.new(|_| GraphView::<CommitId>::new());
         let detail = cx.new(|cx| CommitPane::new(session.clone(), cx));
+        let paths = session.read(cx).discovered.paths.clone();
+        let search = cx.new(|cx| CommitSearch::new(paths, cx));
         let subscriptions = vec![
+            cx.subscribe(&search, |this, _, event: &CommitSelected, cx| {
+                this.open_commit(event.0, cx)
+            }),
             cx.subscribe(&detail, |_, _, event: &InspectFile, cx| {
                 cx.emit(InspectFile(event.0.clone(), event.1));
             }),
@@ -87,6 +94,7 @@ impl HistoryPane {
             session,
             graph,
             detail,
+            search,
             cancel: Arc::new(AtomicBool::new(false)),
             started: false,
             last_refs: None,
@@ -107,8 +115,17 @@ impl HistoryPane {
     }
 
     pub fn open_commit(&mut self, id: CommitId, cx: &mut Context<Self>) {
+        self.graph.update(cx, |graph, cx| graph.reveal(id, cx));
         self.detail
             .update(cx, |detail, cx| detail.show(Some(id), cx));
+    }
+
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.search
+            .update(cx, |search, cx| search.set_visible(visible, cx));
+        if !visible && self.row_menu.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// The refs and `HEAD` of the newest read, if one has landed.
@@ -147,6 +164,7 @@ impl HistoryPane {
             self.row_menu = None;
             self.sync_refs(cx);
             self.start_walk(true, cx);
+            self.search.update(cx, |search, cx| search.refresh(cx));
         }
     }
 
@@ -155,7 +173,8 @@ impl HistoryPane {
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
         let paths = self.session.read(cx).discovered.paths.clone();
-        let inbox = walk(paths, None, self.cancel.clone());
+        let cancel = self.cancel.clone();
+        let inbox = walk(paths, None, cancel.clone());
         self.graph.update(cx, |graph, cx| {
             if refresh {
                 graph.begin_refresh();
@@ -184,7 +203,7 @@ impl HistoryPane {
                     })
                     .await;
                 inbox = back;
-                if batch.is_empty() {
+                if batch.is_empty() || cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 graph.update(cx, |graph, cx| {
@@ -272,7 +291,15 @@ impl Render for HistoryPane {
         div()
             .flex()
             .size_full()
-            .child(div().flex_1().min_w(px(0.)).child(self.graph.clone()))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(self.search.clone())
+                    .child(div().flex_1().min_h(px(0.)).child(self.graph.clone())),
+            )
             .child(
                 div()
                     .flex_none()
