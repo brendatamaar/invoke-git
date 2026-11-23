@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use invoke_core::{GitArgs, Operation, PullMode, RepoPath, Side};
+use invoke_core::{GitArgs, Operation, PullMode, RepoPath, ResetMode, Side};
 
 /// The oldest git Invoke Git supports (PRD → "Decisions").
 pub const MIN_VERSION: GitVersion = GitVersion {
@@ -333,6 +333,23 @@ pub fn invocation(args: &GitArgs) -> Invocation {
             argv.push(commit.to_string().into());
             plain(argv)
         }
+        // P7: reflog recovery reset. Only `--soft` and `--mixed` exist so
+        // working-tree files are never overwritten and undo (`Reversal::Refs`)
+        // restores exact pre-reset state (law 8). Trailing `--` keeps git from
+        // reading a 40-hex commit id as a pathspec if a file has that name.
+        GitArgs::Reset { target, mode, .. } => {
+            argv.push("reset".into());
+            argv.push(
+                match mode {
+                    ResetMode::Soft => "--soft",
+                    ResetMode::Mixed => "--mixed",
+                }
+                .into(),
+            );
+            argv.push(target.to_string().into());
+            argv.push("--".into());
+            plain(argv)
+        }
     }
 }
 
@@ -395,7 +412,7 @@ fn hide_console(_: &mut Command) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use invoke_core::{BranchName, Lease, Oid, RefName, RemoteBranch};
+    use invoke_core::{BranchName, Lease, Oid, RefName, RefValue, RemoteBranch};
     use proptest::prelude::*;
 
     #[test]
@@ -935,5 +952,35 @@ mod tests {
             let stage = GitArgs::ResolveStage { path: rel("a") };
             prop_assert!(!stage.may_open_editor());
         }
+    }
+
+    #[test]
+    fn reset_invocation_uses_soft_or_mixed_and_trailing_separator() {
+        let target = Oid::from_hex(&"a".repeat(40)).unwrap();
+        let expected_ref = RefValue {
+            name: RefName("refs/heads/main".into()),
+            oid: Some(Oid::from_hex(&"b".repeat(40)).unwrap()),
+        };
+        let soft = invocation(&GitArgs::Reset {
+            target: target.clone(),
+            mode: ResetMode::Soft,
+            expected_ref: expected_ref.clone(),
+        });
+        assert_eq!(
+            after_globals(&soft),
+            vec!["reset", "--soft", &target.to_string(), "--"]
+        );
+        assert!(soft.stdin.is_none());
+
+        let mixed = invocation(&GitArgs::Reset {
+            target: target.clone(),
+            mode: ResetMode::Mixed,
+            expected_ref,
+        });
+        assert_eq!(
+            after_globals(&mixed),
+            vec!["reset", "--mixed", &target.to_string(), "--"]
+        );
+        assert!(mixed.stdin.is_none());
     }
 }
