@@ -1,5 +1,5 @@
 # P3 - Tags (Create, Push, Delete)
-Status: todo
+Status: in-progress
 Depends on: P1
 Parallel-safe with: P1b, P2, P4a, P4b, P5, P6, P7, P8, P11
 
