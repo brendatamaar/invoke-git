@@ -12,6 +12,7 @@ pub mod detect;
 pub mod event;
 pub mod ids;
 pub mod message;
+pub mod notes;
 pub mod ops;
 pub mod stash;
 pub mod state;

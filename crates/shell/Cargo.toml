@@ -11,6 +11,7 @@ askpass = { path = "../askpass" }
 gix = { workspace = true, features = ["index", "excludes", "status", "revision", "max-performance"] }
 graph = { path = "../graph" }
 notify = "8"
+rusqlite.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

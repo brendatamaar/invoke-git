@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 
+use invoke_core::notes::{self, Anchor, Note, NoteProblem};
 use invoke_core::{Head, Oid, RepoState, Snapshot};
 
 /// What the diff beside the list shows.
@@ -71,6 +72,84 @@ pub fn viewed_text(done: usize, total: usize) -> String {
 /// `+15` and `−3`; `None` (a file with no text diff) shows nothing.
 pub fn counts(stats: Option<(u32, u32)>) -> Option<(String, String)> {
     stats.map(|(added, removed)| (format!("+{added}"), format!("−{removed}")))
+}
+
+/// The warning above the Push button while to-dos are still open.
+pub fn todo_warning(open: usize) -> Option<String> {
+    match open {
+        0 => None,
+        1 => Some("1 to-do note is unresolved".to_owned()),
+        n => Some(format!("{n} to-do notes are unresolved")),
+    }
+}
+
+/// The line number the user typed: a whole number from 1.
+pub fn parse_line(text: &str) -> Result<u32, String> {
+    text.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|line| *line >= 1)
+        .ok_or_else(|| "Type the line number, from 1.".to_owned())
+}
+
+pub fn problem_text(problem: &NoteProblem) -> String {
+    match problem {
+        NoteProblem::Empty => "Write something in the note.".to_owned(),
+        NoteProblem::TooLong { max } => format!("A note can have at most {max} characters."),
+        NoteProblem::NoSuchLine { lines } => format!(
+            "This file has {} on this side.",
+            plural(*lines, "line", "lines")
+        ),
+    }
+}
+
+/// `path:line`, as the list of notes shows where a note is.
+pub fn place(note: &Note) -> String {
+    format!("{}:{}", note.anchor.path, note.anchor.line)
+}
+
+/// The anchor for a note on `line_input` of the new side `new_text` of
+/// `path`, written while `commit` was on screen.
+pub fn new_anchor(
+    commit: &str,
+    path: &str,
+    new_text: &str,
+    line_input: &str,
+) -> Result<Anchor, String> {
+    let line = parse_line(line_input)?;
+    let text = notes::line_of(new_text, line).map_err(|p| problem_text(&p))?;
+    Ok(Anchor {
+        commit: commit.to_owned(),
+        path: path.to_owned(),
+        line,
+        text,
+    })
+}
+
+/// Whether a note was written for this review: on one of the outgoing
+/// commits, or on the tip (the combined diff).
+pub fn is_in_review(note: &Note, commits: &[String], head: &str) -> bool {
+    note.anchor.commit == head || commits.contains(&note.anchor.commit)
+}
+
+/// Notes of this branch whose commit is not part of this review any more (it
+/// was rewritten) but whose file is still changed by it: candidates for
+/// being found again by their line text.
+pub fn adoptable<'a>(
+    notes: &'a [Note],
+    branch: &str,
+    commits: &[String],
+    head: &str,
+    files: &[String],
+) -> Vec<&'a Note> {
+    notes
+        .iter()
+        .filter(|note| {
+            note.branch == branch
+                && !is_in_review(note, commits, head)
+                && files.contains(&note.anchor.path)
+        })
+        .collect()
 }
 
 /// Which files the reviewer ticked as viewed. A tick belongs to the diff it
@@ -144,6 +223,80 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    fn note(commit: &str, branch: &str, path: &str, todo: bool, resolved: bool) -> Note {
+        Note {
+            id: notes::NoteId(1),
+            anchor: Anchor {
+                commit: commit.into(),
+                path: path.into(),
+                line: 3,
+                text: "x".into(),
+            },
+            branch: branch.into(),
+            body: "b".into(),
+            todo,
+            resolved,
+            created: 0,
+            updated: 0,
+        }
+    }
+
+    #[test]
+    fn the_warning_counts_open_todos() {
+        assert_eq!(todo_warning(0), None);
+        assert_eq!(
+            todo_warning(1).as_deref(),
+            Some("1 to-do note is unresolved")
+        );
+        assert_eq!(
+            todo_warning(3).as_deref(),
+            Some("3 to-do notes are unresolved")
+        );
+    }
+
+    #[test]
+    fn a_line_number_is_a_whole_number_from_one() {
+        assert_eq!(parse_line(" 12 "), Ok(12));
+        for bad in ["", "0", "-1", "1.5", "abc", "99999999999"] {
+            assert!(parse_line(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_anchor_keeps_the_text_of_its_line() {
+        let text = "one\ntwo\nthree\n";
+        let anchor = new_anchor("abc", "a.rs", text, "2").unwrap();
+        assert_eq!((anchor.line, anchor.text.as_str()), (2, "two"));
+        assert_eq!(anchor.path, "a.rs");
+        assert_eq!(
+            new_anchor("abc", "a.rs", text, "4"),
+            Err("This file has 3 lines on this side.".to_owned())
+        );
+        assert_eq!(
+            new_anchor("abc", "a.rs", "x\n", "2"),
+            Err("This file has 1 line on this side.".to_owned())
+        );
+    }
+
+    #[test]
+    fn only_notes_of_this_branch_and_file_are_found_again() {
+        let commits = vec!["c1".to_owned(), "c2".to_owned()];
+        let list = vec![
+            note("c1", "topic", "a.rs", true, false),   // in the review
+            note("head", "topic", "a.rs", true, false), // in the review (tip)
+            note("old", "topic", "a.rs", true, false),  // rewritten: adoptable
+            note("old", "other", "a.rs", true, false),  // another branch
+            note("old", "topic", "gone.rs", true, false), // file no longer in the push
+        ];
+        let files = vec!["a.rs".to_owned(), "b.rs".to_owned()];
+        let picked = adoptable(&list, "topic", &commits, "head", &files);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].anchor.commit, "old");
+        assert!(is_in_review(&list[0], &commits, "head"));
+        assert!(!is_in_review(&list[2], &commits, "head"));
+        assert_eq!(place(&list[0]), "a.rs:3");
+    }
 
     #[test]
     fn the_title_counts_the_commits() {

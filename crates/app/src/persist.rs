@@ -59,14 +59,25 @@ pub fn decode(text: &str) -> Saved {
 /// `~/.config` elsewhere. `INVOKE_GIT_DATA_DIR` replaces the folder (for
 /// tests, and for anyone who wants a throwaway profile).
 pub fn file() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("tabs.txt"))
+}
+
+/// The app's data folder (see [`file`]): where the tabs, the notes and
+/// whatever comes next are kept. Never inside a repository.
+pub fn data_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("INVOKE_GIT_DATA_DIR") {
-        return Some(PathBuf::from(dir).join("tabs.txt"));
+        return Some(PathBuf::from(dir));
     }
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))?;
-    Some(base.join("Invoke Git").join("tabs.txt"))
+    Some(base.join("Invoke Git"))
+}
+
+/// The notes database.
+pub fn notes_file() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("notes.sqlite"))
 }
 
 pub fn load() -> Saved {

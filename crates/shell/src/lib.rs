@@ -20,6 +20,7 @@ mod resolve_undo;
 pub mod runner;
 pub mod staging;
 mod status;
+pub mod store;
 mod tree;
 pub mod undo;
 pub mod watch;

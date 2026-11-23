@@ -12,6 +12,7 @@ mod conflict_view;
 mod diff_load;
 mod discard;
 mod history_view;
+mod notes_db;
 mod notice;
 mod paths;
 mod persist;

@@ -5,6 +5,7 @@
 //! the upstream moves (a fetch, a commit, a push), and sends nothing itself:
 //! Push is a `PushRequested` like the header's.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
@@ -12,6 +13,7 @@ use gpui::{
     Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 use invoke_core::RepoPath;
+use invoke_core::notes::{Note, NoteId, open_todos, relocate};
 use shell::InputsError;
 use shell::commit_detail::{Change, CommitSides, read_commit, read_commit_sides};
 use shell::history::CommitId;
@@ -24,10 +26,11 @@ use tokens::{
 use ui::convert::hsla;
 use ui::time::relative;
 use ui::{
-    Button, CheckState, Checkbox, DiffContent, DiffView, Segmented, TextStyleExt, ThemeExt,
-    diff_view, short_hash,
+    Button, CheckState, Checkbox, DiffContent, DiffView, Segmented, TextEditor, TextStyleExt,
+    ThemeExt, diff_view, short_hash,
 };
 
+use crate::notes_db::{self, NotesDb};
 use crate::review::{self, Key, Scope, Viewed};
 use crate::session::RepoSession;
 use crate::sync;
@@ -97,6 +100,14 @@ fn change_letter(change: Change) -> &'static str {
     }
 }
 
+/// What a note's buttons do.
+#[derive(Clone, Copy)]
+enum NoteChange {
+    /// Mark a to-do resolved (`true`) or open again (`false`).
+    Resolve(bool),
+    Delete,
+}
+
 pub struct ReviewPane {
     session: Entity<RepoSession>,
     diff: Entity<DiffView>,
@@ -114,6 +125,19 @@ pub struct ReviewPane {
     listings: u64,
     /// Numbers each diff load.
     requests: u64,
+    db: Arc<NotesDb>,
+    /// The notes of this repo that belong to this review.
+    notes: Vec<Note>,
+    /// Why the notes could not be read or saved.
+    notes_error: Option<String>,
+    note_line: Entity<TextEditor>,
+    note_text: Entity<TextEditor>,
+    note_todo: bool,
+    /// Why the note in the form was not added.
+    note_problem: Option<String>,
+    /// The file on show and its new side: what a typed line number is
+    /// counted in.
+    shown: Option<(String, Arc<str>)>,
     _observe: Subscription,
 }
 
@@ -134,6 +158,14 @@ impl ReviewPane {
             reads: 0,
             listings: 0,
             requests: 0,
+            db: NotesDb::global(),
+            notes: Vec::new(),
+            notes_error: None,
+            note_line: cx.new(|cx| TextEditor::new("Line", 1, cx).single_line()),
+            note_text: cx.new(|cx| TextEditor::new("Write a note on this line", 2, cx)),
+            note_todo: false,
+            note_problem: None,
+            shown: None,
             _observe: observe,
         }
     }
@@ -198,6 +230,7 @@ impl ReviewPane {
                             selected: None,
                         }));
                         this.files_ready(cx);
+                        this.refresh_notes(cx);
                     }
                     Err(error) => {
                         this.phase =
@@ -454,6 +487,7 @@ impl ReviewPane {
                     match loaded {
                         Ok(data) => {
                             let texts = (data.diff.old.clone(), data.diff.new.clone());
+                            this.shown = Some((data.path.to_string(), data.diff.new.clone()));
                             this.diff.update(cx, |diff, cx| {
                                 diff.set_content(DiffContent::Text(Box::new(data)), cx)
                             });
@@ -463,6 +497,7 @@ impl ReviewPane {
                             this.diff.update(cx, |diff, cx| {
                                 diff.set_content(DiffContent::Message(message.into()), cx)
                             });
+                            this.shown = None;
                             None
                         }
                     }
@@ -484,6 +519,167 @@ impl ReviewPane {
             .ok();
         })
         .detach();
+    }
+
+    /// Reads the notes of this repo, finds again those whose commit was
+    /// rewritten (a rebase) by the text of their line, and keeps the notes
+    /// that belong to this review.
+    fn refresh_notes(&mut self, cx: &mut Context<Self>) {
+        let Phase::Ready(ready) = &self.phase else {
+            return;
+        };
+        let session = self.session.read(cx);
+        let paths = session.discovered.paths.clone();
+        let repo = notes_db::repo_key(&paths.workdir);
+        let branch = sync::plan(&session.state)
+            .and_then(|plan| plan.local)
+            .map(|name| name.0)
+            .unwrap_or_default();
+        let commits: Vec<String> = ready.out.commits.iter().map(|c| c.id.clone()).collect();
+        let (head, base) = (ready.out.head.clone(), ready.out.base.clone());
+        let files: Vec<String> = ready.out.files.iter().map(|f| f.path.clone()).collect();
+        let (db, read) = (self.db.clone(), self.reads);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut all = db.notes(&repo)?;
+                    let moved: Vec<(NoteId, invoke_core::notes::Anchor)> =
+                        review::adoptable(&all, &branch, &commits, &head, &files)
+                            .into_iter()
+                            .map(|note| (note.id, note.anchor.clone()))
+                            .collect();
+                    if let Some(tip) = parse(&head) {
+                        let from = base.as_deref().and_then(parse);
+                        let mut changed = false;
+                        for (id, anchor) in moved {
+                            let path = RepoPath(anchor.path.clone());
+                            let found = read_range_sides(&paths, from.as_ref(), &tip, &path)
+                                .ok()
+                                .and_then(|sides| sides.new)
+                                .and_then(|text| relocate(&anchor, &text));
+                            if let Some(line) = found {
+                                changed |= db.reanchor(&repo, id, &head, line)?;
+                            }
+                        }
+                        if changed {
+                            all = db.notes(&repo)?;
+                        }
+                    }
+                    all.retain(|note| review::is_in_review(note, &commits, &head));
+                    Ok::<_, String>(all)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.reads != read {
+                    return;
+                }
+                match result {
+                    Ok(notes) => {
+                        this.notes = notes;
+                        this.notes_error = None;
+                    }
+                    Err(error) => this.notes_error = Some(format!("Notes: {error}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Adds the note of the form to the line it names, on the file on show.
+    fn add_note(&mut self, cx: &mut Context<Self>) {
+        let (Some((path, text)), Phase::Ready(ready)) = (self.shown.clone(), &self.phase) else {
+            return;
+        };
+        let commit = self.scope_key().unwrap_or_else(|| ready.out.head.clone());
+        let anchor = match review::new_anchor(&commit, &path, &text, self.note_line.read(cx).text())
+        {
+            Ok(anchor) => anchor,
+            Err(problem) => {
+                self.note_problem = Some(problem);
+                cx.notify();
+                return;
+            }
+        };
+        let body = self.note_text.read(cx).text().to_owned();
+        if let Err(problem) = invoke_core::notes::clean_body(&body) {
+            self.note_problem = Some(review::problem_text(&problem));
+            cx.notify();
+            return;
+        }
+        let session = self.session.read(cx);
+        let repo = notes_db::repo_key(&session.discovered.paths.workdir);
+        let branch = sync::plan(&session.state)
+            .and_then(|plan| plan.local)
+            .map(|name| name.0)
+            .unwrap_or_default();
+        let (db, todo) = (self.db.clone(), self.note_todo);
+        self.note_problem = None;
+        cx.spawn(async move |this, cx| {
+            let added = cx
+                .background_executor()
+                .spawn(async move { db.add(&repo, &branch, &anchor, &body, todo) })
+                .await;
+            this.update(cx, |this, cx| {
+                match added {
+                    Ok(_) => {
+                        this.note_text
+                            .update(cx, |field, cx| field.set_text("", cx));
+                        this.note_todo = false;
+                        this.refresh_notes(cx);
+                    }
+                    Err(error) => {
+                        this.note_problem = Some(format!("Could not save the note: {error}"))
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Resolves, reopens or deletes a note, then reads the notes again.
+    fn change_note(&mut self, id: NoteId, change: NoteChange, cx: &mut Context<Self>) {
+        let repo = notes_db::repo_key(&self.session.read(cx).discovered.paths.workdir);
+        let db = self.db.clone();
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_executor()
+                .spawn(async move {
+                    match change {
+                        NoteChange::Resolve(resolved) => db.set_resolved(&repo, id, resolved),
+                        NoteChange::Delete => db.delete(&repo, id),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match done {
+                    Ok(_) => this.refresh_notes(cx),
+                    Err(error) => this.notes_error = Some(format!("Notes: {error}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Shows the file a note is on, in the combined diff.
+    fn open_note(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(path) = self.notes.get(index).map(|note| note.anchor.path.clone()) else {
+            return;
+        };
+        self.set_scope(Scope::Combined, cx);
+        let at = match &self.phase {
+            Phase::Ready(ready) => ready.rows.iter().position(|row| row.path == path),
+            _ => None,
+        };
+        if let Some(at) = at {
+            self.select_file(at, cx);
+        }
     }
 
     /// Push, as the header's Push does; the strip under the header shows it
@@ -786,6 +982,107 @@ impl Render for ReviewPane {
             files = files.child(line);
         }
 
+        // The notes of this review.
+        let open = open_todos(&self.notes);
+        let mut notes = div().flex().flex_col().gap(px(SPACE_1)).child(
+            div()
+                .px(px(SPACE_2))
+                .text_style(&TEXT_LABEL, cx)
+                .text_color(hsla(p.ink_muted))
+                .child(format!("NOTES · {}", self.notes.len())),
+        );
+        if let Some(error) = &self.notes_error {
+            notes = notes.child(
+                div()
+                    .px(px(SPACE_2))
+                    .text_style(&TEXT_SMALL, cx)
+                    .text_color(hsla(p.warning))
+                    .child(error.clone()),
+            );
+        }
+        for (index, note) in self.notes.iter().enumerate() {
+            let (open_it, change) = (cx.entity(), cx.entity());
+            let hover = hsla(p.bg_hover);
+            let (id, todo, resolved) = (note.id, note.todo, note.resolved);
+            let mut head = div().flex().items_center().gap(px(SPACE_2));
+            if todo {
+                let (text, fg, bg) = if resolved {
+                    ("RESOLVED", p.ink_muted, p.bg_raised)
+                } else {
+                    ("TO-DO", p.warning, p.warning_soft)
+                };
+                head = head.child(
+                    div()
+                        .flex_none()
+                        .px(px(SPACE_1 + 2.0))
+                        .rounded(px(RADIUS_MD / 2.0))
+                        .bg(hsla(bg))
+                        .text_style(&TEXT_LABEL, cx)
+                        .text_color(hsla(fg))
+                        .child(text),
+                );
+            }
+            head = head.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_style(&TEXT_SMALL, cx)
+                    .text_color(hsla(p.ink_muted))
+                    .child(review::place(note)),
+            );
+            let mut buttons = div().flex().gap(px(SPACE_1));
+            if todo {
+                let toggle = cx.entity();
+                buttons = buttons.child(
+                    Button::new(
+                        ("review-note-resolve", index),
+                        if resolved { "Reopen" } else { "Resolve" },
+                    )
+                    .ghost()
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        toggle.update(cx, |pane, cx| {
+                            pane.change_note(id, NoteChange::Resolve(!resolved), cx)
+                        })
+                    }),
+                );
+            }
+            buttons = buttons.child(
+                Button::new(("review-note-delete", index), "Delete")
+                    .ghost()
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        change.update(cx, |pane, cx| pane.change_note(id, NoteChange::Delete, cx))
+                    }),
+            );
+            notes = notes.child(
+                div()
+                    .id(("review-note", index))
+                    .flex()
+                    .flex_col()
+                    .gap(px(SPACE_1))
+                    .px(px(SPACE_2))
+                    .py(px(SPACE_1 + 2.0))
+                    .rounded(px(RADIUS_MD))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(move |_, _, cx| {
+                        open_it.update(cx, |pane, cx| pane.open_note(index, cx))
+                    })
+                    .child(head)
+                    .child(
+                        div()
+                            .max_h(px(60.))
+                            .overflow_hidden()
+                            .text_style(&TEXT_BODY, cx)
+                            .text_color(hsla(p.ink))
+                            .child(note.body.clone()),
+                    )
+                    .child(buttons),
+            );
+        }
+
         let aside = div()
             .id("review-aside")
             .flex()
@@ -799,7 +1096,85 @@ impl Render for ReviewPane {
             .border_r_1()
             .border_color(hsla(p.line))
             .child(commits)
-            .child(files);
+            .child(files)
+            .child(notes);
+
+        // The form for a new note, on the file on show.
+        let form = self.shown.as_ref().map(|(path, _)| {
+            let (add, todo) = (cx.entity(), cx.entity());
+            let mut form = div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .gap(px(SPACE_2))
+                .p(px(SPACE_3))
+                .border_t_1()
+                .border_color(hsla(p.line))
+                .bg(hsla(p.bg_panel))
+                .child(
+                    div()
+                        .text_style(&TEXT_SMALL, cx)
+                        .text_color(hsla(p.ink_muted))
+                        .child(format!(
+                            "Add a note on {path}. The line is counted on the new side of this diff."
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap(px(SPACE_2))
+                        .child(div().flex_none().w(px(96.)).child(self.note_line.clone()))
+                        .child(div().flex_1().min_w(px(0.)).child(self.note_text.clone()))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .flex_col()
+                                .gap(px(SPACE_2))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(SPACE_2))
+                                        .child(
+                                            Checkbox::new(
+                                                "review-note-todo",
+                                                if self.note_todo {
+                                                    CheckState::Checked
+                                                } else {
+                                                    CheckState::Unchecked
+                                                },
+                                            )
+                                            .on_click(move |_, _, cx| {
+                                                todo.update(cx, |pane, cx| {
+                                                    pane.note_todo = !pane.note_todo;
+                                                    cx.notify();
+                                                })
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_style(&TEXT_SMALL, cx)
+                                                .text_color(hsla(p.ink))
+                                                .child("To-do"),
+                                        ),
+                                )
+                                .child(Button::new("review-note-add", "Add note").on_click(
+                                    move |_, _, cx| add.update(cx, |pane, cx| pane.add_note(cx)),
+                                )),
+                        ),
+                );
+            if let Some(problem) = &self.note_problem {
+                form = form.child(
+                    div()
+                        .text_style(&TEXT_SMALL, cx)
+                        .text_color(hsla(p.warning))
+                        .child(problem.clone()),
+                );
+            }
+            form
+        });
 
         let main = div()
             .flex()
@@ -813,7 +1188,8 @@ impl Render for ReviewPane {
                     .min_h(px(0.))
                     .bg(hsla(p.bg_panel))
                     .child(self.diff.clone()),
-            );
+            )
+            .children(form);
 
         let total = ready.rows.len();
         let push_this = cx.entity();
@@ -828,6 +1204,12 @@ impl Render for ReviewPane {
             .border_t_1()
             .border_color(hsla(p.line))
             .bg(hsla(p.bg_panel))
+            .children(review::todo_warning(open).map(|text| {
+                div()
+                    .text_style(&TEXT_SMALL, cx)
+                    .text_color(hsla(p.warning))
+                    .child(format!("⚠ {text}"))
+            }))
             .child(
                 div()
                     .text_style(&TEXT_SMALL, cx)
