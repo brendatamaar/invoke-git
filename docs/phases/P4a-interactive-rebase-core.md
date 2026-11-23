@@ -1,5 +1,5 @@
 # P4a - Interactive Rebase Core & v0.2 Law Gate
-Status: todo
+Status: in-progress
 Depends on: P2
 Parallel-safe with: P3, P5, P6, P7, P8, P11
 
@@ -23,3 +23,4 @@ Mengimplementasikan state machine & eksekusi shell untuk interactive rebase (reo
 
 ## Handoff notes
 - Pastikan mekanisme `GIT_SEQUENCE_EDITOR` bekerja lintas Windows (path dengan spasi & backslash) dan Linux VPS tanpa bergantung pada POSIX shell; pola helper executable seperti `crates/askpass` dapat dipertimbangkan jika perlu (catat di `docs/DECISIONS.md` bila menambah binary).
+- Basis P4a adalah `ca02a21`, yang memuat merge core/shell/harness P2 `302682a`. UI P2 yang berstatus review ditunda ke Windows dan bukan dependensi core P4a.

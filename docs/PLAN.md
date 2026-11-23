@@ -19,7 +19,7 @@
 | P1b | Non-Text Staging & Discard | todo | P1 | P3, P5, P6, P7, P8 |
 | P2 | Cherry-Pick & Revert | review | P1 | P3, P5, P6, P7, P8, P11 |
 | P3 | Tags (Create, Push, Delete) | review | P1 | P1b, P2, P4a, P4b, P5, P6, P7, P8, P11 |
-| P4a | Interactive Rebase Core & v0.2 Law Gate | todo | P2 | P3, P5, P6, P7, P8, P11 |
+| P4a | Interactive Rebase Core & v0.2 Law Gate | in-progress | P2 | P3, P5, P6, P7, P8, P11 |
 | P4b | Interactive Rebase Editor UI | todo | P4a | P3, P5, P6, P7, P8, P9, P10, P11 |
 | P5 | Blame & File History | review | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
 | P6 | Commit Search | todo | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
