@@ -20,6 +20,7 @@ use ui::{
 
 use crate::branch_panel::BranchPanel;
 use crate::commit_box::CommitBox;
+use crate::conflict_view::ConflictPane;
 use crate::diff_load::{self, Loaded, Verb};
 use crate::discard::{self, Confirm, What};
 use crate::history_view::HistoryPane;
@@ -39,6 +40,8 @@ enum Page {
     History,
     /// The pre-push review, opened by the Push button.
     Review,
+    /// The resolver of a paused merge, rebase, cherry-pick or revert (task 23).
+    Conflicts,
 }
 
 /// Files to stage or unstage one after another. Each stage is built from a
@@ -61,6 +64,9 @@ pub struct RepoView {
     sync_buttons: Entity<SyncButtons>,
     sync_strip: Entity<SyncStrip>,
     review: Entity<ReviewPane>,
+    conflicts: Entity<ConflictPane>,
+    /// An operation was paused the last time the session moved.
+    was_paused: bool,
     diff: Entity<DiffView>,
     selected: Option<(Section, RepoPath)>,
     collapsed: HashSet<(Section, String)>,
@@ -127,6 +133,7 @@ impl RepoView {
         let sync_buttons = cx.new(|cx| SyncButtons::new(session.clone(), cx));
         let sync_strip = cx.new(|cx| SyncStrip::new(session.clone(), cx));
         let review = cx.new(|cx| ReviewPane::new(session.clone(), cx));
+        let conflicts = cx.new(|cx| ConflictPane::new(session.clone(), cx));
         cx.subscribe(&review, |this, _, event: &ReviewEvent, cx| match event {
             ReviewEvent::Back => this.show(Page::Changes, cx),
         })
@@ -153,6 +160,8 @@ impl RepoView {
             sync_buttons,
             sync_strip,
             review,
+            conflicts,
+            was_paused: false,
             diff,
             selected: None,
             collapsed: HashSet::new(),
@@ -180,6 +189,19 @@ impl RepoView {
 
     /// The session moved. Only a new read can change the list or the diff.
     fn session_changed(&mut self, cx: &mut Context<Self>) {
+        let paused = matches!(
+            &self.session.read(cx).state.snapshot,
+            Snapshot::Read { disk, .. } if disk.phase.operation().is_some()
+        );
+        if paused && !self.was_paused {
+            self.was_paused = true;
+            self.show(Page::Conflicts, cx);
+        } else if !paused && self.was_paused {
+            self.was_paused = false;
+            if self.page == Page::Conflicts {
+                self.show(Page::Changes, cx);
+            }
+        }
         if matches!(self.bulk, Bulk::Running) && self.settled(cx) {
             self.bulk = Bulk::Idle;
         }
@@ -529,6 +551,9 @@ impl Render for RepoView {
             Summary::of(&session.state),
             session.discovered.paths.workdir.display().to_string(),
         );
+        if self.page == Page::Conflicts {
+            summary = summary.without_phase();
+        }
         if let Some(error) = &session.watch_error {
             summary = summary.warning(format!(
                 "Changes made outside Invoke Git will not show up on their own ({error}). Press F5 to refresh."
@@ -561,20 +586,25 @@ impl Render for RepoView {
         let dismiss = cx.entity();
         let page_switch = Segmented::new(
             "repo-page",
-            vec!["Changes".into(), "History".into()],
+            if self.was_paused {
+                vec!["Changes".into(), "History".into(), "Conflicts".into()]
+            } else {
+                vec!["Changes".into(), "History".into()]
+            },
             match self.page {
                 Page::Changes => 0,
                 Page::History => 1,
-                // Neither is chosen while the review is open.
-                Page::Review => 2,
+                Page::Conflicts => 2,
+                // None is chosen while the review is open.
+                Page::Review => 3,
             },
             move |index, _, cx| {
                 switch.update(cx, |view, cx| {
                     view.show(
-                        if index == 0 {
-                            Page::Changes
-                        } else {
-                            Page::History
+                        match index {
+                            0 => Page::Changes,
+                            1 => Page::History,
+                            _ => Page::Conflicts,
                         },
                         cx,
                     )
@@ -657,6 +687,11 @@ impl Render for RepoView {
         });
 
         let body = match self.page {
+            Page::Conflicts => div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .child(self.conflicts.clone()),
             Page::Review => div()
                 .flex()
                 .flex_1()
@@ -708,7 +743,9 @@ impl Render for RepoView {
                     .flex()
                     .flex_1()
                     .min_h(px(0.))
-                    .children((self.page != Page::Review).then_some(sidebar))
+                    .children(
+                        (!matches!(self.page, Page::Review | Page::Conflicts)).then_some(sidebar),
+                    )
                     .child(body),
             )
     }

@@ -147,6 +147,7 @@ pub struct RepoSummary {
     path: SharedString,
     warning: Option<SharedString>,
     control: Option<gpui::AnyElement>,
+    show_phase: bool,
 }
 
 impl RepoSummary {
@@ -156,6 +157,7 @@ impl RepoSummary {
             path: path.into(),
             warning: None,
             control: None,
+            show_phase: true,
         }
     }
 
@@ -163,6 +165,13 @@ impl RepoSummary {
     /// History switch).
     pub fn control(mut self, control: impl IntoElement) -> Self {
         self.control = Some(control.into_any_element());
+        self
+    }
+
+    /// Leaves out the line about a paused operation (the conflict screen says
+    /// it better itself).
+    pub fn without_phase(mut self) -> Self {
+        self.show_phase = false;
         self
     }
 
@@ -223,7 +232,7 @@ impl RenderOnce for RepoSummary {
 
         let mut body = div().flex().flex_col().flex_none().gap(px(SPACE_2));
         let mut any = false;
-        if let Some(phase) = &s.phase {
+        if let Some(phase) = s.phase.as_ref().filter(|_| self.show_phase) {
             body = body.child(Banner::new(BannerKind::Warning, phase.clone()));
             any = true;
         }

@@ -8,6 +8,7 @@ mod apply;
 mod histogram;
 mod hunks;
 mod lines;
+pub mod markers;
 mod model;
 mod myers;
 mod patch;

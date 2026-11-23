@@ -3,8 +3,8 @@
 //! only appears as "Details" (README, "Content fundamentals").
 
 use invoke_core::{
-    Action, BranchRefusal, CommitRefusal, ErrorClass, Failure, Notice, OpOutcome, Refusal,
-    UndoMoved,
+    Action, BranchRefusal, CommitRefusal, ConflictRefusal, ErrorClass, Failure, Notice, OpOutcome,
+    Refusal, UndoMoved,
 };
 
 /// How to draw a notice.
@@ -88,7 +88,25 @@ fn refusal_text(reason: &Refusal) -> String {
         }
         Refusal::BranchChanged => "The checked-out branch changed. Try again.".into(),
         Refusal::Commit(problem) => commit_text(problem),
-        Refusal::Conflict(_) => "That cannot run on the operation in progress.".into(),
+        Refusal::Conflict(problem) => conflict_text(problem),
+    }
+}
+
+fn conflict_text(problem: &ConflictRefusal) -> String {
+    match problem {
+        ConflictRefusal::NotInProgress => {
+            "No merge, rebase, cherry-pick or revert is waiting for this.".into()
+        }
+        ConflictRefusal::PhaseChanged => {
+            "The operation moved on since you looked (for example to the next rebase step). Check the files and try again.".into()
+        }
+        ConflictRefusal::Unresolved { remaining } => format!(
+            "{remaining} {} still not resolved.",
+            if *remaining == 1 { "file is" } else { "files are" }
+        ),
+        ConflictRefusal::SkipNotAvailable => "Skip is only for a rebase.".into(),
+        ConflictRefusal::NotConflicted => "That file is not conflicted any more.".into(),
+        ConflictRefusal::AlreadyResolved => "That file is already resolved.".into(),
     }
 }
 
@@ -356,6 +374,40 @@ mod tests {
                 details: String::new(),
             });
             assert!(!text.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_conflict_request_says_what_is_missing() {
+        let text = |problem| {
+            message(&Notice::Refused {
+                action: Action::Continue,
+                reason: Refusal::Conflict(problem),
+            })
+            .unwrap()
+            .text
+        };
+        assert_eq!(
+            text(ConflictRefusal::Unresolved { remaining: 1 }),
+            "Continue refused: 1 file is still not resolved."
+        );
+        assert_eq!(
+            text(ConflictRefusal::Unresolved { remaining: 3 }),
+            "Continue refused: 3 files are still not resolved."
+        );
+        assert!(text(ConflictRefusal::PhaseChanged).contains("moved on"));
+        for problem in [
+            ConflictRefusal::NotInProgress,
+            ConflictRefusal::SkipNotAvailable,
+            ConflictRefusal::NotConflicted,
+            ConflictRefusal::AlreadyResolved,
+        ] {
+            assert!(!text(problem).is_empty());
         }
     }
 }

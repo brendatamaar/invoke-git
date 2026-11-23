@@ -53,6 +53,15 @@ impl Render for SyncButtons {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.session.read(cx).state.ops.running.is_some();
         let plan = plan_of(&self.session, cx);
+        // A paused operation owns the repo: the core refuses these until it ends.
+        if plan.as_ref().is_some_and(|plan| !plan.clean) {
+            let p = cx.palette();
+            return div()
+                .text_style(&TEXT_SMALL, cx)
+                .text_color(hsla(p.ink_muted))
+                .child("Fetch, pull and push are paused until this is finished")
+                .into_any_element();
+        }
         let ready = plan.is_some() && !busy;
         let (can_pull, can_push, diverged) = plan
             .as_ref()
@@ -118,6 +127,7 @@ impl Render for SyncButtons {
                 .disabled(!ready || !can_push)
                 .on_click(move |_, _, cx| review.update(cx, |_, cx| cx.emit(SyncEvent::Review))),
         )
+        .into_any_element()
     }
 }
 

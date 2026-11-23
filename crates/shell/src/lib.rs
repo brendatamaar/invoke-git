@@ -25,7 +25,7 @@ pub mod undo;
 pub mod watch;
 
 pub use clone::CloneRunner;
-pub use conflict::read_conflict_content;
+pub use conflict::{read_conflict_content, read_worktree_file, write_worktree_file};
 pub use discard::DiscardRunner;
 pub use discover::{DiscoverError, Discovered, discover};
 pub use git::{Git, GitVersion, SetupError};
