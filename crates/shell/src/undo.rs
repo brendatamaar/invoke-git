@@ -12,8 +12,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use invoke_core::{
-    ErrorClass, Event, Failure, Head, HeadRestore, IndexEffect, Oid, OpId, OpOutcome, Reversal,
-    StashRestore, UndoPoint, UndoReplay,
+    ErrorClass, Event, Failure, Head, HeadRestore, HeadTarget, IndexEffect, Oid, OpId, OpOutcome,
+    Reversal, StashRestore, UndoPoint, UndoReplay,
 };
 
 use crate::classify::classify;
@@ -94,6 +94,19 @@ impl UndoRunner {
         let fail = |class, details: String| Failure { class, details };
         let current =
             precondition::current(&self.paths).map_err(|details| fail(ErrorClass::Bug, details))?;
+        if self.paths.git_dir.join("index.lock").exists() {
+            return Err(fail(
+                ErrorClass::PreconditionChanged,
+                "index.lock is held".into(),
+            ));
+        }
+        if HeadTarget::of(&current.head) != point.head {
+            return Err(fail(
+                ErrorClass::PreconditionChanged,
+                "HEAD moved before the undo snapshot".into(),
+            ));
+        }
+        precondition::check_refs(&self.paths, &point.refs)?;
         if current.index != point.index {
             return Err(fail(
                 ErrorClass::PreconditionChanged,
@@ -120,6 +133,12 @@ impl UndoRunner {
         );
         let _ = fs::remove_file(&copy);
         let tree = written.map_err(|details| fail(ErrorClass::Bug, details))?;
+        if self.paths.git_dir.join("index.lock").exists() {
+            return Err(fail(
+                ErrorClass::PreconditionChanged,
+                "index.lock is held".into(),
+            ));
+        }
         let tree = Oid::from_hex(tree.trim())
             .map_err(|error| fail(ErrorClass::Bug, format!("write-tree: {error:?}")))?;
         self.run(&["update-ref", &undo_ref(op), tree.as_hex()], &[], None)
@@ -298,6 +317,9 @@ impl UndoRunner {
     /// a ref that is already gone is fine.
     pub fn prune(&self, ops: &[OpId]) {
         for op in ops {
+            if self.paths.git_dir.join("index.lock").exists() {
+                return;
+            }
             let _ = self.run(&["update-ref", "-d", &undo_ref(*op)], &[], None);
             let _ = self.run(&["update-ref", "-d", &stash_keep_ref(*op)], &[], None);
             let _ = self.run(&["update-ref", "-d", &discard_ref(*op)], &[], None);

@@ -197,7 +197,7 @@ proptest! {
         let conflicts = Conflicts::default();
         let phase = [
             Phase::Merging { conflicts: conflicts.clone() },
-            Phase::Rebasing { step: 1, total: 2, conflicts: conflicts.clone() },
+            Phase::Rebasing { step: 1, total: 2, conflicts: conflicts.clone(), pause: Default::default(), origin: None },
             Phase::CherryPicking { conflicts: conflicts.clone() },
             Phase::Reverting { conflicts },
         ][which].clone();

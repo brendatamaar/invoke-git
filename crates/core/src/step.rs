@@ -14,6 +14,9 @@ use crate::ops::{
     ErrorClass, Failure, GitArgs, Lease, OpOutcome, PullMode, RemoteBranch, StageRequest,
     WriteRequest,
 };
+use crate::rebase::{
+    RebaseControl, RebaseFinish, RebaseIntent, RebaseOrigin, RebaseRun, RebaseState, RebaseUndo,
+};
 use crate::stash;
 use crate::state::{
     Action, BranchRefusal, CommitRefusal, DiskState, Freshness, Head, LockState, Notice, OpPhase,
@@ -79,6 +82,40 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
                 WriteRequest::Revert { commit, onto }
             })
         }
+        Event::RebasePlanEdited(plan) => match &mut state.rebase {
+            RebaseState::Editing { plan: draft, .. } => *draft = plan,
+            RebaseState::Idle | RebaseState::Done | RebaseState::Aborted => {
+                match state.snapshot.disk() {
+                    Some(disk) if disk.phase == Phase::Clean => {
+                        state.rebase = RebaseState::Editing {
+                            plan,
+                            head: disk.head.clone(),
+                        };
+                    }
+                    Some(_) => {
+                        refuse_because(&mut state, Action::InteractiveRebase, Refusal::RepoBusy)
+                    }
+                    None => refuse_because(&mut state, Action::InteractiveRebase, Refusal::NotRead),
+                }
+            }
+            _ => refuse_because(&mut state, Action::InteractiveRebase, Refusal::RepoBusy),
+        },
+        Event::RebaseStartRequested => {
+            if let RebaseState::Editing { plan, head } = &state.rebase {
+                let request = WriteRequest::InteractiveRebase {
+                    plan: plan.clone(),
+                    head: head.clone(),
+                };
+                state.rebase = RebaseState::Queued(state.ops.next);
+                enqueue(&mut state, request);
+            } else {
+                refuse_because(
+                    &mut state,
+                    Action::InteractiveRebase,
+                    Refusal::NothingSelected,
+                );
+            }
+        }
         Event::SkipRequested => request_conflict(&mut state, Action::Skip, |operation| {
             if operation.can_skip() {
                 Ok(WriteRequest::Skip { operation })
@@ -86,9 +123,15 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
                 Err(ConflictRefusal::SkipNotAvailable)
             }
         }),
-        Event::AbortRequested => request_conflict(&mut state, Action::Abort, |operation| {
-            Ok(WriteRequest::Abort { operation })
-        }),
+        Event::AbortRequested => match state.rebase {
+            RebaseState::Editing { .. } => state.rebase = RebaseState::Aborted,
+            RebaseState::Queued(op) => cancel(&mut state, op, &mut commands),
+            RebaseState::Running { ref mut intent, .. }
+            | RebaseState::Reading { ref mut intent, .. } => *intent = RebaseIntent::AbortAtPause,
+            _ => request_conflict(&mut state, Action::Abort, |operation| {
+                Ok(WriteRequest::Abort { operation })
+            }),
+        },
         Event::UndoRequested => match state.undo.top() {
             Ok(_) => enqueue(&mut state, WriteRequest::Undo),
             Err(reason) => refuse_because(&mut state, Action::Undo, reason),
@@ -239,13 +282,12 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         }
         Event::OpFinished(op, outcome) => {
             if let Some(running) = state.ops.running.take_if(|running| running.id == op) {
-                finish_undo(
-                    &mut state,
-                    op,
-                    &running.request,
-                    outcome == OpOutcome::Succeeded,
-                    &mut commands,
-                );
+                let succeeded = outcome == OpOutcome::Succeeded;
+                if matches!(state.rebase, RebaseState::Running { .. }) {
+                    finish_rebase(&mut state, &running.request, succeeded, &mut commands);
+                } else {
+                    finish_undo(&mut state, op, &running.request, succeeded, &mut commands);
+                }
                 state.notice = Some(match (&running.request, outcome) {
                     // A rejected push is a state change, not an error.
                     (
@@ -343,6 +385,9 @@ fn cancel(state: &mut RepoState, op: OpId, commands: &mut Vec<Command>) {
         }
     } else if let Some(position) = state.ops.queued.iter().position(|queued| queued.id == op) {
         state.ops.queued.remove(position);
+        if state.rebase == RebaseState::Queued(op) {
+            state.rebase = RebaseState::Aborted;
+        }
         state.notice = Some(Notice::OpEnded {
             op,
             outcome: OpOutcome::Cancelled,
@@ -370,6 +415,7 @@ fn is_conflict_flow(request: &WriteRequest) -> bool {
             // P2: git stops half way if killed; it is local and quick.
             | WriteRequest::CherryPick { .. }
             | WriteRequest::Revert { .. }
+            | WriteRequest::InteractiveRebase { .. }
     )
 }
 
@@ -399,7 +445,131 @@ fn apply_read(state: &mut RepoState, read: ReadId, disk: DiskState, commands: &m
     };
     if read >= latest {
         state.reads.freshness = Freshness::Fresh;
+        settle_rebase(state, commands);
         settle_undo(state, commands);
+    }
+}
+
+fn finish_rebase(
+    state: &mut RepoState,
+    request: &WriteRequest,
+    succeeded: bool,
+    commands: &mut Vec<Command>,
+) {
+    let RebaseState::Running { run, intent } = mem::take(&mut state.rebase) else {
+        return;
+    };
+    let saved = match run {
+        RebaseRun::Starting(origin) => match mem::take(&mut state.undo.pending) {
+            UndoPending::Taken { point, tree } => Some(Box::new(RebaseUndo {
+                point,
+                tree,
+                origin,
+            })),
+            UndoPending::Recording { point } => {
+                prune(vec![point.op], commands);
+                None
+            }
+            _ => None,
+        },
+        RebaseRun::Resuming(saved) => Some(saved),
+    };
+    if let Some(saved) = saved {
+        let finish = match (succeeded, request) {
+            (true, WriteRequest::Abort { .. }) => RebaseFinish::Aborted,
+            (true, _) => RebaseFinish::Completed,
+            (false, _) => RebaseFinish::Failed,
+        };
+        state.rebase = RebaseState::Reading {
+            saved,
+            finish,
+            intent,
+        };
+    }
+}
+
+fn settle_rebase(state: &mut RepoState, commands: &mut Vec<Command>) {
+    let Some(disk) = state.snapshot.disk() else {
+        return;
+    };
+    let matches_origin = |saved: &RebaseUndo| matches!(&disk.phase, Phase::Rebasing { origin: Some(origin), .. } if origin == &saved.origin);
+    let mut requested_abort = None;
+    state.rebase = match mem::take(&mut state.rebase) {
+        RebaseState::Reading { saved, intent, .. } if matches_origin(&saved) => {
+            if intent == RebaseIntent::AbortAtPause {
+                requested_abort = disk.phase.operation();
+            }
+            RebaseState::Paused(saved)
+        }
+        RebaseState::Reading {
+            saved,
+            finish: RebaseFinish::Completed,
+            ..
+        } if disk.phase == Phase::Clean && HeadTarget::of(&disk.head) == saved.point.head => {
+            state.undo.pending = UndoPending::Settling {
+                point: saved.point,
+                tree: saved.tree,
+            };
+            RebaseState::Done
+        }
+        RebaseState::Reading { saved, finish, .. } => {
+            prune(vec![saved.point.op], commands);
+            if finish == RebaseFinish::Aborted {
+                // Git may rewrite the index on abort even though its tree is restored.
+                // Like undo, re-anchor only if the last point was current at start.
+                if RebaseOrigin::from_head(&disk.head).as_ref() == Some(&saved.origin)
+                    && let Some(top) = state.undo.entries.back_mut()
+                    && top.after_index == saved.point.index
+                    && top.after_head == saved.point.head
+                {
+                    top.after_index = disk.index.clone();
+                }
+                RebaseState::Aborted
+            } else {
+                RebaseState::Idle
+            }
+        }
+        RebaseState::Paused(saved) if !matches_origin(&saved) => {
+            prune(vec![saved.point.op], commands);
+            RebaseState::Idle
+        }
+        other => other,
+    };
+    if let Some(operation) = requested_abort {
+        enqueue(state, WriteRequest::Abort { operation });
+    }
+}
+
+fn resume_rebase(state: &mut RepoState, args: GitArgs) -> GitArgs {
+    let (control, step, total) = match args {
+        GitArgs::Continue {
+            operation: Operation::Rebase { step, total },
+        } => (RebaseControl::Continue, step, total),
+        GitArgs::Skip {
+            operation: Operation::Rebase { step, total },
+        } => (RebaseControl::Skip, step, total),
+        GitArgs::Abort {
+            operation: Operation::Rebase { step, total },
+        } => (RebaseControl::Abort, step, total),
+        _ => return args,
+    };
+    if !matches!(state.rebase, RebaseState::Paused(_)) {
+        return args;
+    }
+    if let RebaseState::Paused(saved) = mem::take(&mut state.rebase) {
+        let origin = saved.origin.clone();
+        state.rebase = RebaseState::Running {
+            run: RebaseRun::Resuming(saved),
+            intent: RebaseIntent::Run,
+        };
+        GitArgs::GuardedRebase {
+            control,
+            step,
+            total,
+            origin,
+        }
+    } else {
+        args
     }
 }
 
@@ -519,16 +689,20 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     CommitKind::ConcludeMerge => Reversal::Never(Irreversible::MergeConcluded),
                     CommitKind::Commit | CommitKind::Amend => Reversal::Refs,
                 };
-                let point = UndoPoint {
-                    op: id,
-                    label: message.label(kind.verb()),
-                    head: HeadTarget::of(&disk.head),
-                    refs: vec![head_ref(&disk.head)],
-                    index: expect.index.clone(),
-                    index_effect: IndexEffect::Rewrites,
-                    reverse,
-                };
-                commands.push(Command::SnapshotForUndo(point.clone()));
+                // At an edit stop the amend belongs to the rebase's undo.
+                if !matches!(disk.phase, Phase::Rebasing { .. }) {
+                    let point = UndoPoint {
+                        op: id,
+                        label: message.label(kind.verb()),
+                        head: HeadTarget::of(&disk.head),
+                        refs: vec![head_ref(&disk.head)],
+                        index: expect.index.clone(),
+                        index_effect: IndexEffect::Rewrites,
+                        reverse,
+                    };
+                    commands.push(Command::SnapshotForUndo(point.clone()));
+                    state.undo.pending = UndoPending::Recording { point };
+                }
                 commands.push(Command::RunGit {
                     op: id,
                     args: GitArgs::Commit {
@@ -537,7 +711,6 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     },
                     expect,
                 });
-                state.undo.pending = UndoPending::Recording { point };
             }
             // Task 11. The patch was built from a diff of one index; if the
             // index on disk is another, the diff is stale and nothing runs.
@@ -551,23 +724,26 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     refuse_because(state, action, Refusal::StaleDiff);
                     continue;
                 }
-                // Only the index changes, so the point records no refs.
-                let point = UndoPoint {
-                    op: id,
-                    label: stage.selection.label(verb),
-                    head: HeadTarget::of(&disk.head),
-                    refs: Vec::new(),
-                    index: expect.index.clone(),
-                    index_effect: IndexEffect::Rewrites,
-                    reverse: Reversal::Refs,
-                };
-                commands.push(Command::SnapshotForUndo(point.clone()));
+                // Index edits at a pause belong to the rebase's undo.
+                if !matches!(state.rebase, RebaseState::Paused(_)) {
+                    // Only the index changes, so the point records no refs.
+                    let point = UndoPoint {
+                        op: id,
+                        label: stage.selection.label(verb),
+                        head: HeadTarget::of(&disk.head),
+                        refs: Vec::new(),
+                        index: expect.index.clone(),
+                        index_effect: IndexEffect::Rewrites,
+                        reverse: Reversal::Refs,
+                    };
+                    commands.push(Command::SnapshotForUndo(point.clone()));
+                    state.undo.pending = UndoPending::Recording { point };
+                }
                 commands.push(Command::ApplyPatchToIndex {
                     op: id,
                     patch: stage.patch.clone(),
                     expect_index: expect.index.clone(),
                 });
-                state.undo.pending = UndoPending::Recording { point };
             }
             // Task 13. Refused in a merge, rebase, cherry-pick or revert, like
             // the other writes that rewrite files, and when the diff the patch
@@ -720,16 +896,25 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
             WriteRequest::Continue { operation } => {
                 match conflict::plan_continue(&disk, *operation) {
                     Ok(args) => {
-                        let label = format!("Continue {}", operation_name(*operation));
-                        let rewrites = IndexEffect::Rewrites;
-                        run_with_point(
-                            state,
-                            commands,
-                            (id, label),
-                            (&disk, expect),
-                            args,
-                            (rewrites, Irreversible::Continued),
-                        );
+                        let args = resume_rebase(state, args);
+                        if matches!(args, GitArgs::GuardedRebase { .. }) {
+                            commands.push(Command::RunGit {
+                                op: id,
+                                args,
+                                expect,
+                            });
+                        } else {
+                            let label = format!("Continue {}", operation_name(*operation));
+                            let rewrites = IndexEffect::Rewrites;
+                            run_with_point(
+                                state,
+                                commands,
+                                (id, label),
+                                (&disk, expect),
+                                args,
+                                (rewrites, Irreversible::Continued),
+                            );
+                        }
                     }
                     Err(reason) => {
                         refuse_conflict(state, Action::Continue, reason);
@@ -738,27 +923,76 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                 }
             }
             WriteRequest::Skip { operation } => match conflict::plan_skip(&disk, *operation) {
-                Ok(args) => commands.push(Command::RunGit {
-                    op: id,
-                    args,
-                    expect,
-                }),
+                Ok(args) => {
+                    let args = resume_rebase(state, args);
+                    commands.push(Command::RunGit {
+                        op: id,
+                        args,
+                        expect,
+                    });
+                }
                 Err(reason) => {
                     refuse_conflict(state, Action::Skip, reason);
                     continue;
                 }
             },
             WriteRequest::Abort { operation } => match conflict::plan_abort(&disk, *operation) {
-                Ok(args) => commands.push(Command::RunGit {
-                    op: id,
-                    args,
-                    expect,
-                }),
+                Ok(args) => {
+                    let args = resume_rebase(state, args);
+                    commands.push(Command::RunGit {
+                        op: id,
+                        args,
+                        expect,
+                    });
+                }
                 Err(reason) => {
                     refuse_conflict(state, Action::Abort, reason);
                     continue;
                 }
             },
+            WriteRequest::InteractiveRebase { plan, head } => {
+                let result = if disk.phase != Phase::Clean {
+                    Err(Refusal::RepoBusy)
+                } else if &disk.head != head {
+                    Err(Refusal::BranchChanged)
+                } else if disk.status.has_tracked_changes() {
+                    Err(Refusal::UncommittedChanges)
+                } else {
+                    RebaseOrigin::from_head(head)
+                        .ok_or(Refusal::Branch(BranchRefusal::NoCommitsYet))
+                };
+                let origin = match result {
+                    Ok(origin) => origin,
+                    Err(reason) => {
+                        state.rebase = RebaseState::Editing {
+                            plan: plan.clone(),
+                            head: head.clone(),
+                        };
+                        refuse_because(state, Action::InteractiveRebase, reason);
+                        continue;
+                    }
+                };
+                let point = UndoPoint {
+                    op: id,
+                    label: "Interactive rebase".to_owned(),
+                    head: HeadTarget::of(head),
+                    refs: vec![head_ref(head)],
+                    index: expect.index.clone(),
+                    index_effect: IndexEffect::Rewrites,
+                    reverse: Reversal::Refs,
+                };
+                commands.push(Command::SnapshotForUndo(point.clone()));
+                commands.push(Command::RunGit {
+                    op: id,
+                    args: GitArgs::InteractiveRebase(plan.clone()),
+                    expect,
+                });
+                state.undo.pending = UndoPending::Recording { point };
+                state.rebase = RebaseState::Running {
+                    run: RebaseRun::Starting(origin),
+                    intent: RebaseIntent::Run,
+                };
+            }
             // P2. Starting needs a clean repo with a commit to build on, and
             // the `HEAD` the user saw (law 9). A clean result is one commit
             // on `HEAD`, undone like a commit (refs and index). A conflict

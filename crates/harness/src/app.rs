@@ -4,6 +4,7 @@
 //! the core as the `DiskChanged` the watcher would have sent.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -43,14 +44,18 @@ pub struct App {
 }
 
 impl App {
-    pub fn open(repo: RepoDir) -> Self {
+    pub fn open(repo: RepoDir, editor: Option<&Path>) -> Self {
         let git = || Git::detect("git").expect("git on PATH");
         let (state, commands) = open(RepoId {
             root_commit: None,
             remote_url: None,
         });
+        let mut runner = GitRunner::new(git(), repo.paths.clone()).with_env(repo.env.clone());
+        if let Some(editor) = editor {
+            runner = runner.with_rebase_editor(editor);
+        }
         let mut app = Self {
-            runner: GitRunner::new(git(), repo.paths.clone()).with_env(repo.env.clone()),
+            runner,
             staging: StagingRunner::new(git(), repo.paths.clone()).with_env(repo.env.clone()),
             discard: DiscardRunner::new(git(), repo.paths.clone()).with_env(repo.env.clone()),
             undo: UndoRunner::new(git(), repo.paths.clone()).with_env(repo.env.clone()),

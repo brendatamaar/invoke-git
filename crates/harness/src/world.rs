@@ -6,11 +6,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 
 use diff::{DiffOptions, Direction, Mode, PatchSpec, Pick as DiffPick, build_patch, diff_text};
 use invoke_core::{
     Area, BranchName, BranchStart, DiscardRequest, ErrorClass, Event, FileChange, LockState,
-    MAX_POINTS, Oid, Patch, Refusal, RepoPath, Reversal, Selection, StageRequest,
+    MAX_POINTS, Oid, Patch, Phase, RebaseAction, RebasePlan, RebaseState, Refusal, RepoPath,
+    Reversal, Selection, StageRequest,
 };
 use shell::{InputsError, Source, load_inputs, read::read_state};
 
@@ -18,7 +20,9 @@ use crate::app::{App, Outcome};
 use crate::content::{self, FILES};
 use crate::gitdir::{RepoDir, Root, Run, dollar_quote, quote};
 use crate::observe::{HeadAt, Observed, Snap, first_difference, footprint, observe};
-use crate::transition::{BRANCHES, BranchSel, Pick, ReplayEnd, Target, Transition};
+use crate::transition::{
+    BRANCHES, BranchSel, Pick, RebaseEnd, RebaseShape, ReplayEnd, Target, Transition,
+};
 
 /// One git run on the twin: argv after `git`, and what goes to stdin.
 #[derive(Clone, Debug)]
@@ -116,6 +120,7 @@ pub struct World {
     _root: Root,
     pub app: App,
     pub twin: RepoDir,
+    rebase_editor: Option<PathBuf>,
     script: Vec<String>,
     stack: Vec<Entry>,
     twin_obs: Observed,
@@ -128,6 +133,10 @@ pub struct World {
 
 impl World {
     pub fn new() -> Self {
+        Self::with_rebase_editor(None)
+    }
+
+    pub fn with_rebase_editor(editor: Option<&Path>) -> Self {
         let root = Root::new();
         let app_repo = RepoDir::init(&root.path, "app");
         let twin = RepoDir::init(&root.path, "twin");
@@ -152,11 +161,12 @@ impl World {
         }
         script.push("git add -A && git commit -q -m init".to_owned());
         let twin_obs = observe(&twin);
-        let app = App::open(app_repo);
+        let app = App::open(app_repo, editor);
         let mut world = Self {
             _root: root,
             app,
             twin,
+            rebase_editor: editor.map(Path::to_owned),
             script,
             stack: Vec::new(),
             twin_obs,
@@ -245,7 +255,14 @@ impl World {
                 }
                 Target::Detach => self.outside(&["checkout", "-q", "--detach"]),
             },
+            Transition::InteractiveRebase { count, shape, end } => {
+                self.interactive_rebase(*count, *shape, *end, false);
+            }
             Transition::WhileLocked(inner) => {
+                if let Transition::InteractiveRebase { count, shape, end } = **inner {
+                    self.interactive_rebase(count, shape, end, true);
+                    return;
+                }
                 self.begin_replay(inner);
                 let prepared = self.prepare(inner);
                 self.drive(prepared, true);
@@ -1030,6 +1047,237 @@ impl World {
         self.mark_ambiguous();
     }
 
+    /// Generate a complete plan over the twin's real commits, then drive
+    /// Git with an independently formatted todo. Check every Git stop before
+    /// resuming it, including intermediate conflicts and clean edit pauses.
+    fn interactive_rebase(
+        &mut self,
+        count: usize,
+        shape: RebaseShape,
+        end: RebaseEnd,
+        locked: bool,
+    ) {
+        let commits = self.twin.git(&[
+            "rev-list",
+            "--first-parent",
+            "-n",
+            &(count + 1).to_string(),
+            "HEAD",
+        ]);
+        let listing = commits.text();
+        let mut ids: Vec<_> = listing.lines().rev().collect();
+        if !commits.ok || ids.len() < 2 {
+            return;
+        }
+        let upstream = ids.remove(0);
+        let mut verbs = vec![("pick", RebaseAction::Pick); ids.len()];
+        match shape {
+            RebaseShape::Reorder => ids.reverse(),
+            RebaseShape::Squash if ids.len() > 1 => verbs[1] = ("squash", RebaseAction::Squash),
+            RebaseShape::Fixup if ids.len() > 1 => verbs[1] = ("fixup", RebaseAction::Fixup),
+            RebaseShape::Edit => verbs[0] = ("edit", RebaseAction::Edit),
+            RebaseShape::Drop => verbs[0] = ("drop", RebaseAction::Drop),
+            RebaseShape::Squash | RebaseShape::Fixup => return,
+        }
+        let rows = ids
+            .iter()
+            .zip(&verbs)
+            .map(|(id, (_, action))| (Oid::from_hex(id).unwrap(), *action))
+            .collect();
+        let plan = RebasePlan::new(Oid::from_hex(upstream).unwrap(), rows).unwrap();
+        assert_eq!(
+            self.app.request(Event::RebasePlanEdited(plan)),
+            Outcome::Nothing
+        );
+        let before = self.twin_obs.clone();
+        let dirty = self
+            .twin
+            .git(&["status", "--porcelain", "--untracked-files=no"]);
+        assert!(dirty.ok);
+        if !dirty.text().is_empty() {
+            assert_eq!(
+                self.request(Event::RebaseStartRequested, locked),
+                Outcome::Refused(Refusal::UncommittedChanges)
+            );
+            assert_eq!(self.app.request(Event::AbortRequested), Outcome::Nothing);
+            self.check();
+            return;
+        }
+        let before_snap = self.twin_snap();
+        let tree_var = format!("T{}", self.trees);
+        self.trees += 1;
+        self.script
+            .push(format!("{tree_var}=$(git write-tree)  # saved index"));
+        let todo = ids
+            .iter()
+            .zip(verbs)
+            .map(|(id, (verb, _))| format!("{verb} {id}\n"))
+            .collect::<String>();
+        let outcome = self.request(Event::RebaseStartRequested, locked);
+        let mut run = self.twin_rebase(upstream, &todo);
+        Self::compare_rebase_result(&outcome, &run);
+        self.refresh_twin();
+
+        let mut stops = 0;
+        while self.twin.paths.git_dir.join("rebase-merge").is_dir() {
+            stops += 1;
+            assert!(stops <= ids.len(), "rebase failed to advance");
+            self.check();
+            assert!(matches!(self.app.state.rebase, RebaseState::Paused(_)));
+            let push = self.app.request(Event::PushRequested {
+                to: invoke_core::RemoteBranch {
+                    remote: "origin".into(),
+                    branch: BranchName("main".into()),
+                },
+                force_with_lease: true,
+                set_upstream: false,
+            });
+            assert!(
+                matches!(
+                    push,
+                    Outcome::Refused(Refusal::NoBranch | Refusal::RepoBusy)
+                ),
+                "law 10: paused rebase must refuse force push, got {push:?}"
+            );
+            let phase = &self.app.state.fresh_disk().unwrap().phase;
+            let Phase::Rebasing { conflicts, .. } = phase else {
+                panic!("law 11/13: git paused, snapshot reports {phase:?}");
+            };
+            let paths: BTreeSet<_> = conflicts
+                .unresolved()
+                .map(|(path, _)| path.0.clone())
+                .collect();
+            let listing = self.twin.git(&["ls-files", "-u", "-z"]);
+            let output = String::from_utf8_lossy(&listing.stdout);
+            let expected: BTreeSet<_> = output
+                .split('\0')
+                .filter_map(|entry| entry.split_once('\t'))
+                .map(|(_, path)| path.to_owned())
+                .collect();
+            assert_eq!(paths, expected, "law 11: conflict paths differ from git");
+            stat(if paths.is_empty() {
+                "rebase edit or empty pause"
+            } else {
+                "rebase conflict pause"
+            });
+
+            let (event, flag) = match end {
+                RebaseEnd::Abort => (Event::AbortRequested, "--abort"),
+                RebaseEnd::Skip => (Event::SkipRequested, "--skip"),
+                RebaseEnd::Continue => {
+                    if !paths.is_empty() {
+                        let blocked = self.app.request(Event::ContinueRequested);
+                        assert!(matches!(blocked, Outcome::Refused(Refusal::Conflict(_))));
+                    }
+                    for path in paths {
+                        self.fs_write(&path, "resolved by the harness\n");
+                        self.app.disk_changed(&[Area::Worktree]);
+                        let result = self.app.request(Event::ResolveFileRequested {
+                            path: RepoPath(path.clone()),
+                            choice: invoke_core::ResolveChoice::Manual,
+                        });
+                        assert_eq!(result, Outcome::Succeeded);
+                        assert!(self.twin_git(&TwinOp::git(&["add", "--", &path])).ok);
+                    }
+                    (Event::ContinueRequested, "--continue")
+                }
+            };
+            let outcome = self.request(event, locked);
+            run = self.twin_git(&TwinOp::git(&["-c", "core.editor=:", "rebase", flag]));
+            Self::compare_rebase_result(&outcome, &run);
+            self.refresh_twin();
+            if end == RebaseEnd::Abort {
+                assert!(run.ok);
+                assert!(
+                    first_difference(&before, &self.twin_obs).is_none(),
+                    "law 13: rebase abort did not restore the original repository"
+                );
+                self.check();
+                return;
+            }
+            if !run.ok
+                && !self.twin_obs.has_unmerged()
+                && self.twin.paths.git_dir.join("rebase-merge").is_dir()
+            {
+                // Git can stop at an empty resolution. Skip it to exercise
+                // the rest of the plan rather than retrying the same step.
+                let outcome = self.request(Event::SkipRequested, locked);
+                run = self.twin_git(&TwinOp::git(&["-c", "core.editor=:", "rebase", "--skip"]));
+                Self::compare_rebase_result(&outcome, &run);
+                self.refresh_twin();
+            }
+        }
+
+        if run.ok {
+            let after = self.twin_snap();
+            let target = match &before_snap.head {
+                HeadAt::Branch(name) => format!("refs/heads/{name}"),
+                HeadAt::Detached => "HEAD".into(),
+            };
+            assert!(
+                footprint(&before_snap, &after)
+                    .iter()
+                    .all(|name| name == &target),
+                "law 9: interactive rebase moved an untargeted ref"
+            );
+            self.push_entry(before_snap.clone(), tree_var, Hint::Replay, None);
+            self.check();
+            // Prove the rebase's single undo point covers all of its steps.
+            assert!(self.drive_undo(locked));
+            assert_eq!(
+                self.twin_snap(),
+                before_snap,
+                "law 8: rebase undo did not restore refs and index tree"
+            );
+        } else {
+            assert!(
+                first_difference(&before, &self.twin_obs).is_none(),
+                "law 13: failed rebase left a partial change outside a resumable state"
+            );
+            self.mark_ambiguous();
+            self.check();
+        }
+    }
+
+    fn compare_rebase_result(outcome: &Outcome, run: &Run) {
+        assert!(
+            matches!(outcome, Outcome::Succeeded) && run.ok
+                || matches!(outcome, Outcome::Failed(_)) && !run.ok,
+            "interactive rebase result differs: app {outcome:?}, git {} ({})",
+            run.ok,
+            run.stderr
+        );
+    }
+
+    fn twin_rebase(&mut self, upstream: &str, todo: &str) -> Run {
+        let editor = self
+            .rebase_editor
+            .as_ref()
+            .expect("provide the native test editor");
+        let name = editor.file_name().unwrap();
+        let dir = editor.parent().unwrap().to_owned();
+        let inherited = std::env::var_os("PATH");
+        let path = std::env::join_paths(
+            std::iter::once(dir).chain(inherited.iter().flat_map(std::env::split_paths)),
+        )
+        .unwrap();
+        // The replay is copy/pasteable in a shell. The actual twin runs the
+        // native test fixture with these bytes supplied independently.
+        self.script.push(format!(
+            r#"GIT_SEQUENCE_EDITOR='printf %s "$INVOKE_TWIN_TODO" > ' INVOKE_TWIN_TODO={} git -c core.editor=: rebase -i {}"#,
+            quote(todo), quote(upstream)
+        ));
+        self.twin.git_with_env(
+            &["-c", "core.editor=:", "rebase", "--interactive", upstream],
+            &[
+                ("PATH", &path),
+                ("GIT_EDITOR", ":".as_ref()),
+                ("GIT_SEQUENCE_EDITOR", name),
+                ("INVOKE_TWIN_TODO", todo.as_ref()),
+            ],
+        )
+    }
+
     // ---- the undo model ---------------------------------------------------
 
     /// The stash entry at `position` as plain git lists it: commit and message.
@@ -1446,8 +1694,21 @@ impl World {
                 app_obs.head
             );
         }
-        let expected = status_from_git(&self.app.repo);
-        let found = status_from_state(snapshot);
+        let unresolved: BTreeSet<_> = snapshot
+            .phase
+            .conflicts()
+            .into_iter()
+            .flat_map(|conflicts| conflicts.unresolved())
+            .map(|(path, _)| path.0.as_str())
+            .collect();
+        let expected: Vec<_> = status_from_git(&self.app.repo)
+            .into_iter()
+            .filter(|(path, ..)| !unresolved.contains(path.as_str()))
+            .collect();
+        let found: Vec<_> = status_from_state(snapshot)
+            .into_iter()
+            .filter(|(path, ..)| !unresolved.contains(path.as_str()))
+            .collect();
         if expected != found {
             panic!(
                 "law 11: the state's status differs from git status\n  state: {found:?}\n  git:   {expected:?}"
@@ -1465,6 +1726,9 @@ impl World {
             .cloned()
             .collect();
         let mut expected = BTreeSet::new();
+        if let RebaseState::Paused(saved) = &self.app.state.rebase {
+            expected.insert(format!("refs/invoke-git/undo/{}", saved.point.op.0));
+        }
         for entry in &self.app.state.undo.entries {
             expected.insert(format!("refs/invoke-git/undo/{}", entry.point.op.0));
             if matches!(entry.point.reverse, Reversal::Discard { .. }) {

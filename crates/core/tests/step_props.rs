@@ -51,7 +51,9 @@ fn phase() -> impl Strategy<Value = Phase> {
         (0..5u32, 0..5u32, conflicts()).prop_map(|(step, total, conflicts)| Phase::Rebasing {
             step,
             total,
-            conflicts
+            conflicts,
+            pause: Default::default(),
+            origin: None
         }),
         conflicts().prop_map(|conflicts| Phase::CherryPicking { conflicts }),
         conflicts().prop_map(|conflicts| Phase::Reverting { conflicts }),

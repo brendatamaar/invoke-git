@@ -80,6 +80,8 @@ fn disk(head: HeadKind, phase: PhaseKind, staged: bool, unstaged: bool) -> DiskS
                 step: 1,
                 total: 2,
                 conflicts: conflicts(&[]),
+                pause: Default::default(),
+                origin: None,
             },
             PhaseKind::CherryPicking => Phase::CherryPicking {
                 conflicts: conflicts(&[]),

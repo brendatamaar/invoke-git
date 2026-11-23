@@ -72,14 +72,18 @@ impl ReferenceStateMachine for Reference {
     }
 }
 
-pub struct Harness;
+pub trait TestEditor {
+    const PROGRAM: &'static str;
+}
 
-impl StateMachineTest for Harness {
+pub struct Harness<Editor>(std::marker::PhantomData<Editor>);
+
+impl<Editor: TestEditor> StateMachineTest for Harness<Editor> {
     type SystemUnderTest = World;
     type Reference = Reference;
 
     fn init_test(_: &Plan) -> World {
-        World::new()
+        World::with_rebase_editor(Some(std::path::Path::new(Editor::PROGRAM)))
     }
 
     fn apply(mut world: World, _: &Plan, transition: Transition) -> World {

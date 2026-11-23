@@ -337,7 +337,12 @@ fn stopped_rebase_reports_step_and_total() {
         Phase::Rebasing {
             step: 2,
             total: 3,
-            conflicts: conflict_paths(&["a.txt"])
+            conflicts: conflict_paths(&["a.txt"]),
+            pause: invoke_core::RebasePause::Conflict,
+            origin: Some(invoke_core::RebaseOrigin {
+                branch: Some(invoke_core::BranchName("topic".into())),
+                tip: invoke_core::Oid::from_hex(&repo.git(&["rev-parse", "topic"])).unwrap(),
+            }),
         }
     );
     // During a rebase HEAD is detached.
@@ -360,7 +365,12 @@ fn stopped_apply_rebase_reads_next_and_last() {
         Phase::Rebasing {
             step: 2,
             total: 3,
-            conflicts: conflict_paths(&["a.txt"])
+            conflicts: conflict_paths(&["a.txt"]),
+            pause: invoke_core::RebasePause::Conflict,
+            origin: Some(invoke_core::RebaseOrigin {
+                branch: Some(invoke_core::BranchName("topic".into())),
+                tip: invoke_core::Oid::from_hex(&repo.git(&["rev-parse", "topic"])).unwrap(),
+            }),
         }
     );
 }

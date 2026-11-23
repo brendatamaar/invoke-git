@@ -17,6 +17,7 @@ pub mod outgoing;
 pub mod precondition;
 pub mod progress;
 pub mod read;
+pub mod rebase;
 mod resolve_undo;
 pub mod runner;
 pub mod staging;

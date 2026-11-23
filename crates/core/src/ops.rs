@@ -17,6 +17,10 @@ pub enum WriteRequest {
     },
     /// Reverse the newest undo point.
     Undo,
+    InteractiveRebase {
+        plan: crate::RebasePlan,
+        head: crate::Head,
+    },
     // Task 11: index writes from the status tree.
     Stage(StageRequest),
     Unstage(StageRequest),
@@ -316,6 +320,13 @@ pub enum GitArgs {
     Revert {
         commit: Oid,
     },
+    InteractiveRebase(crate::RebasePlan),
+    GuardedRebase {
+        control: crate::rebase::RebaseControl,
+        step: u32,
+        total: u32,
+        origin: crate::RebaseOrigin,
+    },
 }
 
 impl GitArgs {
@@ -361,7 +372,13 @@ impl GitArgs {
             | GitArgs::Abort { .. }
             // P2: `HEAD` and the index are what these expect.
             | GitArgs::CherryPick { .. }
-            | GitArgs::Revert { .. } => Vec::new(),
+            | GitArgs::Revert { .. }
+            | GitArgs::InteractiveRebase(_) => Vec::new(),
+            GitArgs::GuardedRebase { origin, .. } => origin
+                .branch
+                .iter()
+                .map(|branch| at(branch, Some(&origin.tip)))
+                .collect(),
             GitArgs::CreateBranch { name, .. } => vec![at(name, None)],
             GitArgs::CreateTag { name, .. } => vec![tag_at(name, None)],
             GitArgs::DeleteTag { name, tip } | GitArgs::PushTag { name, tip, .. } => {
@@ -388,6 +405,8 @@ impl GitArgs {
                 | GitArgs::Abort { .. }
                 | GitArgs::CherryPick { .. }
                 | GitArgs::Revert { .. }
+                | GitArgs::InteractiveRebase(_)
+                | GitArgs::GuardedRebase { .. }
         )
     }
 

@@ -116,12 +116,14 @@ pub fn merge_message(paths: &RepoPaths) -> Result<Option<String>, Failure> {
 }
 
 /// Which markers exist in the worktree's own git dir, with their counters.
-fn read_markers(git_dir: &Path) -> Markers {
+pub(crate) fn read_markers(git_dir: &Path) -> Markers {
     let rebase = |dir: &str, step: &str, total: &str| {
         let dir = git_dir.join(dir);
         dir.is_dir().then(|| RebaseFiles {
             step: fs::read_to_string(dir.join(step)).ok(),
             total: fs::read_to_string(dir.join(total)).ok(),
+            edit: dir.join("amend").is_file(),
+            origin: rebase_origin(&dir),
         })
     };
     Markers {
@@ -131,6 +133,16 @@ fn read_markers(git_dir: &Path) -> Markers {
         cherry_pick_head: git_dir.join("CHERRY_PICK_HEAD").exists(),
         revert_head: git_dir.join("REVERT_HEAD").exists(),
     }
+}
+
+fn rebase_origin(dir: &Path) -> Option<invoke_core::RebaseOrigin> {
+    let tip = Oid::from_hex(fs::read_to_string(dir.join("orig-head")).ok()?.trim()).ok()?;
+    let head = fs::read_to_string(dir.join("head-name")).ok()?;
+    let branch = match head.trim() {
+        "detached HEAD" => None,
+        name => Some(BranchName::parse(name.strip_prefix("refs/heads/")?).ok()?),
+    };
+    Some(invoke_core::RebaseOrigin { branch, tip })
 }
 
 /// The conflicted files (task 23). Paths with an index entry at stage 1, 2

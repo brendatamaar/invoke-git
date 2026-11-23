@@ -184,6 +184,8 @@ fn a_merge_rebase_cherry_pick_or_revert_refuses_a_discard() {
             step: 1,
             total: 2,
             conflicts: Conflicts::default(),
+            pause: Default::default(),
+            origin: None,
         },
         Phase::CherryPicking {
             conflicts: Conflicts::default(),

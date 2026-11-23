@@ -50,6 +50,11 @@ pub fn plan(disk: &DiskState, amend: bool) -> Result<CommitKind, Refusal> {
             Err(Refusal::Commit(CommitRefusal::UnresolvedConflicts))
         }
         Phase::Merging { .. } => Ok(CommitKind::ConcludeMerge),
+        Phase::Rebasing {
+            pause: crate::RebasePause::Edit,
+            conflicts,
+            ..
+        } if amend && conflicts.all_resolved() => Ok(CommitKind::Amend),
         // Their own `--continue` finishes these (task 23).
         Phase::Rebasing { .. } | Phase::CherryPicking { .. } | Phase::Reverting { .. } => {
             Err(Refusal::RepoBusy)

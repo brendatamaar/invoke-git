@@ -318,6 +318,44 @@ pub fn invocation(args: &GitArgs) -> Invocation {
             plain(argv)
         }
         GitArgs::ResolveStage { path } => stage_path(argv, path),
+        GitArgs::InteractiveRebase(plan) => {
+            argv.extend(
+                [
+                    "rebase",
+                    "--interactive",
+                    "--no-autosquash",
+                    "--no-autostash",
+                    "--no-update-refs",
+                    "--no-rebase-merges",
+                    "--no-fork-point",
+                    "--reapply-cherry-picks",
+                    plan.upstream().as_hex(),
+                ]
+                .map(OsString::from),
+            );
+            plain(argv)
+        }
+        GitArgs::GuardedRebase {
+            control,
+            step,
+            total,
+            ..
+        } => {
+            use invoke_core::rebase::RebaseControl;
+            let flag = match control {
+                RebaseControl::Continue => "--continue",
+                RebaseControl::Skip => "--skip",
+                RebaseControl::Abort => "--abort",
+            };
+            sequencer(
+                argv,
+                Operation::Rebase {
+                    step: *step,
+                    total: *total,
+                },
+                flag,
+            )
+        }
         GitArgs::Continue { operation } => sequencer(argv, *operation, "--continue"),
         GitArgs::Skip { operation } => sequencer(argv, *operation, "--skip"),
         GitArgs::Abort { operation } => sequencer(argv, *operation, "--abort"),

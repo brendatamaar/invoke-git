@@ -53,6 +53,8 @@ pub enum Event {
     // onto the `HEAD` in the snapshot at the moment of the request.
     CherryPickRequested(Oid),
     RevertRequested(Oid),
+    RebasePlanEdited(crate::RebasePlan),
+    RebaseStartRequested,
     SkipRequested,
     AbortRequested,
     OpCancelRequested(OpId),
