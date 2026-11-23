@@ -759,6 +759,10 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     refuse_because(state, action, Refusal::Branch(BranchRefusal::NoCommitsYet));
                     continue;
                 }
+                if disk.status.has_tracked_changes() {
+                    refuse_because(state, action, Refusal::UncommittedChanges);
+                    continue;
+                }
                 if HeadTarget::of(&disk.head) != *onto {
                     refuse_because(state, action, Refusal::BranchChanged);
                     continue;

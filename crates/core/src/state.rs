@@ -351,6 +351,24 @@ pub enum Refusal {
     Commit(CommitRefusal),
     /// Task 23: a conflict request that cannot run on the paused operation.
     Conflict(ConflictRefusal),
+    /// P2: a cherry-pick or revert needs every tracked file unchanged (staged
+    /// or not). git would start with some unstaged edits in place, but an
+    /// abort then rewrites the files it touched and loses those edits.
+    UncommittedChanges,
+}
+
+impl StatusSnapshot {
+    /// Whether any tracked file has a staged or unstaged change (untracked
+    /// files do not count).
+    pub fn has_tracked_changes(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.staged.is_some()
+                || entry
+                    .unstaged
+                    .as_ref()
+                    .is_some_and(|change| *change != FileChange::Untracked)
+        })
+    }
 }
 
 /// Why a commit request was turned down (task 14). These are expected

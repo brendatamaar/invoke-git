@@ -762,3 +762,35 @@ fn a_running_pick_or_revert_cannot_be_cancelled() {
         ));
     }
 }
+
+/// A change to a tracked file, staged or not, refuses the start; an
+/// untracked file does not.
+#[test]
+fn a_pick_or_revert_needs_tracked_files_unchanged() {
+    let entry = |staged, unstaged| StatusEntry {
+        path: path_named("a.txt"),
+        staged,
+        unstaged,
+    };
+    for pick in [true, false] {
+        for (entries, refused_with) in [
+            (vec![entry(Some(FileChange::Modified), None)], true),
+            (vec![entry(None, Some(FileChange::Modified))], true),
+            (vec![entry(None, Some(FileChange::Deleted))], true),
+            (vec![entry(None, Some(FileChange::Untracked))], false),
+        ] {
+            let mut snapshot = disk(Phase::Clean, LockState::Free);
+            snapshot.status = StatusSnapshot::from_entries(entries);
+            let (state, commands) = step(opened(snapshot), replay_event(pick, oid_of('b')));
+            if refused_with {
+                assert!(commands.iter().all(|command| !command.is_write()));
+                assert_eq!(
+                    refused(&state),
+                    Some((replay_action(pick), Refusal::UncommittedChanges))
+                );
+            } else {
+                assert!(run_git(&commands).is_some());
+            }
+        }
+    }
+}

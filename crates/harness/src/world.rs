@@ -18,7 +18,7 @@ use crate::app::{App, Outcome};
 use crate::content::{self, FILES};
 use crate::gitdir::{RepoDir, Root, Run, dollar_quote, quote};
 use crate::observe::{HeadAt, Observed, Snap, first_difference, footprint, observe};
-use crate::transition::{BRANCHES, BranchSel, Pick, Target, Transition};
+use crate::transition::{BRANCHES, BranchSel, Pick, ReplayEnd, Target, Transition};
 
 /// One git run on the twin: argv after `git`, and what goes to stdin.
 #[derive(Clone, Debug)]
@@ -42,7 +42,14 @@ enum Hint {
     Commit,
     Other,
     StashRewrote,
-    StashDrop { position: usize },
+    StashDrop {
+        position: usize,
+    },
+    /// P2: a cherry-pick or revert that ended in one commit: undone like a
+    /// commit (refs and index).
+    Replay,
+    /// P2: a continued cherry-pick or revert: undo stops at it.
+    Continued,
 }
 
 struct Write {
@@ -112,6 +119,9 @@ pub struct World {
     script: Vec<String>,
     stack: Vec<Entry>,
     twin_obs: Observed,
+    /// P2: how to end a conflicting cherry-pick or revert of this step, and
+    /// what the twin looked like before it started.
+    replay: Option<(ReplayEnd, Box<Observed>)>,
     steps: usize,
     trees: usize,
 }
@@ -150,6 +160,7 @@ impl World {
             script,
             stack: Vec::new(),
             twin_obs,
+            replay: None,
             steps: 0,
             trees: 0,
         };
@@ -235,17 +246,29 @@ impl World {
                 Target::Detach => self.outside(&["checkout", "-q", "--detach"]),
             },
             Transition::WhileLocked(inner) => {
+                self.begin_replay(inner);
                 let prepared = self.prepare(inner);
                 self.drive(prepared, true);
+                self.replay = None;
             }
             other => {
+                self.begin_replay(other);
                 let prepared = self.prepare(other);
                 self.drive(prepared, false);
+                self.replay = None;
             }
         }
     }
 
     // ---- twin helpers ---------------------------------------------------
+
+    /// P2: remembers how a conflicting pick or revert of this step ends and
+    /// what the repo looked like before it.
+    fn begin_replay(&mut self, transition: &Transition) {
+        if let Transition::Replay { end, .. } = transition {
+            self.replay = Some((*end, Box::new(self.twin_obs.clone())));
+        }
+    }
 
     fn twin_git(&mut self, op: &TwinOp) -> Run {
         let line = format!(
@@ -486,6 +509,32 @@ impl World {
                     TwinOp::git(&["stash", verb, &format!("stash@{{{position}}}")]),
                     hint,
                 )
+            }
+            Transition::Replay { commit, revert, .. } => {
+                let list = self.twin.git(&["rev-list", "--branches", "HEAD"]);
+                let commits: Vec<String> = list.text().lines().map(str::to_owned).collect();
+                // The app refuses while a tracked file has changes (git alone
+                // would start, and an abort then rewrites those edits).
+                let dirty = self
+                    .twin
+                    .git(&["status", "--porcelain", "--untracked-files=no"]);
+                if !list.ok || commits.is_empty() || !dirty.ok || !dirty.text().is_empty() {
+                    return Prepared::Nothing;
+                }
+                let id = commits[commit % commits.len()].clone();
+                let oid = Oid::from_hex(&id).expect("rev-list gives an object id");
+                let (event, twin) = if *revert {
+                    (
+                        Event::RevertRequested(oid),
+                        TwinOp::git(&["revert", "--no-edit", "--", &id]),
+                    )
+                } else {
+                    (
+                        Event::CherryPickRequested(oid),
+                        TwinOp::git(&["cherry-pick", "--", &id]),
+                    )
+                };
+                write(event, twin, Hint::Replay)
             }
             Transition::Undo => Prepared::Undo,
             _ => Prepared::Nothing,
@@ -864,6 +913,15 @@ impl World {
     /// cannot resolve conflicts yet (a later task), so both repos are reset
     /// the way a user would, behind the app's back.
     fn recover_from_conflicts(&mut self) {
+        // P2: a pick or revert that stopped is ended through the app, as the
+        // step says; it may stop without a conflict (the change is already
+        // there and the commit would be empty), then only abort is left.
+        if let Some((end, before)) = self.replay.take()
+            && self.twin_paused()
+        {
+            self.finish_replay(end, &before);
+            return;
+        }
         if !self.twin_obs.has_unmerged() {
             return;
         }
@@ -878,6 +936,98 @@ impl World {
         self.app.everything_changed();
         self.mark_ambiguous();
         self.refresh_twin();
+    }
+
+    /// The twin is stopped in a cherry-pick or a revert.
+    fn twin_paused(&self) -> bool {
+        ["CHERRY_PICK_HEAD", "REVERT_HEAD"]
+            .iter()
+            .any(|name| self.twin.git(&["rev-parse", "-q", "--verify", name]).ok)
+    }
+
+    /// P2: ends a paused cherry-pick or revert in both repos. Abort must
+    /// restore everything; resolving every file and continuing must make
+    /// one commit and leave an undo point that stops there.
+    fn finish_replay(&mut self, end: ReplayEnd, before: &Observed) {
+        let verb = if self
+            .twin
+            .git(&["rev-parse", "-q", "--verify", "REVERT_HEAD"])
+            .ok
+        {
+            "revert"
+        } else {
+            "cherry-pick"
+        };
+        let unresolved: Vec<String> = self
+            .app
+            .state
+            .fresh_disk()
+            .and_then(|disk| disk.phase.conflicts())
+            .map(|conflicts| {
+                conflicts
+                    .unresolved()
+                    .map(|(path, _)| path.0.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if end == ReplayEnd::Resolve && !unresolved.is_empty() {
+            stat(&format!("{verb} conflict: resolved and continued"));
+            let before_continue = self.twin_snap();
+            let tree_var = format!("T{}", self.trees);
+            self.trees += 1;
+            for path in &unresolved {
+                let text = "resolved by the harness\n";
+                self.script.push(write_line(path, text));
+                self.app.repo.write(path, text);
+                self.twin.write(path, text);
+                self.app.disk_changed(&[Area::Worktree]);
+                let outcome = self.app.request(Event::ResolveFileRequested {
+                    path: RepoPath(path.clone()),
+                    choice: invoke_core::ResolveChoice::Manual,
+                });
+                assert_eq!(outcome, Outcome::Succeeded, "resolving {path}");
+                let add = self.twin_git(&TwinOp::git(&["add", "--", path]));
+                assert!(add.ok, "twin: git add failed: {}", add.stderr);
+            }
+            let outcome = self.app.request(Event::ContinueRequested);
+            let twin = self.twin_git(&TwinOp::git(&[
+                "-c",
+                "core.editor=true",
+                verb,
+                "--continue",
+            ]));
+            match outcome {
+                Outcome::Succeeded => {
+                    assert!(
+                        twin.ok,
+                        "the app continued the {verb} but git failed: {}",
+                        twin.stderr
+                    );
+                    self.refresh_twin();
+                    self.push_entry(before_continue, tree_var, Hint::Continued, None);
+                    return;
+                }
+                // The resolution left nothing to commit: git stays paused
+                // too, and only abort is left.
+                Outcome::Failed(_) if !twin.ok => {}
+                other => panic!(
+                    "continuing the {verb}: the app answered {other:?}, git {} ({})",
+                    twin.ok, twin.stderr
+                ),
+            }
+        }
+        stat(&format!("{verb} stopped: aborted"));
+        let outcome = self.app.request(Event::AbortRequested);
+        assert_eq!(outcome, Outcome::Succeeded, "aborting the {verb}");
+        let abort = self.twin_git(&TwinOp::git(&[verb, "--abort"]));
+        assert!(abort.ok, "twin: {verb} --abort failed: {}", abort.stderr);
+        self.refresh_twin();
+        // Law 13: abort puts the repo back exactly. (An undo may now be
+        // refused over a rewritten index file the model cannot see.)
+        if let Some(difference) = first_difference(&self.twin_obs, before) {
+            panic!("law 13: aborting the {verb} did not restore the repo: {difference}");
+        }
+        self.mark_ambiguous();
     }
 
     // ---- the undo model ---------------------------------------------------
@@ -909,9 +1059,10 @@ impl World {
                 Kind::StashDrop { id, message }
             }
             Hint::StashDrop { .. } => Kind::Irreversible,
-            Hint::Commit => Kind::Refs {
+            Hint::Commit | Hint::Replay => Kind::Refs {
                 index_dependent: true,
             },
+            Hint::Continued => Kind::Irreversible,
             Hint::Other => Kind::Refs {
                 index_dependent: before.index_tree != after.index_tree,
             },

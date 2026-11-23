@@ -1107,18 +1107,27 @@ fn a_pick_git_turns_down_changes_nothing() {
     );
     assert_eq!(*app.phase(), Phase::Clean);
     assert_eq!(fx.picture(), before);
-    // Staged changes in the way: git refuses and the repo stays as it was.
-    fx.write("a.txt", "staged\n");
-    fx.git(&["add", "a.txt"]);
-    let before = fx.picture();
-    app.refresh();
-    let outcome = app.request(Event::CherryPickRequested(oid(&fx, "topic")));
-    assert!(
-        matches!(outcome, Outcome::Failed(ErrorClass::Expected, _)),
-        "{outcome:?}"
-    );
-    assert_eq!(*app.phase(), Phase::Clean);
-    assert_eq!(fx.picture(), before);
+    // Changes to tracked files (staged or not) are refused by the core, so
+    // an abort can never rewrite an edit; untracked files do not matter.
+    for stage in [true, false] {
+        fx.write("a.txt", "edited\n");
+        if stage {
+            fx.git(&["add", "a.txt"]);
+        }
+        let before = fx.picture();
+        app.refresh();
+        for event in [
+            Event::CherryPickRequested(oid(&fx, "topic")),
+            Event::RevertRequested(oid(&fx, "HEAD")),
+        ] {
+            assert_eq!(
+                app.request(event),
+                Outcome::Refused(Refusal::UncommittedChanges)
+            );
+        }
+        assert_eq!(fx.picture(), before);
+        fx.git(&["checkout", "-q", "HEAD", "--", "a.txt"]);
+    }
 }
 
 #[test]
