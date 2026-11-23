@@ -1,71 +1,39 @@
 # Invoke Git — agent guide
 
-Invoke Git is a fast, native desktop git client (a GitKraken alternative without the bloat) with a first-class review step before every push. Rust end to end, UI in GPUI. Windows first; macOS and Linux builds are on hold, but core tests run on all three.
+Fast, native desktop git client with a first-class pre-push review step. **Stack:** Rust (edition 2024), GPUI (pinned in `README.md`), `gix` (reads), system `git` CLI ≥ 2.40 (writes/network/hooks), tree-sitter, `notify`, `rusqlite` (bundled), `proptest`, `criterion`. Windows first; macOS/Linux builds on hold, core tests run on all three.
 
 ## Source of truth
 
-Read only the docs for your task areas:
-
-- Diff or staging → `docs/spec/diff-engine.md`
-- Graph or history → `docs/spec/commit-graph.md`
-- State, shell, undo or errors → `docs/spec/core-design.md`
-- Test changes → `docs/spec/verification.md`
-- UI → `docs/design/tokens.json` and the matching `docs/design/screens/*.dc.html`
-
-Always read your task file and its cited PRD laws. For doc/code disagreements, follow Handoff.
-
-| Doc | What it decides |
-| --- | --- |
-| `docs/PRD.md` | Scope, goals, non-goals, laws, performance budgets, decisions |
-| `docs/PLAN.md` | Phases, the Phase 0 spike checklist, the v0.1 backlog in dependency order |
-| `docs/spec/core-design.md` | Crates, `State` / `Event` / `Command`, repo-state detection, shell, undo, errors |
-| `docs/spec/diff-engine.md` | Diff algorithm, data model, word diff, line staging, highlighting |
-| `docs/spec/commit-graph.md` | Paging, lane assignment, rendering, edge cases |
-| `docs/spec/verification.md` | Laws → tests, model-based harness, Quint, Kani, CI matrix |
-| `docs/design/tokens.json`, `docs/design/README.md` | Colours, type, spacing, radii, sizes and their usage rules |
-| `docs/design/screens/*.dc.html` | Reference mockups for History, Changes, Pre-push review, Conflict |
+Read only the docs for your phase area (`tasks/` and `docs/PLAN-v0.1-archive.md` are historical archives):
+- Scope, 14 laws, perf budgets, build-vs-library → `docs/PRD.md`
+- Diff/staging → `docs/spec/diff-engine.md` | Graph/history → `docs/spec/commit-graph.md`
+- State/shell/undo/errors → `docs/spec/core-design.md` | Tests/laws → `docs/spec/verification.md`
+- UI → `docs/design/tokens.json`, `docs/design/README.md`, `docs/design/screens/*.dc.html`
 
 ## Architecture rules (do not break)
 
-1. **Pure core.** `core`, `diff`, `graph`, `highlight` do no IO: no filesystem, network, clock, threads or randomness. Logic is `step(state, event) -> (state, commands)`.
-2. **IO only in `shell`.** It runs commands and turns every outcome into an event. No business logic there.
-3. **Reads through `gix`, writes and network through the system git CLI** (≥ 2.40). Never implement push, fetch, merge or rebase on gix.
-4. **Disk is the source of truth.** A watcher event triggers a fresh read; never patch state from memory.
-5. **Every write carries what it expects to find** (index id, ref value) and is refused if disk changed.
-6. **Phases are enums, not booleans.** Make impossible states unrepresentable.
-7. **UI only renders state** and sends events. Colours, sizes and spacing come from the `tokens` crate, never hard-coded.
-8. **GPUI stays pinned** to the revision recorded in `README.md`. Update it only when asked, in its own commit.
+1. **Pure core.** `core`, `diff`, `graph`, `highlight` do no IO (no fs, network, clock, threads, randomness); logic is `step(state, event) -> (state, commands)`.
+2. **IO only in `shell`** (no business logic). Reads through `gix`; writes, network, and hooks through system `git` CLI (≥ 2.40).
+3. **Disk is source of truth.** Watcher events trigger a fresh read; never patch state from memory.
+4. **Expected-state guards.** Every write carries expected `index` id / ref value and refuses if disk changed or `index.lock` is held.
+5. **Phases are enums, not booleans.** Make impossible states unrepresentable.
+6. **UI only renders state** and sends events. Colours, sizes, and spacing come from `crates/tokens`, never hard-coded.
+7. **GPUI stays pinned** to the revision in `README.md`; update only when asked, in its own commit.
 
-## Laws and tests
+## Commands (build / lint / test / bench)
 
-- The 14 laws in `docs/PRD.md` are the contract. Each has one owning test (see `docs/spec/verification.md`).
-- New logic in a pure crate gets property tests (`proptest`). Prove each new test can fail by breaking the code once.
-- Tests use only generated fixture repos in temp folders and never touch the user's real repositories. Normal git (commit, branch, worktree) in this project's own checkout is fine.
-- Benchmarks (`criterion`) guard the performance budgets; a regression past budget is a failure.
+- Iterate: `cargo check -p <crate>` | `cargo test -p <crate>`
+- Full verification (fmt, clippy `-D warnings`, tests): `cargo xtask check` (auto-skips UI on headless Linux) or `cargo xtask check --core`
+- Performance budgets: `cargo xtask bench-check` (core) | `cargo xtask bench-check --ui` (Windows)
 
-## Working style
+## Laws, environment & conventions
 
-- Check your environment first. On the headless VPS (Linux, no display): never build or run the `ui` or `app` crates, and never claim a UI change works. On the Windows laptop: you may run `cargo check` on `ui` and `app`, but you still cannot see the window, so UI tasks end with a checklist for me to verify by running the app.
-- A task branch is owned by one machine at a time. Never commit to a branch another machine is working on.
-- Before calling a task done, run `cargo xtask check`.
-- While iterating, use `cargo check -p <crate>` or `cargo test -p <crate>`.
-- Do not add dependencies beyond the PRD's build-vs-library table without asking.
-- Windows matters most: watch for path length, case-insensitive paths, CRLF and file locking.
-
-## Handoff
-
-- Do only the task in `tasks/NNN.md` and say its backlog number.
-- Write `tasks/NNN.DONE.md` with what changed, what is unfinished and anything surprising.
-- For spec gaps or doc/code disagreements, record the question and proposed answer in DONE.md. Finish unblocked work, commit and stop. Do not guess silently.
-- UI tasks end at compile-ready plus a Windows checklist in DONE.md. Include exact commands and checks. Never claim a UI change works.
-
-## Out of scope (non-goals)
-
-No account or login wall, no cloud features, no telemetry, no AI features, no issue boards, no code editor. A terminal panel may come later; do not build it now.
-
-## Commits
-
-Conventional, imperative subject under 72 characters (`diff: add histogram fallback to Myers`), body explaining why. Reference the backlog task number.
+- **Laws & tests:** Each of the 14 PRD laws has one owning test (`docs/spec/verification.md`). New pure logic gets `proptest` (prove each test can fail once). Tests use generated temp fixtures only and never touch real user repos; normal git in this checkout is fine. Benchmark regressions past `docs/perf-budgets.toml` fail CI.
+- **Dependencies:** Do not add crates beyond the `docs/PRD.md` build-vs-library table without asking.
+- **Headless VPS vs Windows:** On headless Linux (no display), never build or run `ui`, `app`, or `spike-*`, and never claim a UI change works; verify core DoD with `cargo xtask check --core` and put a Windows verification checklist in the phase's `Handoff notes`. On Windows, watch for path length, case-insensitive paths, CRLF, and file locking. One machine owns a branch at a time.
+- **Spec gaps:** Record the question and proposed answer in the phase's `Handoff notes`, finish unblocked work, commit, and stop; do not guess silently.
+- **Non-goals:** No login wall, cloud sync, telemetry, AI features, issue boards, code editor, or embedded terminal.
+- **Commits:** Conventional, imperative subject < 72 chars (`diff: add histogram fallback to Myers`), body explaining why, reference the phase ID (e.g. `P1b`).
 
 <!-- repo-playbook:start (dikelola oleh repo-playbook/install.sh; jangan edit manual) -->
 ## Workflow per fase
