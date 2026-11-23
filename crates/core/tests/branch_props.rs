@@ -398,7 +398,10 @@ impl Sim {
             | GitArgs::ResolveStage { .. }
             | GitArgs::Continue { .. }
             | GitArgs::Skip { .. }
-            | GitArgs::Abort { .. } => {
+            | GitArgs::Abort { .. }
+            // P2.
+            | GitArgs::CherryPick { .. }
+            | GitArgs::Revert { .. } => {
                 panic!("no commits, stashes or remotes in this simulation")
             }
         }

@@ -300,6 +300,9 @@ pub enum Action {
     Continue,
     Skip,
     Abort,
+    // P2.
+    CherryPick,
+    Revert,
     // Task 17: the user asked to remove a leftover `index.lock`.
     RemoveLock,
 }

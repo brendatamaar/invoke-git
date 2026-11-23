@@ -67,6 +67,17 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         Event::ContinueRequested => request_conflict(&mut state, Action::Continue, |operation| {
             Ok(WriteRequest::Continue { operation })
         }),
+        // P2: a single-commit pick or revert onto the `HEAD` the user sees.
+        Event::CherryPickRequested(commit) => {
+            request_replay(&mut state, Action::CherryPick, commit, |commit, onto| {
+                WriteRequest::CherryPick { commit, onto }
+            })
+        }
+        Event::RevertRequested(commit) => {
+            request_replay(&mut state, Action::Revert, commit, |commit, onto| {
+                WriteRequest::Revert { commit, onto }
+            })
+        }
         Event::SkipRequested => request_conflict(&mut state, Action::Skip, |operation| {
             if operation.can_skip() {
                 Ok(WriteRequest::Skip { operation })
@@ -325,6 +336,9 @@ fn is_conflict_flow(request: &WriteRequest) -> bool {
             | WriteRequest::Continue { .. }
             | WriteRequest::Skip { .. }
             | WriteRequest::Abort { .. }
+            // P2: git stops half way if killed; it is local and quick.
+            | WriteRequest::CherryPick { .. }
+            | WriteRequest::Revert { .. }
     )
 }
 
@@ -714,6 +728,59 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     continue;
                 }
             },
+            // P2. Starting needs a clean repo with a commit to build on, and
+            // the `HEAD` the user saw (law 9). A clean result is one commit
+            // on `HEAD`, undone like a commit (refs and index). A conflict
+            // is not a failure of the request: git is paused, the point is
+            // dropped, and the conflict flow takes over (abort is the way back).
+            WriteRequest::CherryPick { commit, onto } | WriteRequest::Revert { commit, onto } => {
+                let (action, verb, args) = if matches!(request, WriteRequest::CherryPick { .. }) {
+                    (
+                        Action::CherryPick,
+                        "Cherry-pick",
+                        GitArgs::CherryPick {
+                            commit: commit.clone(),
+                        },
+                    )
+                } else {
+                    (
+                        Action::Revert,
+                        "Revert",
+                        GitArgs::Revert {
+                            commit: commit.clone(),
+                        },
+                    )
+                };
+                if disk.phase != Phase::Clean {
+                    refuse_because(state, action, Refusal::RepoBusy);
+                    continue;
+                }
+                if matches!(disk.head, Head::Unborn(_)) {
+                    refuse_because(state, action, Refusal::Branch(BranchRefusal::NoCommitsYet));
+                    continue;
+                }
+                if HeadTarget::of(&disk.head) != *onto {
+                    refuse_because(state, action, Refusal::BranchChanged);
+                    continue;
+                }
+                let short: String = commit.to_string().chars().take(7).collect();
+                let point = UndoPoint {
+                    op: id,
+                    label: format!("{verb} {short}"),
+                    head: HeadTarget::of(&disk.head),
+                    refs: vec![head_ref(&disk.head)],
+                    index: expect.index.clone(),
+                    index_effect: IndexEffect::Rewrites,
+                    reverse: Reversal::Refs,
+                };
+                commands.push(Command::SnapshotForUndo(point.clone()));
+                commands.push(Command::RunGit {
+                    op: id,
+                    args,
+                    expect,
+                });
+                state.undo.pending = UndoPending::Recording { point };
+            }
             WriteRequest::Undo => match undo::plan(&state.undo, &disk, id) {
                 Ok(replay) => {
                     if let Some(entry) = state.undo.entries.pop_back() {
@@ -902,6 +969,23 @@ fn request_conflict(
     match make(operation) {
         Ok(request) => enqueue(state, request),
         Err(reason) => refuse_conflict(state, action, reason),
+    }
+}
+
+/// P2: queues a cherry-pick or revert onto the `HEAD` of the snapshot the
+/// user is looking at.
+fn request_replay(
+    state: &mut RepoState,
+    action: Action,
+    commit: Oid,
+    make: impl FnOnce(Oid, HeadTarget) -> WriteRequest,
+) {
+    match state.snapshot.disk() {
+        None => refuse_because(state, action, Refusal::NotRead),
+        Some(disk) => {
+            let onto = HeadTarget::of(&disk.head);
+            enqueue(state, make(commit, onto));
+        }
     }
 }
 

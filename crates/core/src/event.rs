@@ -49,6 +49,10 @@ pub enum Event {
         choice: ResolveChoice,
     },
     ContinueRequested,
+    // P2: single-commit cherry-pick and revert of the commit with this id,
+    // onto the `HEAD` in the snapshot at the moment of the request.
+    CherryPickRequested(Oid),
+    RevertRequested(Oid),
     SkipRequested,
     AbortRequested,
     OpCancelRequested(OpId),
