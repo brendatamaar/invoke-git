@@ -12,8 +12,14 @@
 //! nightly job uses 10000) and `INVOKE_HARNESS_STEPS` the longest sequence.
 //! The sequences are split over two tests so both cores of a CI runner work.
 
-use harness::model::{Harness, config, steps};
+use harness::model::{TestEditor, config, steps};
 use proptest_state_machine::prop_state_machine;
+
+struct Editor;
+impl TestEditor for Editor {
+    const PROGRAM: &'static str = env!("CARGO_BIN_EXE_harness-rebase-editor");
+}
+type Harness = harness::model::Harness<Editor>;
 
 /// The first half of the sequences (the law-ownership table names this one).
 mod first_half {
@@ -35,5 +41,49 @@ mod second_half {
 
         #[test]
         fn model_based_sequences_second_half(sequential 1..steps() => Harness);
+    }
+}
+
+#[test]
+fn interactive_rebase_pauses_and_restores_the_twin() {
+    use harness::content::{Change, Eol};
+    use harness::transition::{RebaseEnd, RebaseShape, Transition};
+    use harness::world::World;
+
+    for (shape, end) in [
+        (RebaseShape::Edit, RebaseEnd::Abort),
+        (RebaseShape::Reorder, RebaseEnd::Abort),
+        (RebaseShape::Reorder, RebaseEnd::Continue),
+        (RebaseShape::Reorder, RebaseEnd::Skip),
+    ] {
+        let mut world = World::with_rebase_editor(Some(std::path::Path::new(Editor::PROGRAM)));
+        for text in ["first", "second"] {
+            world.step(Transition::WriteFile {
+                file: 0,
+                change: Change::Whole {
+                    lines: vec![text.into()],
+                    eol: Eol::Lf,
+                    final_newline: true,
+                },
+            });
+            world.step(Transition::OutsideCommitAll {
+                message: text.into(),
+            });
+        }
+        world.step(Transition::WhileLocked(Box::new(
+            Transition::InteractiveRebase {
+                count: 2,
+                shape,
+                end,
+            },
+        )));
+        assert_eq!(
+            world.twin.git(&["log", "-1", "--format=%s"]).text(),
+            "second"
+        );
+        assert_eq!(
+            world.twin.git(&["diff", "--cached", "--name-only"]).text(),
+            ""
+        );
     }
 }

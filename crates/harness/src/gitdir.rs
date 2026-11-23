@@ -122,19 +122,24 @@ impl RepoDir {
     }
 
     pub fn git(&self, args: &[&str]) -> Run {
-        self.run(args, None)
+        self.run(args, None, &[])
     }
 
     pub fn git_stdin(&self, args: &[&str], stdin: &[u8]) -> Run {
-        self.run(args, Some(stdin))
+        self.run(args, Some(stdin), &[])
     }
 
-    fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Run {
+    pub fn git_with_env(&self, args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> Run {
+        self.run(args, None, env)
+    }
+
+    fn run(&self, args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &std::ffi::OsStr)]) -> Run {
         let mut command = Command::new("git");
         command
             .args(args)
             .current_dir(&self.paths.workdir)
             .envs(self.env.iter().map(|(key, value)| (key, value)))
+            .envs(env.iter().copied())
             // Looking must not write: no opportunistic index refresh.
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0")

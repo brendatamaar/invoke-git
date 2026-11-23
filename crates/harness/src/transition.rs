@@ -48,6 +48,22 @@ pub enum ReplayEnd {
     Resolve,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum RebaseShape {
+    Reorder,
+    Squash,
+    Fixup,
+    Edit,
+    Drop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebaseEnd {
+    Abort,
+    Continue,
+    Skip,
+}
+
 /// One step of a sequence. The names line up with the Quint specs in
 /// `specs/` (`stage`, `commit`, `outside_commit`, `hold_lock`, ...).
 #[derive(Clone, Debug)]
@@ -136,6 +152,11 @@ pub enum Transition {
         revert: bool,
         end: ReplayEnd,
     },
+    InteractiveRebase {
+        count: usize,
+        shape: RebaseShape,
+        end: RebaseEnd,
+    },
     Undo,
     Refresh,
     // Plain git or the filesystem behind the app's back.
@@ -168,6 +189,7 @@ impl Transition {
                 | Transition::StashPop { .. }
                 | Transition::StashDrop { .. }
                 | Transition::Replay { .. }
+                | Transition::InteractiveRebase { .. }
                 | Transition::Undo
         )
     }
@@ -242,6 +264,17 @@ fn app_write() -> impl Strategy<Value = Transition> {
                 end: if resolve { ReplayEnd::Resolve } else { ReplayEnd::Abort },
             }
         }),
+        5 => (
+            2..=5usize,
+            prop_oneof![
+                Just(RebaseShape::Reorder),
+                Just(RebaseShape::Squash),
+                Just(RebaseShape::Fixup),
+                Just(RebaseShape::Edit),
+                Just(RebaseShape::Drop),
+            ],
+            prop_oneof![Just(RebaseEnd::Abort), Just(RebaseEnd::Continue), Just(RebaseEnd::Skip)],
+        ).prop_map(|(count, shape, end)| Transition::InteractiveRebase { count, shape, end }),
         4 => Just(Transition::Undo),
     ]
 }

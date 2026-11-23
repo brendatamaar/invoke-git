@@ -33,6 +33,8 @@ The harness generates random sequences of user and outside actions, runs each on
 - Stage / unstage / discard a random selection (file, hunk or lines)
 - Commit, amend, create / switch / delete branch, stash save / pop
 - Undo the last operation (on the twin, undo restores a copy of the twin's refs and index saved before that step)
+- Cherry-pick and revert commits, resolving and continuing or aborting when Git pauses
+- Interactive rebase of linear commit ranges, including reordered commits, squash, fixup, edit and drop. Compare every Git pause, drive continue/skip/abort, and undo successful rebases
 - "Outside" actions run by plain git or the filesystem behind the app's back: `git commit -am`, `git checkout`, holding `index.lock` for a while
 
 **After every step, compare**
