@@ -180,3 +180,35 @@ fn a_running_abort_waits_for_a_git_pause() {
         }]
     ));
 }
+
+#[test]
+fn plan_rejects_upstream_in_steps_and_branch_changed_clears_stale_head() {
+    assert_eq!(
+        RebasePlan::new(oid(1), vec![(oid(1), RebaseAction::Pick)]),
+        Err(PlanError::ContainsUpstream)
+    );
+
+    let (state, _) = editing(1);
+    let (state, refresh) = step(state, Event::RefreshRequested);
+    let (state, _) = read(state, &refresh, disk(2));
+    let (state, commands) = step(state, Event::RebaseStartRequested);
+    assert!(commands.is_empty());
+    assert_eq!(state.rebase, RebaseState::Idle);
+    assert!(matches!(
+        state.notice,
+        Some(Notice::Refused {
+            reason: Refusal::BranchChanged,
+            ..
+        })
+    ));
+
+    // A fresh edit after BranchChanged binds to the new HEAD and starts cleanly.
+    let plan = RebasePlan::new(oid(0), vec![(oid(2), RebaseAction::Pick)]).unwrap();
+    let (state, _) = step(state, Event::RebasePlanEdited(plan));
+    let (_, commands) = step(state, Event::RebaseStartRequested);
+    assert!(matches!(
+        commands.as_slice(),
+        [Command::SnapshotForUndo(_), Command::RunGit { args: GitArgs::InteractiveRebase(_), expect, .. }]
+            if expect.head == disk(2).head
+    ));
+}

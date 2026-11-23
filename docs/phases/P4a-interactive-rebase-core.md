@@ -33,6 +33,7 @@ Mengimplementasikan state machine & eksekusi shell untuk interactive rebase (reo
 - Tes target `rebase_props` (5), `rebase` (5), dan `model_based` (4, smoke 16 urutan acak) lulus. Regresi P2 `conflict_props` (24) dan `conflicts` (27) juga lulus. Semua perintah Cargo memakai target bersama, dev debug 0, dan dua build jobs.
 - Tiga proptest baru masing-masing gagal ketika validasi target squash/fixup, guard HEAD, dan transfer snapshot undo sengaja dirusak. Ketiganya lulus lagi setelah perubahan percobaan dipulihkan.
 - Self-review menemukan kebutuhan guard ref branch asal saat HEAD detached pada pause dan guard lock sebelum snapshot undo. Keduanya ditambahkan bersama regresi untuk perubahan ref eksternal, origin marker kedua backend, dan abort setelah amend isi file.
+- Review silang (`antigravity/gemini-4-neon`, verdict `APPROVE_WITH_MINOR_FIXES`): semua 3 temuan diperbaiki langsung di `main` — (1) reset `state.rebase = RebaseState::Idle` saat `Refusal::BranchChanged` agar edit ulang mengikat ke `HEAD` baru, (2) prioritaskan `AbortAtPause` ke depan antrean (`enqueue_front`), (3) tolak `upstream` di dalam `steps` langsung di `RebasePlan::new` (`PlanError::ContainsUpstream`) beserta tes regresi di `rebase_props.rs`.
 
 ### Checklist Windows
 - [ ] Bangun `invoke-rebase-editor.exe` dengan `cargo build -p shell --bin invoke-rebase-editor` dan tempatkan di direktori yang sama dengan executable app.

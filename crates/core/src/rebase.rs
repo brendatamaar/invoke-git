@@ -31,6 +31,7 @@ pub struct RebasePlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanError {
     Empty,
+    ContainsUpstream,
     DuplicateCommit,
     MissingSquashTarget,
 }
@@ -41,6 +42,9 @@ impl RebasePlan {
     pub fn new(upstream: Oid, steps: Vec<(Oid, RebaseAction)>) -> Result<Self, PlanError> {
         if steps.is_empty() {
             return Err(PlanError::Empty);
+        }
+        if steps.iter().any(|(commit, _)| commit == &upstream) {
+            return Err(PlanError::ContainsUpstream);
         }
         let mut commits = BTreeSet::new();
         if steps.iter().any(|(commit, _)| !commits.insert(commit)) {

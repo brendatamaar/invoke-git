@@ -356,6 +356,15 @@ fn enqueue(state: &mut RepoState, request: WriteRequest) {
     }
 }
 
+fn enqueue_front(state: &mut RepoState, request: WriteRequest) {
+    let id = state.ops.next;
+    state.ops.next = OpId(id.0.saturating_add(1));
+    state.ops.queued.push_front(QueuedOp { id, request });
+    if matches!(state.notice, Some(Notice::Refused { .. })) {
+        state.notice = None;
+    }
+}
+
 fn running_mut(state: &mut RepoState, op: OpId) -> Option<&mut RunningOp> {
     state
         .ops
@@ -536,7 +545,7 @@ fn settle_rebase(state: &mut RepoState, commands: &mut Vec<Command>) {
         other => other,
     };
     if let Some(operation) = requested_abort {
-        enqueue(state, WriteRequest::Abort { operation });
+        enqueue_front(state, WriteRequest::Abort { operation });
     }
 }
 
@@ -964,9 +973,13 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                 let origin = match result {
                     Ok(origin) => origin,
                     Err(reason) => {
-                        state.rebase = RebaseState::Editing {
-                            plan: plan.clone(),
-                            head: head.clone(),
+                        state.rebase = if matches!(reason, Refusal::BranchChanged) {
+                            RebaseState::Idle
+                        } else {
+                            RebaseState::Editing {
+                                plan: plan.clone(),
+                                head: head.clone(),
+                            }
                         };
                         refuse_because(state, Action::InteractiveRebase, reason);
                         continue;
