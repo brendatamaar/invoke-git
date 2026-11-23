@@ -26,6 +26,9 @@ pub struct RepoState {
 }
 
 /// What is known about the disk.
+// One value per open repo, almost always `Read`: boxing the snapshot would
+// only add an indirection to every access.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Snapshot {
     /// Nothing read yet (the repo was just opened).
