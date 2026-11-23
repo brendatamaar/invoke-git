@@ -125,3 +125,36 @@ jobs:
 
       - name: Benchmarks against the performance budgets
         run: cargo xtask bench-check
+
+  # Backlog task 25, the UI half: the same check with the benchmarks of the
+  # `ui` crate (the status tree's rows and the diff viewer's rows). They need
+  # GPUI built, so they run on Windows, in a job of their own that builds in
+  # release mode (a cold build was not timed when this was written: see
+  # tasks/025.DONE.md).
+  bench-ui:
+    name: Benchmarks (windows-latest, ui)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: windows-bench-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-bench-
+
+      - name: Benchmarks against the performance budgets, with the UI crate
+        run: cargo xtask bench-check --ui

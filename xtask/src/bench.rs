@@ -139,6 +139,19 @@ pub fn evaluate(budgets: &Budgets, measured: &BTreeMap<String, f64>) -> Report {
     Report { lines, failures }
 }
 
+/// The benchmarks of the `ui` crate need GPUI built, so they run only with
+/// `--ui` (Windows); without it their ceilings are not asked for.
+const UI_GROUP: &str = "ui/";
+
+/// The ceilings that apply to this run.
+pub fn applicable(budgets: &Budgets, with_ui: bool) -> Budgets {
+    budgets
+        .iter()
+        .filter(|(name, _)| with_ui || !name.starts_with(UI_GROUP))
+        .map(|(name, ms)| (name.clone(), *ms))
+        .collect()
+}
+
 /// Reads every `<home>/<group>/<name>/new/estimates.json` into milliseconds.
 fn read_measurements(home: &Path) -> Result<BTreeMap<String, f64>, String> {
     let mut measured = BTreeMap::new();
@@ -171,11 +184,11 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-pub fn bench_check() -> Result<(), String> {
+pub fn bench_check(with_ui: bool) -> Result<(), String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let text = fs::read_to_string(root.join(BUDGETS_FILE))
         .map_err(|error| format!("read {BUDGETS_FILE} failed: {error}"))?;
-    let budgets = parse_budgets(&text)?;
+    let budgets = applicable(&parse_budgets(&text)?, with_ui);
 
     // Timings are only meaningful when no other build competes for the
     // cores, so share the lock `cargo xtask check` takes.
@@ -202,11 +215,18 @@ pub fn bench_check() -> Result<(), String> {
     command
         .current_dir(&root)
         .env("CRITERION_HOME", &home)
-        .args(["bench", "-p", "diff", "-p", "graph", "--benches"]);
+        .args(["bench", "-p", "diff", "-p", "graph"]);
+    if with_ui {
+        command.args(["-p", "ui"]);
+    }
+    command.arg("--benches");
     if cfg!(target_os = "linux") && env::var_os("CARGO_BUILD_JOBS").is_none() {
         command.env("CARGO_BUILD_JOBS", "2");
     }
-    eprintln!("xtask: cargo bench (diff, graph)");
+    eprintln!(
+        "xtask: cargo bench (diff, graph{})",
+        if with_ui { ", ui" } else { "" }
+    );
     let status = command
         .status()
         .map_err(|error| format!("cargo bench failed: {error}"))?;
@@ -292,6 +312,23 @@ mod tests {
         let slow = evaluate(&budgets, &measured(&[("diff/a", 50.1), ("graph/b", 0.1)]));
         assert_eq!(slow.failures, 1);
         assert!(slow.lines[0].starts_with("FAIL diff/a"), "{:?}", slow.lines);
+    }
+
+    #[test]
+    fn ui_ceilings_apply_only_when_the_ui_benchmarks_run() {
+        let budgets = parse_budgets(
+            "[budgets_ms]
+\"diff/a\" = 5
+\"ui/tree\" = 7
+",
+        )
+        .unwrap();
+        let without = applicable(&budgets, false);
+        assert_eq!(without.keys().collect::<Vec<_>>(), vec!["diff/a"]);
+        assert_eq!(applicable(&budgets, true).len(), 2);
+        // A run without `--ui` that still produced a ui measurement fails.
+        let report = evaluate(&without, &measured(&[("diff/a", 1.0), ("ui/tree", 1.0)]));
+        assert_eq!(report.failures, 1);
     }
 
     #[test]

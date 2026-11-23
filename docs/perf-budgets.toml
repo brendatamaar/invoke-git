@@ -10,8 +10,8 @@
 # app on a mid-range Windows laptop; where it has none for a pure-crate step,
 # the ceiling is derived from one it does have, and says so.
 #
-# Benchmarks that wait for the UI (the diff viewer's first paint, the status
-# tree) are not here yet; they arrive with the rest of task 25.
+# The `ui/` benchmarks run only with `cargo xtask bench-check --ui` (they need
+# GPUI built); without the flag their ceilings are not asked for.
 
 [budgets_ms]
 
@@ -52,3 +52,27 @@
 # Derived: the lanes and edges for the 60 visible rows of one frame are
 # computed within that frame (16 ms).
 "graph/visible_window_60_wide" = 16
+
+# Stage a hunk. Source: PRD "stage a hunk to UI updated < 16 ms (within one
+# frame)". The pure part of it, building the patch for one hunk (or for three
+# lines of it) of a 50k-line diff; the rest of the budget is `git apply` and
+# the repaint, which are not benchmarked here.
+"diff/stage_hunk_50k_2k" = 16
+"diff/stage_lines_50k_2k" = 16
+
+# The UI crate's plain functions (`cargo xtask bench-check --ui`, Windows: they
+# need GPUI built, which the Linux benchmark job does not do).
+#
+# Source: PRD "status refresh after a file save, 100k-file repo < 100 ms". The
+# rows of the status tree for a status of 100k changed files are one step of
+# that refresh, so they must fit in the whole of it.
+"ui/tree_rows_100k" = 100
+# Derived: the tree for the 2k files a big change really touches is rebuilt
+# on every refresh and must fit in one frame (16 ms).
+"ui/tree_rows_2k" = 16
+# Derived: the rows of a 10k-line diff (split, unified, and the worst case in
+# which every line changed) are laid out within one frame; the diff itself is
+# `diff/open_10k_lines` against the 50 ms "first visible lines" budget.
+"ui/rows_split_10k" = 16
+"ui/rows_unified_10k" = 16
+"ui/rows_split_all_changed_10k" = 16

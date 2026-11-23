@@ -6480,6 +6480,7 @@ dependencies = [
 name = "ui"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "diff",
  "gpui",
  "gpui_platform",

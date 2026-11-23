@@ -18,10 +18,12 @@ fn main() -> ExitCode {
         [command, flag] if command == "check" && flag == "--core" => check(true),
         [command] if command == "fixtures" => write_fixtures(),
         // Benchmarks against the ceilings in docs/perf-budgets.toml (task 25).
-        [command] if command == "bench-check" => bench::bench_check(),
+        [command] if command == "bench-check" => bench::bench_check(false),
+        // Also the benchmarks of the `ui` crate (GPUI is built: Windows).
+        [command, flag] if command == "bench-check" && flag == "--ui" => bench::bench_check(true),
         _ => {
             eprintln!(
-                "Usage: cargo xtask check [--core] | cargo xtask fixtures | cargo xtask bench-check"
+                "Usage: cargo xtask check [--core] | cargo xtask fixtures | cargo xtask bench-check [--ui]"
             );
             return ExitCode::FAILURE;
         }

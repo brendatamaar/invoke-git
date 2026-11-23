@@ -16,3 +16,8 @@ highlight = { path = "../highlight" }
 [dev-dependencies]
 gpui_platform.workspace = true
 proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "ui"
+harness = false

@@ -177,6 +177,41 @@ fn benches(c: &mut Criterion) {
         b.iter(|| black_box(&done).hunks_with_context(black_box(10)))
     });
 
+    // PRD budget "stage a hunk to UI updated < 16 ms": the pure part of it,
+    // building the patch for one hunk (and for a few lines of it) of the big
+    // diff. The rest of the budget is `git apply` and the repaint.
+    let middle = done.hunks.len() / 2;
+    let spec = diff::PatchSpec {
+        path: "src/lib.rs",
+        direction: diff::Direction::Stage,
+        old_exists: true,
+        new_exists: true,
+        mode: diff::Mode::Regular,
+    };
+    let changed: Vec<usize> = done.hunks[middle]
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.kind != diff::LineKind::Context)
+        .map(|(index, _)| index)
+        .take(3)
+        .collect();
+    group.bench_function("stage_hunk_50k_2k", |b| {
+        b.iter(|| diff::build_patch(black_box(&done), &spec, &diff::Pick::Hunk(middle)))
+    });
+    group.bench_function("stage_lines_50k_2k", |b| {
+        b.iter(|| {
+            diff::build_patch(
+                black_box(&done),
+                &spec,
+                &diff::Pick::Lines {
+                    hunk: middle,
+                    lines: &changed,
+                },
+            )
+        })
+    });
+
     // Word diff of every modified pair, directly and through the hunks.
     group.bench_function("word_pairs_1k", |b| {
         b.iter(|| {
