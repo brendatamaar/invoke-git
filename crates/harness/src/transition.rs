@@ -39,6 +39,15 @@ pub enum Target {
     Detach,
 }
 
+/// What happens to a cherry-pick or revert that stops on a conflict (P2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayEnd {
+    /// Abort: the repo must be exactly as it was before.
+    Abort,
+    /// Resolve every file by hand, then continue.
+    Resolve,
+}
+
 /// One step of a sequence. The names line up with the Quint specs in
 /// `specs/` (`stage`, `commit`, `outside_commit`, `hold_lock`, ...).
 #[derive(Clone, Debug)]
@@ -120,6 +129,13 @@ pub enum Transition {
     StashDrop {
         entry: usize,
     },
+    /// P2: cherry-pick (or revert) the commit `commit` (modulo the commits
+    /// reachable from a branch or `HEAD`). A conflict is ended as `end` says.
+    Replay {
+        commit: usize,
+        revert: bool,
+        end: ReplayEnd,
+    },
     Undo,
     Refresh,
     // Plain git or the filesystem behind the app's back.
@@ -151,6 +167,7 @@ impl Transition {
                 | Transition::StashApply { .. }
                 | Transition::StashPop { .. }
                 | Transition::StashDrop { .. }
+                | Transition::Replay { .. }
                 | Transition::Undo
         )
     }
@@ -218,6 +235,13 @@ fn app_write() -> impl Strategy<Value = Transition> {
         1 => (0..4usize).prop_map(|entry| Transition::StashApply { entry }),
         1 => (0..4usize).prop_map(|entry| Transition::StashPop { entry }),
         1 => (0..4usize).prop_map(|entry| Transition::StashDrop { entry }),
+        3 => (0..16usize, any::<bool>(), any::<bool>()).prop_map(|(commit, revert, resolve)| {
+            Transition::Replay {
+                commit,
+                revert,
+                end: if resolve { ReplayEnd::Resolve } else { ReplayEnd::Abort },
+            }
+        }),
         4 => Just(Transition::Undo),
     ]
 }

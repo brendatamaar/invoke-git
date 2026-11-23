@@ -37,7 +37,10 @@ pub fn action_of(request: &WriteRequest) -> Option<Action> {
         | WriteRequest::ResolveFile { .. }
         | WriteRequest::Continue { .. }
         | WriteRequest::Skip { .. }
-        | WriteRequest::Abort { .. } => None,
+        | WriteRequest::Abort { .. }
+        // P2.
+        | WriteRequest::CherryPick { .. }
+        | WriteRequest::Revert { .. } => None,
     }
 }
 
@@ -210,7 +213,10 @@ fn check(
         | WriteRequest::ResolveFile { .. }
         | WriteRequest::Continue { .. }
         | WriteRequest::Skip { .. }
-        | WriteRequest::Abort { .. } => Err(Refusal::NotYetSupported { task: 15 }),
+        | WriteRequest::Abort { .. }
+        // P2.
+        | WriteRequest::CherryPick { .. }
+        | WriteRequest::Revert { .. } => Err(Refusal::NotYetSupported { task: 15 }),
     }
 }
 

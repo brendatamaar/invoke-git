@@ -18,8 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use invoke_core::{
     Action, BranchName, Command, ConflictKind, ConflictRefusal, Conflicts, ErrorClass, Event,
-    FileState, Irreversible, Notice, OpOutcome, Operation, Phase, PullMode, Refusal, RemoteBranch,
-    RepoId, RepoPath, RepoState, ResolveChoice, StageContent, open, step,
+    FileState, Irreversible, Notice, Oid, OpOutcome, Operation, Phase, PullMode, Refusal,
+    RemoteBranch, RepoId, RepoPath, RepoState, ResolveChoice, StageContent, open, step,
 };
 use shell::precondition::RepoPaths;
 use shell::undo::Snapshotted;
@@ -293,6 +293,7 @@ impl App {
                     }
                 }
             }
+            Command::ReplayUndo(replay) => self.deliver(self.undo.replay(&replay)),
             Command::PruneUndo(ops) => self.undo.prune(&ops),
             other => panic!("not driven here: {other:?}"),
         }
@@ -938,6 +939,236 @@ fn revert_conflicts_resolve_continue_and_abort() {
     assert_eq!(*app.phase(), Phase::Clean);
     assert_eq!(fx.git(&["log", "-1", "--format=%s"]), "Revert \"two\"");
     assert_eq!(fx.git(&["show", "HEAD:a.txt"]), "reverted by hand");
+}
+
+// --- P2: cherry-pick and revert started by the app ----------------------------
+
+fn oid(fx: &Fx, name: &str) -> Oid {
+    Oid::from_hex(&fx.rev(name)).unwrap()
+}
+
+/// `main` and `topic` both change a.txt from "base"; `topic` also adds b.txt.
+fn diverged(fx: &Fx) {
+    fx.commit("a.txt", "base\n", "base");
+    fx.git(&["branch", "side"]);
+    fx.git(&["switch", "-q", "-c", "topic"]);
+    fx.commit("a.txt", "topic\n", "topic change");
+    fx.git(&["switch", "-q", "main"]);
+    fx.commit("a.txt", "main\n", "main change");
+}
+
+/// Refs, `HEAD` and index entries (what law 8 restores).
+fn refs_and_index(fx: &Fx) -> (String, String, String) {
+    let p = fx.picture();
+    (p.refs, p.head, p.index)
+}
+
+#[test]
+fn a_clean_cherry_pick_commits_and_undo_restores_refs_and_index() {
+    let fx = Fx::new();
+    fx.commit("a.txt", "base\n", "base");
+    fx.git(&["branch", "side"]);
+    fx.git(&["switch", "-q", "-c", "topic"]);
+    fx.commit("b.txt", "new\n", "add b");
+    fx.git(&["switch", "-q", "main"]);
+    let before = refs_and_index(&fx);
+    let mut app = fx.app();
+    assert_eq!(
+        app.request(Event::CherryPickRequested(oid(&fx, "topic"))),
+        Outcome::Succeeded
+    );
+    assert_eq!(*app.phase(), Phase::Clean);
+    assert_eq!(fx.git(&["log", "-1", "--format=%s"]), "add b");
+    assert_eq!(fx.git(&["rev-list", "--count", "HEAD"]), "2");
+    // Law 9: no other branch moved.
+    assert_eq!(fx.rev("side"), fx.rev("HEAD~1"));
+    assert_eq!(app.request(Event::UndoRequested), Outcome::Succeeded);
+    assert_eq!(refs_and_index(&fx), before);
+}
+
+#[test]
+fn a_clean_revert_commits_and_undo_restores_refs_and_index() {
+    let fx = Fx::new();
+    fx.commit("a.txt", "1\n", "one");
+    fx.commit("b.txt", "x\n", "two");
+    let before = refs_and_index(&fx);
+    let mut app = fx.app();
+    assert_eq!(
+        app.request(Event::RevertRequested(oid(&fx, "HEAD"))),
+        Outcome::Succeeded
+    );
+    assert_eq!(fx.git(&["log", "-1", "--format=%s"]), "Revert \"two\"");
+    assert!(!fx.dir.join("b.txt").exists());
+    assert_eq!(app.request(Event::UndoRequested), Outcome::Succeeded);
+    assert_eq!(refs_and_index(&fx), before);
+}
+
+#[test]
+fn a_conflicting_cherry_pick_pauses_aborts_whole_and_resolves_to_a_commit() {
+    let fx = Fx::new();
+    diverged(&fx);
+    let before = fx.picture();
+    let mut app = fx.app();
+    let topic = oid(&fx, "topic");
+    let outcome = app.request(Event::CherryPickRequested(topic.clone()));
+    assert!(
+        matches!(outcome, Outcome::Failed(ErrorClass::Expected, _)),
+        "{outcome:?}"
+    );
+    assert!(matches!(app.phase(), Phase::CherryPicking { .. }));
+    assert_eq!(app.unresolved(), ["a.txt"]);
+    // The failed start left no undo point, and nothing new starts meanwhile.
+    assert!(app.state.undo.entries.is_empty());
+    assert_eq!(
+        app.request(Event::CherryPickRequested(topic.clone())),
+        Outcome::Refused(Refusal::RepoBusy)
+    );
+    assert_eq!(
+        app.request(Event::RevertRequested(topic.clone())),
+        Outcome::Refused(Refusal::RepoBusy)
+    );
+    // Continue is blocked until the file is resolved.
+    assert_eq!(
+        app.continue_(),
+        refused(ConflictRefusal::Unresolved { remaining: 1 })
+    );
+    // Abort restores everything exactly.
+    assert_eq!(app.request(Event::AbortRequested), Outcome::Succeeded);
+    assert_eq!(fx.picture(), before);
+    assert_eq!(*app.phase(), Phase::Clean);
+
+    // Again, resolved by hand and continued.
+    let _ = app.request(Event::CherryPickRequested(topic));
+    fx.write("a.txt", "both\n");
+    assert_eq!(
+        app.resolve("a.txt", ResolveChoice::Manual),
+        Outcome::Succeeded
+    );
+    assert_eq!(app.continue_(), Outcome::Succeeded);
+    assert_eq!(*app.phase(), Phase::Clean);
+    assert_eq!(fx.git(&["log", "-1", "--format=%s"]), "topic change");
+    assert_eq!(fx.git(&["show", "HEAD:a.txt"]), "both");
+    // Undo stops at the continued conflict (abort was the way back).
+    assert_eq!(
+        app.request(Event::UndoRequested),
+        Outcome::Refused(Refusal::NotUndoable(Irreversible::Continued))
+    );
+}
+
+#[test]
+fn a_conflicting_revert_pauses_aborts_whole_and_resolves_to_a_commit() {
+    let fx = Fx::new();
+    fx.commit("a.txt", "1\n", "one");
+    fx.commit("a.txt", "2\n", "two");
+    fx.commit("a.txt", "3\n", "three");
+    fx.git(&["branch", "side"]);
+    let before = fx.picture();
+    let mut app = fx.app();
+    let two = oid(&fx, "HEAD~1");
+    let outcome = app.request(Event::RevertRequested(two.clone()));
+    assert!(
+        matches!(outcome, Outcome::Failed(ErrorClass::Expected, _)),
+        "{outcome:?}"
+    );
+    assert!(matches!(app.phase(), Phase::Reverting { .. }));
+    assert!(app.state.undo.entries.is_empty());
+    assert_eq!(app.request(Event::AbortRequested), Outcome::Succeeded);
+    assert_eq!(fx.picture(), before);
+
+    let _ = app.request(Event::RevertRequested(two));
+    fx.write("a.txt", "reverted by hand\n");
+    assert_eq!(
+        app.resolve("a.txt", ResolveChoice::Manual),
+        Outcome::Succeeded
+    );
+    assert_eq!(app.continue_(), Outcome::Succeeded);
+    assert_eq!(*app.phase(), Phase::Clean);
+    assert_eq!(fx.git(&["log", "-1", "--format=%s"]), "Revert \"two\"");
+    assert_eq!(fx.git(&["show", "HEAD:a.txt"]), "reverted by hand");
+}
+
+#[test]
+fn a_pick_git_turns_down_changes_nothing() {
+    let fx = Fx::new();
+    diverged(&fx);
+    // A merge commit needs `-m`: git refuses before touching anything.
+    fx.git(&[
+        "merge", "--no-ff", "-q", "-X", "ours", "-m", "merge", "topic",
+    ]);
+    let merge = oid(&fx, "HEAD");
+    fx.git(&["reset", "-q", "--hard", "HEAD~1"]);
+    let before = fx.picture();
+    let mut app = fx.app();
+    // The merge commit is still in the object database.
+    let outcome = app.request(Event::CherryPickRequested(merge));
+    assert!(
+        matches!(outcome, Outcome::Failed(ErrorClass::Expected, _)),
+        "{outcome:?}"
+    );
+    assert_eq!(*app.phase(), Phase::Clean);
+    assert_eq!(fx.picture(), before);
+    // Changes to tracked files (staged or not) are refused by the core, so
+    // an abort can never rewrite an edit; untracked files do not matter.
+    for stage in [true, false] {
+        fx.write("a.txt", "edited\n");
+        if stage {
+            fx.git(&["add", "a.txt"]);
+        }
+        let before = fx.picture();
+        app.refresh();
+        for event in [
+            Event::CherryPickRequested(oid(&fx, "topic")),
+            Event::RevertRequested(oid(&fx, "HEAD")),
+        ] {
+            assert_eq!(
+                app.request(event),
+                Outcome::Refused(Refusal::UncommittedChanges)
+            );
+        }
+        assert_eq!(fx.picture(), before);
+        fx.git(&["checkout", "-q", "HEAD", "--", "a.txt"]);
+    }
+}
+
+#[test]
+fn a_pick_is_refused_when_the_index_moved_since_the_read() {
+    let fx = Fx::new();
+    fx.commit("a.txt", "base\n", "base");
+    fx.git(&["switch", "-q", "-c", "topic"]);
+    fx.commit("b.txt", "new\n", "add b");
+    fx.git(&["switch", "-q", "main"]);
+    let mut app = fx.app();
+    // Someone stages a file behind the app's back; no watcher event arrives.
+    fx.write("c.txt", "c\n");
+    fx.git(&["add", "c.txt"]);
+    let (state, commands) = step(
+        app.state.clone(),
+        Event::CherryPickRequested(oid(&fx, "topic")),
+    );
+    app.state = state;
+    let outcome = commands
+        .into_iter()
+        .find_map(|command| match command {
+            Command::RunGit { op, args, expect } => {
+                let (sender, events) = mpsc::channel();
+                app.runner.run(op, args, expect, sender);
+                loop {
+                    if let Event::OpFinished(_, outcome) = events
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("finished")
+                    {
+                        break Some(outcome);
+                    }
+                }
+            }
+            _ => None,
+        })
+        .expect("a run");
+    assert!(
+        matches!(&outcome, OpOutcome::Failed(f) if f.class == ErrorClass::PreconditionChanged),
+        "{outcome:?}"
+    );
+    assert_eq!(fx.git(&["rev-list", "--count", "HEAD"]), "1");
 }
 
 // --- a conflict made by the app's own pull ------------------------------------

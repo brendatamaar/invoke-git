@@ -544,3 +544,253 @@ fn binary_on_any_side_is_flagged() {
     assert!(!content(StageContent::Text("b".into())).is_binary());
     assert!(content(StageContent::Binary { size: 4 }).is_binary());
 }
+
+// --- P2: starting a cherry-pick or a revert ---------------------------------
+
+fn replay_event(pick: bool, commit: Oid) -> Event {
+    if pick {
+        Event::CherryPickRequested(commit)
+    } else {
+        Event::RevertRequested(commit)
+    }
+}
+
+fn replay_action(pick: bool) -> Action {
+    if pick {
+        Action::CherryPick
+    } else {
+        Action::Revert
+    }
+}
+
+proptest! {
+    /// A clean repo: one git run for the commit asked, expecting the
+    /// snapshot's head and index, with an undo point that restores `HEAD`'s
+    /// ref only (law 9) and the index (law 8).
+    #[test]
+    fn a_pick_or_revert_runs_once_and_records_only_head(pick in any::<bool>(), c in proptest::sample::select(vec!['b', 'c', 'd', 'f'])) {
+        let snapshot = disk(Phase::Clean, LockState::Free);
+        let commit = oid_of(c);
+        let (state, commands) = step(opened(snapshot.clone()), replay_event(pick, commit.clone()));
+        let expected_args = if pick {
+            GitArgs::CherryPick { commit: commit.clone() }
+        } else {
+            GitArgs::Revert { commit: commit.clone() }
+        };
+        prop_assert_eq!(run_git(&commands), Some(&expected_args));
+        let Some(Command::SnapshotForUndo(point)) = commands.first() else {
+            panic!("{commands:?}");
+        };
+        prop_assert_eq!(&point.refs, &vec![RefValue {
+            name: RefName("refs/heads/main".into()),
+            oid: Some(oid_of('a')),
+        }]);
+        prop_assert_eq!(&point.reverse, &Reversal::Refs);
+        prop_assert_eq!(point.index_effect, IndexEffect::Rewrites);
+        for command in &commands {
+            if let Command::RunGit { args, expect, .. } = command {
+                prop_assert!(args.expected_refs().is_empty());
+                prop_assert_eq!(&expect.head, &snapshot.head);
+                prop_assert_eq!(&expect.index, &snapshot.index);
+            }
+        }
+        prop_assert!(state.ops.running.is_some());
+    }
+
+    /// Nothing starts while a merge, rebase, cherry-pick or revert is paused.
+    #[test]
+    fn a_pick_or_revert_is_refused_while_something_is_paused(
+        phase in paused(),
+        pick in any::<bool>(),
+    ) {
+        let (state, commands) = step(
+            opened(disk(phase, LockState::Free)),
+            replay_event(pick, oid_of('b')),
+        );
+        prop_assert!(commands.iter().all(|command| !command.is_write()));
+        prop_assert_eq!(refused(&state), Some((replay_action(pick), Refusal::RepoBusy)));
+        prop_assert!(state.ops.running.is_none() && state.ops.queued.is_empty());
+    }
+
+    /// Law 12: with `index.lock` held by someone else the request waits and
+    /// nothing is written.
+    #[test]
+    fn a_pick_or_revert_waits_for_the_lock(pick in any::<bool>()) {
+        let state = opened(disk(Phase::Clean, LockState::HeldByOther));
+        let (state, commands) = step(state, replay_event(pick, oid_of('b')));
+        prop_assert!(commands.is_empty());
+        prop_assert_eq!(state.ops.queued.len(), 1);
+        prop_assert!(state.ops.running.is_none());
+    }
+
+    /// Law 9: if `HEAD` moved to another branch (or went detached) between
+    /// the request and its dispatch, the request is refused.
+    #[test]
+    fn a_pick_or_revert_is_refused_when_head_moved(pick in any::<bool>(), detach in any::<bool>()) {
+        let mut moved = disk(Phase::Clean, LockState::Free);
+        let state = opened(disk(Phase::Clean, LockState::HeldByOther));
+        let (state, _) = step(state, replay_event(pick, oid_of('b')));
+        moved.head = if detach {
+            Head::Detached(oid_of('a'))
+        } else {
+            Head::Branch { name: BranchName("other".into()), oid: oid_of('b') }
+        };
+        let (state, commands) = step(state, Event::DiskChanged(ChangeSet([Area::Head].into())));
+        let [Command::ReadState { read, .. }] = commands.as_slice() else {
+            panic!("{commands:?}");
+        };
+        let (state, commands) = step(state, Event::StateRead { read: *read, disk: moved });
+        prop_assert!(commands.iter().all(|command| !command.is_write()));
+        prop_assert_eq!(refused(&state), Some((replay_action(pick), Refusal::BranchChanged)));
+    }
+}
+
+/// A detached `HEAD` is a fine place to pick onto; its undo point records
+/// `HEAD` itself.
+#[test]
+fn a_pick_onto_a_detached_head_records_head() {
+    let mut snapshot = disk(Phase::Clean, LockState::Free);
+    snapshot.head = Head::Detached(oid_of('a'));
+    let (_, commands) = step(opened(snapshot), Event::CherryPickRequested(oid_of('b')));
+    let Some(Command::SnapshotForUndo(point)) = commands.first() else {
+        panic!("{commands:?}");
+    };
+    assert_eq!(point.refs[0].name, RefName("HEAD".into()));
+    assert_eq!(point.head, HeadTarget::Detached);
+}
+
+#[test]
+fn a_pick_or_revert_needs_a_commit_and_a_read_snapshot() {
+    let mut unborn = disk(Phase::Clean, LockState::Free);
+    unborn.head = Head::Unborn(BranchName("main".into()));
+    for pick in [true, false] {
+        let (state, commands) = step(opened(unborn.clone()), replay_event(pick, oid_of('b')));
+        assert!(commands.is_empty());
+        assert_eq!(
+            refused(&state),
+            Some((
+                replay_action(pick),
+                Refusal::Branch(BranchRefusal::NoCommitsYet)
+            ))
+        );
+        let (state, _) = step(open(repo_id()).0, replay_event(pick, oid_of('b')));
+        assert_eq!(
+            refused(&state),
+            Some((replay_action(pick), Refusal::NotRead))
+        );
+    }
+}
+
+/// A pick that stops on a conflict ends as a failed run: its undo point is
+/// dropped (abort is the way back) and the snapshot read next shows the
+/// paused operation. A pick that succeeds leaves an undoable entry.
+#[test]
+fn a_conflicted_pick_leaves_no_undo_point_and_a_clean_one_leaves_one() {
+    let run = |pick: bool, outcome: OpOutcome, after: DiskState| {
+        let (state, commands) = step(
+            opened(disk(Phase::Clean, LockState::Free)),
+            replay_event(pick, oid_of('b')),
+        );
+        let op = state.ops.running.as_ref().unwrap().id;
+        let Some(Command::SnapshotForUndo(_)) = commands.first() else {
+            panic!("{commands:?}");
+        };
+        let (state, _) = step(
+            state,
+            Event::UndoSnapshotTaken {
+                op,
+                tree: oid_of('9'),
+            },
+        );
+        let (state, commands) = step(state, Event::OpFinished(op, outcome));
+        let [.., Command::ReadState { read, .. }] = commands.as_slice() else {
+            panic!("{commands:?}");
+        };
+        let read = *read;
+        let (state, _) = step(state, Event::StateRead { read, disk: after });
+        state
+    };
+    for pick in [true, false] {
+        let conflicted = Phase::CherryPicking {
+            conflicts: Conflicts::from_parts(
+                [(path_named("a.txt"), ConflictKind::BothModified)],
+                [],
+            ),
+        };
+        let conflicted = if pick {
+            conflicted
+        } else {
+            Phase::Reverting {
+                conflicts: conflicted.conflicts().unwrap().clone(),
+            }
+        };
+        let failed = OpOutcome::Failed(Failure {
+            class: ErrorClass::Expected,
+            details: "CONFLICT".into(),
+        });
+        let state = run(pick, failed, disk(conflicted.clone(), LockState::Free));
+        assert!(state.undo.entries.is_empty());
+        assert_eq!(state.undo.pending, UndoPending::Idle);
+        assert_eq!(state.snapshot.disk().unwrap().phase, conflicted);
+
+        let mut moved = disk(Phase::Clean, LockState::Free);
+        moved.head = Head::Branch {
+            name: BranchName("main".into()),
+            oid: oid_of('c'),
+        };
+        let state = run(pick, OpOutcome::Succeeded, moved);
+        assert_eq!(state.undo.entries.len(), 1);
+        assert_eq!(state.undo.entries[0].reversible, Reversible::Yes);
+    }
+}
+
+/// Killing git half way through a pick would leave its sequencer between two
+/// states: not cancellable, like the rest of the conflict flow.
+#[test]
+fn a_running_pick_or_revert_cannot_be_cancelled() {
+    for pick in [true, false] {
+        let (state, _) = step(
+            opened(disk(Phase::Clean, LockState::Free)),
+            replay_event(pick, oid_of('b')),
+        );
+        let op = state.ops.running.as_ref().unwrap().id;
+        let (state, commands) = step(state, Event::OpCancelRequested(op));
+        assert!(commands.is_empty());
+        assert!(matches!(
+            state.ops.running.as_ref().unwrap().phase,
+            OpPhase::Running { .. }
+        ));
+    }
+}
+
+/// A change to a tracked file, staged or not, refuses the start; an
+/// untracked file does not.
+#[test]
+fn a_pick_or_revert_needs_tracked_files_unchanged() {
+    let entry = |staged, unstaged| StatusEntry {
+        path: path_named("a.txt"),
+        staged,
+        unstaged,
+    };
+    for pick in [true, false] {
+        for (entries, refused_with) in [
+            (vec![entry(Some(FileChange::Modified), None)], true),
+            (vec![entry(None, Some(FileChange::Modified))], true),
+            (vec![entry(None, Some(FileChange::Deleted))], true),
+            (vec![entry(None, Some(FileChange::Untracked))], false),
+        ] {
+            let mut snapshot = disk(Phase::Clean, LockState::Free);
+            snapshot.status = StatusSnapshot::from_entries(entries);
+            let (state, commands) = step(opened(snapshot), replay_event(pick, oid_of('b')));
+            if refused_with {
+                assert!(commands.iter().all(|command| !command.is_write()));
+                assert_eq!(
+                    refused(&state),
+                    Some((replay_action(pick), Refusal::UncommittedChanges))
+                );
+            } else {
+                assert!(run_git(&commands).is_some());
+            }
+        }
+    }
+}

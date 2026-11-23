@@ -45,6 +45,8 @@ fn action_name(action: Action) -> &'static str {
         Action::Continue => "Continue",
         Action::Skip => "Skip",
         Action::Abort => "Abort",
+        Action::CherryPick => "Cherry-pick",
+        Action::Revert => "Revert",
         Action::RemoveLock => "Remove lock",
     }
 }
@@ -89,6 +91,9 @@ fn refusal_text(reason: &Refusal) -> String {
         Refusal::BranchChanged => "The checked-out branch changed. Try again.".into(),
         Refusal::Commit(problem) => commit_text(problem),
         Refusal::Conflict(problem) => conflict_text(problem),
+        Refusal::UncommittedChanges => {
+            "Commit or stash your changes to tracked files first.".into()
+        }
     }
 }
 

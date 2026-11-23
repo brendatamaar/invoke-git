@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::conflict::{Operation, ResolveChoice, Side};
-use crate::event::RefValue;
+use crate::event::{HeadTarget, RefValue};
 use crate::ids::{BranchName, IndexId, Oid, RefName, RepoPath};
 use crate::message::CommitMessage;
 
@@ -94,6 +94,17 @@ pub enum WriteRequest {
     },
     Abort {
         operation: Operation,
+    },
+    // P2: start a single-commit cherry-pick or revert. `onto` is the kind of
+    // `HEAD` the user saw; the request is refused if `HEAD` is another
+    // branch by the time it runs (law 9).
+    CherryPick {
+        commit: Oid,
+        onto: HeadTarget,
+    },
+    Revert {
+        commit: Oid,
+        onto: HeadTarget,
     },
 }
 
@@ -254,6 +265,13 @@ pub enum GitArgs {
     Abort {
         operation: Operation,
     },
+    // P2. The commit is an object id, so it can never be read as an option.
+    CherryPick {
+        commit: Oid,
+    },
+    Revert {
+        commit: Oid,
+    },
 }
 
 impl GitArgs {
@@ -292,7 +310,10 @@ impl GitArgs {
             | GitArgs::ResolveStage { .. }
             | GitArgs::Continue { .. }
             | GitArgs::Skip { .. }
-            | GitArgs::Abort { .. } => Vec::new(),
+            | GitArgs::Abort { .. }
+            // P2: `HEAD` and the index are what these expect.
+            | GitArgs::CherryPick { .. }
+            | GitArgs::Revert { .. } => Vec::new(),
             GitArgs::CreateBranch { name, .. } => vec![at(name, None)],
             GitArgs::SwitchBranch { name, tip } | GitArgs::DeleteBranch { name, tip, .. } => {
                 vec![at(name, Some(tip))]
@@ -309,7 +330,11 @@ impl GitArgs {
     pub fn may_open_editor(&self) -> bool {
         matches!(
             self,
-            GitArgs::Continue { .. } | GitArgs::Skip { .. } | GitArgs::Abort { .. }
+            GitArgs::Continue { .. }
+                | GitArgs::Skip { .. }
+                | GitArgs::Abort { .. }
+                | GitArgs::CherryPick { .. }
+                | GitArgs::Revert { .. }
         )
     }
 

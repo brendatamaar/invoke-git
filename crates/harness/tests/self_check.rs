@@ -173,3 +173,46 @@ fn an_undo_that_git_refuses_to_check_out_is_agreement() {
         world.step(transition);
     }
 }
+
+/// P2: cherry-picks and reverts that conflict are driven to an abort (the
+/// repo comes back exactly, law 13) and to a resolved continue, next to
+/// clean ones, and compared with plain git after every step.
+#[test]
+fn conflicting_cherry_picks_and_reverts_abort_or_continue_like_git() {
+    use harness::transition::ReplayEnd;
+    let commit = |message: &str| Transition::OutsideCommitAll {
+        message: message.into(),
+    };
+    let mut world = World::new();
+    for transition in [
+        edit(0, 2, "x"),
+        commit("x"),
+        Transition::CreateBranch {
+            name: 1,
+            switch: true,
+            start_back: true,
+        },
+        edit(0, 2, "z"),
+        commit("z"),
+        edit(0, 2, "y"),
+        commit("y"),
+    ] {
+        world.step(transition);
+    }
+    let count = |world: &World| world.app.repo.git(&["rev-list", "--count", "--all"]).text();
+    let start: usize = count(&world).parse().unwrap();
+    for end in [ReplayEnd::Abort, ReplayEnd::Resolve] {
+        for revert in [false, true] {
+            for commit in 0..4 {
+                world.step(Transition::Replay {
+                    commit,
+                    revert,
+                    end,
+                });
+            }
+        }
+    }
+    let after: usize = count(&world).parse().unwrap();
+    assert!(after > start, "a resolved pick or revert made no commit");
+    world.step(Transition::Undo);
+}
