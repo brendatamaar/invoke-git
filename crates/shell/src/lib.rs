@@ -28,7 +28,7 @@ pub use conflict::read_conflict_content;
 pub use discard::DiscardRunner;
 pub use discover::{DiscoverError, Discovered, discover};
 pub use git::{Git, GitVersion, SetupError};
-pub use precondition::{RepoPaths, use_user_config};
+pub use precondition::{RepoPaths, remove_index_lock, use_user_config};
 pub use read::{execute as execute_read, head_message, merge_message, read_state};
 pub use runner::GitRunner;
 pub use staging::{DiffInputs, InputsError, Source, StagingRunner, load_inputs};

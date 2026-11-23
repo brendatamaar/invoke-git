@@ -300,6 +300,8 @@ pub enum Action {
     Continue,
     Skip,
     Abort,
+    // Task 17: the user asked to remove a leftover `index.lock`.
+    RemoveLock,
 }
 
 /// Why a request was turned down. Every refusal states one.
@@ -322,6 +324,9 @@ pub enum Refusal {
     Changed(UndoMoved),
     /// A merge, rebase, cherry-pick or revert is in progress.
     RepoBusy,
+    /// Task 17: there is no lock left by someone else to remove, or an
+    /// operation of ours is still running (its lock is not stale).
+    NoStaleLock,
     /// Task 20: the stash is no longer in the stash list (dropped, popped or
     /// saved over by someone else). Stashes are addressed by commit id, so
     /// a request never lands on a different entry that took its place.

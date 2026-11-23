@@ -153,6 +153,7 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         }
         Event::RefreshRequested => request_read(&mut state, ReadScope::full(), &mut commands),
         Event::NoticeDismissed => state.notice = None,
+        Event::RemoveStaleLockRequested => remove_stale_lock(&mut state, &mut commands),
         // Law 11: a change on disk is never patched in; it is read again.
         Event::DiskChanged(ChangeSet(areas)) => {
             if !areas.is_empty() {
@@ -215,6 +216,23 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
 
 fn refuse_because(state: &mut RepoState, action: Action, reason: Refusal) {
     state.notice = Some(Notice::Refused { action, reason });
+}
+
+/// Task 17. A lock another process holds may be a leftover (a git we killed
+/// on cancel, a crash). It is removed only on the user's say-so, and only
+/// when the snapshot shows one and none of our own operations is running or
+/// waiting, since then the lock cannot be ours.
+fn remove_stale_lock(state: &mut RepoState, commands: &mut Vec<Command>) {
+    let held = matches!(
+        &state.snapshot,
+        Snapshot::Read { disk, .. } if disk.lock == LockState::HeldByOther
+    );
+    if held && state.ops.running.is_none() && state.ops.queued.is_empty() {
+        state.notice = None;
+        commands.push(Command::RemoveStaleLock);
+    } else {
+        refuse_because(state, Action::RemoveLock, Refusal::NoStaleLock);
+    }
 }
 
 /// Task 11: an empty patch changes nothing and is refused up front; the

@@ -17,6 +17,8 @@ mod repo_view;
 mod session;
 mod setup;
 mod staging;
+mod sync;
+mod sync_view;
 mod tabs;
 mod workspace;
 

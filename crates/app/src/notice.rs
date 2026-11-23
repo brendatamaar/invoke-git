@@ -45,6 +45,7 @@ fn action_name(action: Action) -> &'static str {
         Action::Continue => "Continue",
         Action::Skip => "Skip",
         Action::Abort => "Abort",
+        Action::RemoveLock => "Remove lock",
     }
 }
 
@@ -71,6 +72,9 @@ fn refusal_text(reason: &Refusal) -> String {
                 UndoMoved::Index => "the index".to_owned(),
             }
         ),
+        Refusal::NoStaleLock => {
+            "There is no leftover lock to remove, or an operation is still running.".into()
+        }
         Refusal::RepoBusy => {
             "A merge, rebase, cherry-pick or revert is in progress. Finish or abort it first."
                 .into()

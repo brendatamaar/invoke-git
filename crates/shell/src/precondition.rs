@@ -220,3 +220,39 @@ fn branch_name(full: String) -> BranchName {
 pub(crate) fn oid(id: &gix::oid) -> Result<Oid, String> {
     Oid::from_hex(&id.to_hex().to_string()).map_err(|error| format!("{id}: {error:?}"))
 }
+
+/// Task 17: deletes `index.lock` in the git dir, the leftover of a git that
+/// was killed or crashed. It removes that one file and nothing else, and says
+/// whether there was one. The core asks for it only after the user agreed and
+/// when none of our own operations is running.
+pub fn remove_index_lock(paths: &RepoPaths) -> io::Result<bool> {
+    match std::fs::remove_file(paths.git_dir.join("index.lock")) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_index_lock_is_removed() {
+        let dir = std::env::temp_dir().join(format!("invoke-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = RepoPaths {
+            workdir: dir.clone(),
+            git_dir: dir.clone(),
+        };
+        assert!(!remove_index_lock(&paths).unwrap());
+        for name in ["index.lock", "HEAD.lock", "index"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        assert!(remove_index_lock(&paths).unwrap());
+        assert!(!dir.join("index.lock").exists());
+        assert!(dir.join("HEAD.lock").exists() && dir.join("index").exists());
+        assert!(!remove_index_lock(&paths).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

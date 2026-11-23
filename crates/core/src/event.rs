@@ -80,6 +80,10 @@ pub enum Event {
     StashDropRequested(Oid),
     RefreshRequested,
     NoticeDismissed,
+    /// Task 17: remove `index.lock` that another process left. The UI asks
+    /// first; the core still refuses unless the snapshot shows a lock held by
+    /// someone else and none of our operations is running.
+    RemoveStaleLockRequested,
     // From the shell.
     /// The watcher saw changes (already debounced and classified).
     DiskChanged(ChangeSet),
@@ -235,6 +239,10 @@ pub enum Command {
     /// our own `refs/invoke-git/undo/*`, so it is not a write in the sense
     /// of law 12.
     PruneUndo(Vec<OpId>),
+    /// Task 17: delete `index.lock` (and only it). Not a write in the sense
+    /// of law 12: it exists to lift the lock that blocks writes. The shell
+    /// answers with `DiskChanged` so the state is read again.
+    RemoveStaleLock,
 }
 
 impl Command {

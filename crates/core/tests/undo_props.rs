@@ -217,7 +217,8 @@ impl Sim {
             Command::ApplyPatchToIndex { .. }
             | Command::ApplyPatchToWorktree { .. }
             | Command::CancelOp(_)
-            | Command::AnswerAuth(..) => {
+            | Command::AnswerAuth(..)
+            | Command::RemoveStaleLock => {
                 panic!("unexpected command");
             }
         }

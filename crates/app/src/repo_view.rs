@@ -10,7 +10,7 @@ use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window,
     div, px,
 };
-use invoke_core::{Event, ReadId, RepoPath, Snapshot, StatusSnapshot};
+use invoke_core::{Event, Notice, ReadId, RepoPath, Snapshot, StatusSnapshot};
 use tokens::{SIDEBAR, SPACE_2, SPACE_8, TEXT_SMALL};
 use ui::convert::hsla;
 use ui::{
@@ -26,6 +26,7 @@ use crate::history_view::HistoryPane;
 use crate::notice::{self, Tone};
 use crate::session::RepoSession;
 use crate::staging::{self, Part};
+use crate::sync_view::{SyncButtons, SyncStrip};
 
 /// The changed-file tree is a little wider than the repository sidebar.
 const CHANGES_W: f32 = SIDEBAR + 2.0 * SPACE_8;
@@ -54,6 +55,8 @@ pub struct RepoView {
     history: Entity<HistoryPane>,
     commit: Entity<CommitBox>,
     branches: Entity<BranchPanel>,
+    sync_buttons: Entity<SyncButtons>,
+    sync_strip: Entity<SyncStrip>,
     diff: Entity<DiffView>,
     selected: Option<(Section, RepoPath)>,
     collapsed: HashSet<(Section, String)>,
@@ -111,6 +114,8 @@ impl RepoView {
         let history = cx.new(|cx| HistoryPane::new(session.clone(), cx));
         let commit = cx.new(|cx| CommitBox::new(session.clone(), cx));
         let branches = cx.new(|cx| BranchPanel::new(session.clone(), cx));
+        let sync_buttons = cx.new(|cx| SyncButtons::new(session.clone(), cx));
+        let sync_strip = cx.new(|cx| SyncStrip::new(session.clone(), cx));
         cx.observe(&session, |this, _, cx| this.session_changed(cx))
             .detach();
         cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| {
@@ -123,6 +128,8 @@ impl RepoView {
             history,
             commit,
             branches,
+            sync_buttons,
+            sync_strip,
             diff,
             selected: None,
             collapsed: HashSet::new(),
@@ -514,7 +521,13 @@ impl Render for RepoView {
             .top()
             .ok()
             .map(|entry| entry.point.label.clone());
-        let notice = session.state.notice.as_ref().and_then(notice::message);
+        // A rejected push is shown by the sync strip, with its next steps.
+        let notice = session
+            .state
+            .notice
+            .as_ref()
+            .filter(|notice| !matches!(notice, Notice::PushRejected { .. }))
+            .and_then(notice::message);
         let selected: Option<(Section, SharedString)> = self
             .selected
             .as_ref()
@@ -547,6 +560,7 @@ impl Render for RepoView {
             .flex()
             .items_center()
             .gap(px(SPACE_2))
+            .child(self.sync_buttons.clone())
             .child(page_switch);
         if let Some(label) = undo_label {
             controls = controls
@@ -655,7 +669,9 @@ impl Render for RepoView {
             .flex_col()
             .flex_1()
             .min_h(px(0.))
+            .min_w(px(0.))
             .child(summary)
+            .child(self.sync_strip.clone())
             .children(banners)
             .child(
                 div()

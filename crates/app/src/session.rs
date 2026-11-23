@@ -13,7 +13,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use gpui::{Context, Task};
-use invoke_core::{Command, Event, OpId, RepoId, RepoState, UndoPoint, open, step};
+use invoke_core::{
+    Area, ChangeSet, Command, Event, OpId, RepoId, RepoState, UndoPoint, open, step,
+};
 use shell::undo::Snapshotted;
 use shell::{
     DiscardRunner, Discovered, Git, GitRunner, RepoWatcher, StagingRunner, UndoRunner,
@@ -54,7 +56,7 @@ impl RepoSession {
             state,
             watch_error,
             events,
-            runner: Arc::new(GitRunner::new(git.clone(), paths.clone())),
+            runner: Arc::new(Self::git_runner(git.clone(), paths.clone())),
             staging: Arc::new(StagingRunner::new(git.clone(), paths.clone())),
             discard: Arc::new(DiscardRunner::new(git.clone(), paths.clone())),
             undo: Arc::new(UndoRunner::new(git, paths)),
@@ -64,6 +66,19 @@ impl RepoSession {
         };
         session.exec_all(commands, cx);
         session
+    }
+
+    /// The runner for git commands. Network operations ask for credentials in
+    /// the app through the helper next to the executable; without it they
+    /// fail with git's own message instead of waiting for a console.
+    fn git_runner(git: Git, paths: shell::RepoPaths) -> GitRunner {
+        let runner = GitRunner::new(git, paths);
+        let helper = crate::clone_view::helper_path();
+        if helper.is_file() {
+            runner.with_askpass(helper)
+        } else {
+            runner
+        }
     }
 
     /// Steps the core with one event and runs the commands it asks for.
@@ -249,6 +264,19 @@ impl RepoSession {
                 let undo = self.undo.clone();
                 cx.background_executor()
                     .spawn(async move { undo.prune(&ops) })
+                    .detach();
+            }
+            Command::RemoveStaleLock => {
+                let paths = self.discovered.paths.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = shell::remove_index_lock(&paths);
+                        // Whether or not it worked, read again: the watcher may
+                        // be off, and the lock state is what the user is waiting on.
+                        let _ = events.send(Event::DiskChanged(ChangeSet(
+                            [Area::Index].into_iter().collect(),
+                        )));
+                    })
                     .detach();
             }
             Command::CancelOp(op) => self.runner.cancel(op),

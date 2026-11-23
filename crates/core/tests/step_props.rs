@@ -262,6 +262,7 @@ fn event() -> impl Strategy<Value = Event> {
         2 => Just(Event::AbortRequested),
         1 => Just(Event::RefreshRequested),
         1 => Just(Event::NoticeDismissed),
+        1 => Just(Event::RemoveStaleLockRequested),
         2 => areas.prop_map(|areas| Event::DiskChanged(ChangeSet(areas))),
         4 => (read_id(), disk()).prop_map(|(read, disk)| Event::StateRead { read, disk }),
         1 => (read_id(), failure()).prop_map(|(read, failure)| Event::ReadFailed { read, failure }),
@@ -1061,4 +1062,77 @@ fn a_pushed_branch_leaves_a_marker() {
         state.undo.entries.back().map(|entry| entry.reversible),
         Some(Reversible::No(Irreversible::Push))
     );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Task 17: the lock is removed only when the user asked, the snapshot
+    /// shows a lock held by someone else, and none of our operations is
+    /// running or waiting; otherwise the request is refused, never dropped.
+    #[test]
+    fn a_lock_is_removed_only_when_it_cannot_be_ours(events in vec(event(), 0..60)) {
+        run(events, |before, event, after, commands| {
+            let removes = commands.iter().any(|c| matches!(c, Command::RemoveStaleLock));
+            if !matches!(event, Event::RemoveStaleLockRequested) {
+                prop_assert!(!removes);
+                return Ok(());
+            }
+            let held = matches!(
+                &before.snapshot,
+                Snapshot::Read { disk, .. } if disk.lock == LockState::HeldByOther
+            );
+            let idle = before.ops.running.is_none() && before.ops.queued.is_empty();
+            prop_assert_eq!(removes, held && idle);
+            if !removes {
+                prop_assert_eq!(
+                    after.notice.clone(),
+                    Some(Notice::Refused {
+                        action: Action::RemoveLock,
+                        reason: Refusal::NoStaleLock
+                    })
+                );
+            }
+            Ok(())
+        })?;
+    }
+}
+
+#[test]
+fn a_leftover_lock_is_removed_on_request_and_nothing_else_is() {
+    let locked = |lock| {
+        let mut disk = read_disk(&[], Phase::Clean, 'a');
+        disk.lock = lock;
+        opened(disk)
+    };
+    let (state, commands) = step(
+        locked(LockState::HeldByOther),
+        Event::RemoveStaleLockRequested,
+    );
+    assert_eq!(commands, vec![Command::RemoveStaleLock]);
+    assert_eq!(state.notice, None);
+
+    // A lock that is free, or that our own git holds, is not removed.
+    for lock in [LockState::Free, LockState::HeldByUs] {
+        let (state, commands) = step(locked(lock), Event::RemoveStaleLockRequested);
+        assert!(commands.is_empty());
+        assert_eq!(
+            state.notice,
+            Some(Notice::Refused {
+                action: Action::RemoveLock,
+                reason: Refusal::NoStaleLock
+            })
+        );
+    }
+
+    // Not while one of our operations waits (the lock might be its own).
+    let (queued, _) = step(
+        locked(LockState::HeldByOther),
+        Event::FetchRequested {
+            remote: "origin".into(),
+        },
+    );
+    assert!(!queued.ops.queued.is_empty() || queued.ops.running.is_some());
+    let (_, commands) = step(queued, Event::RemoveStaleLockRequested);
+    assert!(commands.is_empty());
 }

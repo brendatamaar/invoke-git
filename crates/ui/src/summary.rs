@@ -208,10 +208,14 @@ impl RenderOnce for RepoSummary {
             }
         }
 
-        header = header.children(self.control).child(div().flex_1()).child(
+        // The path takes what is left and is cut with an ellipsis, so a long
+        // path or a wide set of controls never pushes the page past the window.
+        header = header.children(self.control).child(
             div()
+                .flex_1()
                 .min_w(px(0.))
                 .truncate()
+                .text_right()
                 .text_style(&tokens::TEXT_CODE_SMALL, cx)
                 .text_color(hsla(p.ink_faint))
                 .child(self.path),
@@ -227,10 +231,8 @@ impl RenderOnce for RepoSummary {
             body = body.child(Banner::new(BannerKind::Warning, warning));
             any = true;
         }
-        if let Some(lock) = &s.lock {
-            body = body.child(Banner::new(BannerKind::Warning, lock.clone()));
-            any = true;
-        }
+        // A lock held by another process is shown by the sync strip, which also
+        // offers to remove a leftover one.
         if s.stale {
             body = body.child(Banner::new(
                 BannerKind::Error,
