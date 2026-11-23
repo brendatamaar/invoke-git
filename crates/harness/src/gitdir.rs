@@ -138,6 +138,10 @@ impl RepoDir {
         command
             .args(args)
             .current_dir(&self.paths.workdir)
+            // Keep the caller's editor env vars from overriding `-c core.editor=:`
+            // in plain-git twin runs; explicit `env` overrides below still win.
+            .env_remove("GIT_EDITOR")
+            .env_remove("GIT_SEQUENCE_EDITOR")
             .envs(self.env.iter().map(|(key, value)| (key, value)))
             .envs(env.iter().copied())
             // Looking must not write: no opportunistic index refresh.

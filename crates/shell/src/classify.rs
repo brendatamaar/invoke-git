@@ -64,6 +64,7 @@ const MARKERS: [(ErrorClass, &[&str]); 5] = [
             "nothing to commit",
             "no changes added to commit",
             "nothing added to commit",
+            "You asked to amend the most recent commit",
             "Aborting commit due to empty commit message",
             "[rejected]",
             "[remote rejected]",
@@ -310,6 +311,10 @@ mod tests {
             ),
             (
                 "On branch main\nnothing to commit, working tree clean",
+                Expected,
+            ),
+            (
+                "No changes\nYou asked to amend the most recent commit, but doing so would make\nit empty.",
                 Expected,
             ),
             ("Aborting commit due to empty commit message.", Expected),
