@@ -77,21 +77,20 @@ fn scan(
     }
     let repo = precondition::open(paths)?;
     let boundary = history::shallow(paths, &repo);
-    let mut walk = history::search_walk(&repo, cancel)?;
+    let mut walk = history::search_walk(&repo, &boundary, cancel)?;
     loop {
         let mut matches = Vec::new();
         let mut scanned = 0;
         while scanned < SCAN_PAGE_SIZE && !cancel.load(Ordering::Relaxed) {
-            let Some(info) = walk.next() else {
+            let Some(id) = walk.next() else {
                 break;
             };
-            let info = info.map_err(|e| format!("walk commit history: {e}"))?;
-            let id = info.id().detach();
+            let id = id?;
             let matched = if query.field() == SearchField::Hash {
                 query.matches_hash(&id.to_string())
             } else {
-                let commit = info
-                    .object()
+                let commit = repo
+                    .find_commit(id)
                     .map_err(|e| format!("read commit {id}: {e}"))?;
                 matches_commit(&repo, &commit, query, boundary.contains(&id))?
             };

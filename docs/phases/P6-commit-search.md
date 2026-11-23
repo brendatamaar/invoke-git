@@ -24,6 +24,7 @@ Menyediakan pencarian commit berdasarkan pesan, penulis, hash (penuh/prefix), da
 - Worker mengirim progres per maksimal 256 commit dengan antrean satu halaman. Traversal menyimpan frontier dan ID yang sudah dilihat untuk deduplikasi. Metadata dan pohon dibaca per kandidat yang membutuhkannya. UI dapat membatalkan lewat token dan membuang hasil query lama.
 - Filter dipilih melalui `SearchField`. Message mencari seluruh pesan. Author mencari nama atau email. Hash mencocokkan awal ID heksadesimal. Path membandingkan ID dan mode entri Git terhadap parent pertama, konsisten dengan commit detail. Root dibandingkan dengan tree kosong. Perubahan path pada batas shallow tidak dapat ditentukan. Path memakai slash dan peka huruf besar/kecil.
 - Tes properti mencakup batas prefix hash, pencocokan field teks, dan perubahan identitas entri path. Ketiganya gagal saat matcher sengaja diubah, lalu matcher asli dipulihkan.
+- Self-review menemukan bahwa gix dapat melewati parent shallow yang seharusnya tetap terjangkau dari ref lain. Fixture membuktikan regresi. Untuk repo shallow, walk memotong edge parent hanya dari boundary commit dan tetap mengeluarkan halaman secara inkremental.
 
 ### Windows verification checklist
 

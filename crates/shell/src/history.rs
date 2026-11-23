@@ -8,7 +8,7 @@
 //! page as it arrives. A shallow clone's boundary commits are flagged
 //! `truncated`.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,12 +106,44 @@ fn tips(repo: &gix::Repository) -> Result<Vec<CommitId>, String> {
 /// breadth-first walk can yield immediately even without a commit-graph.
 pub(crate) fn search_walk<'repo>(
     repo: &'repo gix::Repository,
+    boundary: &'repo HashSet<CommitId>,
     cancel: &'repo AtomicBool,
-) -> Result<gix::revision::Walk<'repo>, String> {
-    repo.rev_walk(tips(repo)?)
-        .sorting(gix::revision::walk::Sorting::BreadthFirst)
-        .selected(move |_| !cancel.load(Ordering::Relaxed))
-        .map_err(|e| format!("start commit search walk: {e}"))
+) -> Result<Box<dyn Iterator<Item = Result<CommitId, String>> + 'repo>, String> {
+    let tips = tips(repo)?;
+    if boundary.is_empty() {
+        let walk = repo
+            .rev_walk(tips)
+            .sorting(gix::revision::walk::Sorting::BreadthFirst)
+            .selected(move |_| !cancel.load(Ordering::Relaxed))
+            .map_err(|e| format!("start commit search walk: {e}"))?;
+        return Ok(Box::new(walk.map(|info| {
+            info.map(|info| info.id().detach())
+                .map_err(|e| format!("walk commit history: {e}"))
+        })));
+    }
+
+    // Cut just the shallow commit's parent edges. The same parents may
+    // still be reachable from other tips through non-shallow edges.
+    let mut seen: HashSet<_> = tips.iter().copied().collect();
+    let mut pending = VecDeque::from(tips);
+    Ok(Box::new(std::iter::from_fn(move || {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let id = pending.pop_front()?;
+        if !boundary.contains(&id) {
+            match repo.find_commit(id) {
+                Ok(commit) => pending.extend(
+                    commit
+                        .parent_ids()
+                        .map(|parent| parent.detach())
+                        .filter(|parent| seen.insert(*parent)),
+                ),
+                Err(error) => return Some(Err(format!("read commit {id}: {error}"))),
+            }
+        }
+        Some(Ok(id))
+    })))
 }
 
 /// The shallow boundary: the commits listed in `.git/shallow` (in a linked

@@ -111,13 +111,16 @@ fn searches_commit_metadata_and_changed_paths() {
     repo.git(&["switch", "main"]);
     repo.git(&["commit-graph", "write", "--reachable"]);
 
-    assert_eq!(repo.matches(SearchField::Message, "NEEDLE"), [root.clone()]);
-    assert_eq!(repo.matches(SearchField::Author, "HOPPER"), [kept.clone()]);
-    assert_eq!(repo.matches(SearchField::Author, "navy@"), [kept.clone()]);
+    assert_eq!(
+        repo.matches(SearchField::Message, "NEEDLE"),
+        [root.as_str()]
+    );
+    assert_eq!(repo.matches(SearchField::Author, "HOPPER"), [kept.as_str()]);
+    assert_eq!(repo.matches(SearchField::Author, "navy@"), [kept.as_str()]);
     assert_eq!(repo.matches(SearchField::Hash, &kept), [kept]);
     assert_eq!(
         repo.matches(SearchField::Hash, &modified[..12].to_uppercase()),
-        [modified.clone()]
+        [modified.as_str()]
     );
     let mut touched = repo.matches(SearchField::Path, path);
     touched.sort();
@@ -185,4 +188,17 @@ fn shallow_boundary_has_metadata_but_no_known_path_change() {
     assert_eq!(repo.matches(SearchField::Message, "shallow"), [boundary]);
     assert!(repo.matches(SearchField::Message, "root").is_empty());
     assert!(repo.matches(SearchField::Path, "file").is_empty());
+}
+
+#[test]
+fn shallow_boundary_does_not_hide_history_reachable_from_another_tip() {
+    let repo = Repo::new();
+    let root = repo.commit(&["--allow-empty", "-m", "shared root"]);
+    repo.git(&["branch", "side"]);
+    let boundary = repo.commit(&["--allow-empty", "-m", "boundary"]);
+    repo.git(&["switch", "side"]);
+    repo.commit(&["--allow-empty", "-m", "side tip"]);
+    fs::write(repo.paths.git_dir.join("shallow"), format!("{boundary}\n")).unwrap();
+
+    assert_eq!(repo.matches(SearchField::Message, "shared root"), [root]);
 }
