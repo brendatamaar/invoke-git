@@ -17,13 +17,13 @@
 | P0 | GPUI Spike | done | - | - |
 | P1 | v0.1 Daily Driver (Tasks 1–25) | done | P0 | - |
 | P1b | Non-Text Staging & Discard | todo | P1 | P3, P5, P6, P7, P8 |
-| P2 | Cherry-Pick & Revert | review | P1 | P3, P5, P6, P7, P8, P11 |
-| P3 | Tags (Create, Push, Delete) | review | P1 | P1b, P2, P4a, P4b, P5, P6, P7, P8, P11 |
+| P2 | Cherry-Pick & Revert | done | P1 | P3, P5, P6, P7, P8, P11 |
+| P3 | Tags (Create, Push, Delete) | done | P1 | P1b, P2, P4a, P4b, P5, P6, P7, P8, P11 |
 | P4a | Interactive Rebase Core & v0.2 Law Gate | done | P2 | P3, P5, P6, P7, P8, P11 |
 | P4b | Interactive Rebase Editor UI | todo | P4a | P3, P5, P6, P7, P8, P9, P10, P11 |
-| P5 | Blame & File History | review | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
-| P6 | Commit Search | review | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
-| P7 | Reflog View | review | P1 | P1b, P2, P3, P4a, P4b, P5, P6, P8, P9, P10, P11 |
+| P5 | Blame & File History | done | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
+| P6 | Commit Search | done | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
+| P7 | Reflog View | done | P1 | P1b, P2, P3, P4a, P4b, P5, P6, P8, P9, P10, P11 |
 | P8 | Forge Auth & Repo List (GitHub/GitLab) | todo | P1 | P1b, P2, P3, P4a, P4b, P5, P6, P7, P10, P11 |
 | P9 | Pull Requests & Merge Requests | todo | P8 | P4b, P5, P6, P7, P10, P11 |
 | P10 | Worktrees, Submodules & Git LFS | todo | P1 | P4b, P5, P6, P7, P8, P9, P11 |
@@ -32,4 +32,4 @@
 
 ## Review Windows
 
-P2, P3, P5, P6, dan P7 memiliki implementasi core, shell, dan UI. `cargo xtask check` lulus sebelum perubahan UI dengan 256 urutan model-based, dan lulus pada gabungan akhir dengan `INVOKE_HARNESS_CASES=16`. `cargo build -p app` dan smoke test pembukaan repo fixture dengan profil terisolasi juga lulus. Checklist interaksi GPUI native ada di Handoff notes tiap fase.
+P2, P3, P5, P6, dan P7 memiliki implementasi core, shell, dan UI. `cargo xtask check` lulus sebelum perubahan UI dengan 256 urutan model-based, dan lulus pada gabungan akhir dengan `INVOKE_HARNESS_CASES=16`. `cargo build -p app` dan smoke test pembukaan repo fixture dengan profil terisolasi juga lulus. Pengguna melaporkan seluruh verifikasi manual Windows lulus. Hasil dicatat di Handoff notes tiap fase.

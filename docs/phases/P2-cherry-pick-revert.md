@@ -1,5 +1,5 @@
 # P2 - Cherry-Pick & Revert
-Status: review
+Status: done
 Depends on: P1
 Parallel-safe with: P3, P5, P6, P7, P8, P11
 
@@ -33,7 +33,7 @@ Menyediakan aksi cherry-pick dan revert commit dengan alur konflik terpadu (reso
 
 ### Lanjutan Windows
 - Klik kanan baris graph atau gunakan tombol di detail commit. Keduanya mengirim event yang sama dengan OID commit terpilih dan menonaktifkan aksi saat fase repo bukan `Clean`. Repo view membuka tampilan konflik yang sama untuk resolve, Continue, dan Abort.
-- Tes `conflict_props` (24), `conflicts` (27), harness model-based, dan `cargo xtask check` pada gabungan akhir lulus di Windows. Verifikasi klik manual masih terbuka.
+- Tes `conflict_props` (24), `conflicts` (27), harness model-based, dan `cargo xtask check` pada gabungan akhir lulus di Windows. Pengguna melaporkan seluruh verifikasi manual Windows lulus.
 
 ### Pertanyaan spec / di luar scope (diusulkan, tidak ditebak)
 1. Pick/revert yang menghasilkan commit kosong (perubahan sudah ada) berhenti dengan `CHERRY_PICK_HEAD` tanpa file konflik; Continue gagal ("nothing to commit"), hanya Abort yang jalan. `Skip` hanya untuk rebase (PRD). Usul: izinkan Skip (`git cherry-pick --skip`, git >= 2.23) untuk cherry-pick/revert, atau tampilkan pesan khusus. Menunggu keputusan.
@@ -43,9 +43,9 @@ Menyediakan aksi cherry-pick dan revert commit dengan alur konflik terpadu (reso
 
 ### Windows verification checklist
 - [x] `cargo xtask check` penuh lulus di Windows. Konfigurasi harness dicatat pada bagian Review Windows di PLAN.md.
-- [ ] Buka menu klik kanan di History dan pastikan kedua aksi memakai OID baris yang diklik. Coba juga kedua tombol di detail commit.
-- [ ] Cherry-pick bersih: commit baru muncul di graph, branch lain tidak bergerak, Undo mengembalikan ref dan index.
-- [ ] Revert bersih: commit `Revert "..."` muncul; Undo mengembalikan.
-- [ ] Konflik: layar konflik membuka dengan judul "Cherry-picking onto ..." / "Reverting on ..."; Continue terkunci sampai semua file resolved; Abort memulihkan semuanya.
-- [ ] Pesan penolakan saat ada perubahan tracked ("Commit or stash your changes...") dan saat repo sedang paused.
-- [ ] Windows: CRLF pada file konflik dan path panjang tetap benar setelah continue.
+- [x] Buka menu klik kanan di History dan pastikan kedua aksi memakai OID baris yang diklik. Coba juga kedua tombol di detail commit.
+- [x] Cherry-pick bersih: commit baru muncul di graph, branch lain tidak bergerak, Undo mengembalikan ref dan index.
+- [x] Revert bersih: commit `Revert "..."` muncul; Undo mengembalikan.
+- [x] Konflik: layar konflik membuka dengan judul "Cherry-picking onto ..." / "Reverting on ..."; Continue terkunci sampai semua file resolved; Abort memulihkan semuanya.
+- [x] Pesan penolakan saat ada perubahan tracked ("Commit or stash your changes...") dan saat repo sedang paused.
+- [x] Windows: CRLF pada file konflik dan path panjang tetap benar setelah continue.

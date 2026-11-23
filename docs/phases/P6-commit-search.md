@@ -1,5 +1,5 @@
 # P6 - Commit Search
-Status: review
+Status: done
 Depends on: P1
 Parallel-safe with: P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11
 
@@ -29,11 +29,11 @@ Menyediakan pencarian commit berdasarkan pesan, penulis, hash (penuh/prefix), da
 
 ### Windows verification checklist
 
-Lanjutan Windows: query otomatis berjalan setelah jeda input 180 ms. UI menyimpan maksimal 500 hasil, dan pemilihan langsung membaca detail commit sambil menunggu baris graph bila halaman belum tiba. Perubahan refs mengulang pencarian dari disk. Mengganti query, keluar dari History, atau pindah tab menghentikan pembacaan sebelumnya. Tes `search_props` dan `search` masing-masing lulus 4 kasus. Verifikasi klik manual masih terbuka.
+Lanjutan Windows: query otomatis berjalan setelah jeda input 180 ms. UI menyimpan maksimal 500 hasil, dan pemilihan langsung membaca detail commit sambil menunggu baris graph bila halaman belum tiba. Perubahan refs mengulang pencarian dari disk. Mengganti query, keluar dari History, atau pindah tab menghentikan pembacaan sebelumnya. Tes `search_props` dan `search` masing-masing lulus 4 kasus. Pengguna melaporkan seluruh verifikasi manual Windows lulus.
 
-- [ ] Coba tiap mode dan amati validasi input, progres, hasil kosong, dan kegagalan baca.
-- [ ] Pastikan input, scroll graph, dan pindah tab tetap responsif pada repo besar, termasuk saat batas 500 hasil tercapai.
-- [ ] Uji pesan multi-baris, nama dan email penulis, hash penuh/prefix, path dengan spasi dan subdirektori, perbedaan kapitalisasi Git di Windows, serta root, delete, dan repo shallow.
-- [ ] Pilih hasil dekat dan jauh. Verifikasi graph scroll ke ID yang tepat dan membuka commit detail, termasuk ketika halaman graph yang memuat ID tersebut belum tiba.
-- [ ] Uji cancel, penggantian query cepat, pindah/tutup tab, serta refresh watcher setelah ref berubah. Abaikan halaman dari query atau repo lama dan ulangi scan dari disk saat referensi berubah.
+- [x] Coba tiap mode dan amati validasi input, progres, hasil kosong, dan kegagalan baca.
+- [x] Pastikan input, scroll graph, dan pindah tab tetap responsif pada repo besar, termasuk saat batas 500 hasil tercapai.
+- [x] Uji pesan multi-baris, nama dan email penulis, hash penuh/prefix, path dengan spasi dan subdirektori, perbedaan kapitalisasi Git di Windows, serta root, delete, dan repo shallow.
+- [x] Pilih hasil dekat dan jauh. Verifikasi graph scroll ke ID yang tepat dan membuka commit detail, termasuk ketika halaman graph yang memuat ID tersebut belum tiba.
+- [x] Uji cancel, penggantian query cepat, pindah/tutup tab, serta refresh watcher setelah ref berubah. Abaikan halaman dari query atau repo lama dan ulangi scan dari disk saat referensi berubah.
 - [x] Jalankan `cargo xtask check` di Windows pada gabungan akhir.
