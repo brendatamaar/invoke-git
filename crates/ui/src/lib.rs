@@ -20,6 +20,7 @@ pub mod editor_model;
 pub mod focus;
 pub mod fonts;
 pub mod graph_view;
+pub mod rebase_editor;
 pub mod ref_labels;
 pub mod reflog_view;
 pub mod scrollbar;
@@ -43,6 +44,10 @@ pub use diff_view::{
     Around, Content as DiffContent, DiffData, DiffEvent, DiffView, InputsMeta, StageMode,
 };
 pub use graph_view::{GraphEvent, GraphView, RowMeta};
+pub use rebase_editor::{
+    ALL_ACTIONS, ActionCounts, RebaseEditor, RebaseEditorEvent, RebaseEditorModel, RebaseRow,
+    action_description, action_label, plan_error_message,
+};
 pub use sidebar::{SideAction, SideRow, Sidebar, sidebar_rows};
 pub use status_tree::{StatusTree, TreeAction, TreeRow, tree_rows};
 pub use summary::{RepoSummary, Summary};

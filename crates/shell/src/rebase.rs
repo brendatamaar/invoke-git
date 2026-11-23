@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use invoke_core::detect::detect_phase;
 use invoke_core::{
-    Conflicts, ErrorClass, Expect, Failure, GitArgs, Operation, Phase, RebaseAction, RebaseOrigin,
-    RebasePlan, RefValue,
+    Conflicts, ErrorClass, Expect, Failure, GitArgs, Oid, Operation, Phase, RebaseAction,
+    RebaseOrigin, RebasePlan, RefValue,
 };
 
 use crate::precondition::{self, RepoPaths};
@@ -157,6 +157,64 @@ fn check_plan(paths: &RepoPaths, plan: &RebasePlan, expect: &Expect) -> Result<(
         ));
     }
     Ok(())
+}
+
+/// One commit in a linear rebase range, read for the interactive rebase editor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebaseCommit {
+    pub oid: Oid,
+    pub subject: String,
+    pub author: String,
+}
+
+/// Read every commit strictly above `upstream` up to `head`, oldest first.
+/// Refuses non-linear ranges (merges) or commits that are not ancestors of `head`,
+/// matching [`check_plan`].
+pub fn read_rebase_commits(
+    paths: &RepoPaths,
+    upstream: &Oid,
+    head: &Oid,
+) -> Result<Vec<RebaseCommit>, String> {
+    if upstream == head {
+        return Err("Choose a commit older than HEAD to rebase onto.".into());
+    }
+    let repo = precondition::open(paths)?;
+    let mut next = head.clone();
+    let mut commits = Vec::new();
+    while &next != upstream {
+        let id =
+            gix::ObjectId::from_hex(next.as_hex().as_bytes()).map_err(|error| error.to_string())?;
+        let commit = repo
+            .find_commit(id)
+            .map_err(|error| format!("Could not read {next}: {error}"))?;
+        let message = commit
+            .message()
+            .map(|m| m.summary().to_string())
+            .unwrap_or_default();
+        let author = commit
+            .author()
+            .map(|a| a.name.to_string())
+            .unwrap_or_default();
+        commits.push(RebaseCommit {
+            oid: next.clone(),
+            subject: message,
+            author,
+        });
+        let mut parents = commit.parent_ids();
+        next = match (parents.next(), parents.next()) {
+            (Some(parent), None) => precondition::oid(&parent)?,
+            (None, _) => {
+                return Err("The chosen commit is not an ancestor of HEAD.".into());
+            }
+            (Some(_), Some(_)) => {
+                return Err(
+                    "Interactive rebase requires a linear range with no merge commits.".into(),
+                );
+            }
+        };
+    }
+    commits.reverse();
+    Ok(commits)
 }
 
 /// The todo travels in a file because Windows limits the size of one

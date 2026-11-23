@@ -2,7 +2,7 @@
 //! is pure (state in, text out); only [`RepoSummary`] draws.
 
 use gpui::{App, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div, px};
-use invoke_core::{Freshness, Head, LockState, Phase, RepoState, Snapshot, Tracking};
+use invoke_core::{Freshness, Head, LockState, Phase, RebasePause, RepoState, Snapshot, Tracking};
 use tokens::{SPACE_2, SPACE_3, TEXT_BODY, TEXT_SMALL};
 
 use crate::components::{Banner, BannerKind, Pill};
@@ -95,11 +95,18 @@ impl Summary {
                 step,
                 total,
                 conflicts,
+                pause,
                 ..
-            } => Some(format!(
-                "Rebasing {step}/{total}{}",
-                conflicts_text(conflicts.unresolved_count())
-            )),
+            } => {
+                let detail = if conflicts.unresolved_count() > 0 {
+                    conflicts_text(conflicts.unresolved_count())
+                } else if *pause == RebasePause::Edit {
+                    ": paused for edit".to_owned()
+                } else {
+                    String::new()
+                };
+                Some(format!("Rebasing {step}/{total}{detail}"))
+            }
             Phase::CherryPicking { conflicts } => Some(format!(
                 "Cherry-picking{}",
                 conflicts_text(conflicts.unresolved_count())
@@ -382,6 +389,22 @@ mod tests {
             RefsSnapshot::default(),
         )));
         assert_eq!(s.phase.as_deref(), Some("Rebasing 3/7"));
+
+        let edit = Summary::of(&state_with(disk(
+            Head::Branch {
+                name: main_branch(),
+                oid: oid(),
+            },
+            Phase::Rebasing {
+                step: 2,
+                total: 4,
+                conflicts: Conflicts::from_parts([], []),
+                pause: RebasePause::Edit,
+                origin: None,
+            },
+            RefsSnapshot::default(),
+        )));
+        assert_eq!(edit.phase.as_deref(), Some("Rebasing 2/4: paused for edit"));
     }
 
     #[test]
