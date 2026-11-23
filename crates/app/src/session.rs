@@ -52,6 +52,7 @@ impl Gate {
 pub struct RepoSession {
     pub discovered: Discovered,
     pub state: RepoState,
+    pub blame: shell::blame::BlameReader,
     /// Why the watcher could not start, if it could not: the repo still
     /// works, but only changes made here show up.
     pub watch_error: Option<String>,
@@ -87,6 +88,7 @@ impl RepoSession {
         let session = Self {
             discovered,
             state,
+            blame: shell::blame::BlameReader::new(git.clone(), paths.clone()),
             watch_error,
             events,
             runner: Arc::new(Self::git_runner(git.clone(), paths.clone())),

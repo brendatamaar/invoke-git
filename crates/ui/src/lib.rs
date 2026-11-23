@@ -49,3 +49,4 @@ pub use text::TextStyleExt;
 pub use text_editor::{EditorEvent, TextEditor, bind_keys as bind_editor_keys};
 pub use theme::{ThemeExt, UiTheme, init, set_theme};
 pub use welcome::Welcome;
+pub mod blame_view;

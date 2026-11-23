@@ -10,7 +10,7 @@ use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window,
     div, px,
 };
-use invoke_core::{Event, Notice, ReadId, RepoPath, Snapshot, StatusSnapshot};
+use invoke_core::{Event, FileChange, Notice, ReadId, RepoPath, Snapshot, StatusSnapshot};
 use tokens::{SIDEBAR, SPACE_2, SPACE_8, TEXT_SMALL};
 use ui::convert::hsla;
 use ui::{
@@ -20,9 +20,11 @@ use ui::{
 
 use crate::branch_panel::BranchPanel;
 use crate::commit_box::CommitBox;
+use crate::commit_pane::InspectFile;
 use crate::conflict_view::ConflictPane;
 use crate::diff_load::{self, Loaded, Verb};
 use crate::discard::{self, Confirm, What};
+use crate::file_insights::{FileInsights, FileInsightsEvent, FileMode, FileVersion, file_actions};
 use crate::history_view::HistoryPane;
 use crate::notice::{self, Tone};
 use crate::review_view::{ReviewEvent, ReviewPane};
@@ -42,6 +44,13 @@ enum Page {
     Review,
     /// The resolver of a paused merge, rebase, cherry-pick or revert (task 23).
     Conflicts,
+    FileInsights(FileBack),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileBack {
+    Changes,
+    History,
 }
 
 /// Files to stage or unstage one after another. Each stage is built from a
@@ -59,6 +68,7 @@ pub struct RepoView {
     pub session: Entity<RepoSession>,
     page: Page,
     history: Entity<HistoryPane>,
+    file_insights: Entity<FileInsights>,
     commit: Entity<CommitBox>,
     branches: Entity<BranchPanel>,
     sync_buttons: Entity<SyncButtons>,
@@ -114,6 +124,10 @@ impl RepoView {
         if self.page == Page::Review && page != Page::Review {
             self.review.update(cx, |review, _| review.close());
         }
+        if matches!(self.page, Page::FileInsights(_)) && !matches!(page, Page::FileInsights(_)) {
+            self.file_insights
+                .update(cx, |insights, _| insights.close());
+        }
         self.page = page;
         if page == Page::Review {
             self.review.update(cx, |review, cx| review.open(cx));
@@ -128,6 +142,8 @@ impl RepoView {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|_| DiffView::new());
         let history = cx.new(|cx| HistoryPane::new(session.clone(), cx));
+        let reader = session.read(cx).blame.clone();
+        let file_insights = cx.new(|_| FileInsights::new(reader));
         let commit = cx.new(|cx| CommitBox::new(session.clone(), cx));
         let branches = cx.new(|cx| BranchPanel::new(session.clone(), cx));
         let sync_buttons = cx.new(|cx| SyncButtons::new(session.clone(), cx));
@@ -151,10 +167,33 @@ impl RepoView {
             this.diff_event(event, cx)
         })
         .detach();
+        cx.subscribe(&history, |this, _, event: &InspectFile, cx| {
+            this.inspect_file(event.0.clone(), event.1, FileBack::History, cx);
+        })
+        .detach();
+        cx.subscribe(
+            &file_insights,
+            |this, _, event: &FileInsightsEvent, cx| match event {
+                FileInsightsEvent::Back => {
+                    let page = match this.page {
+                        Page::FileInsights(FileBack::History) => Page::History,
+                        _ => Page::Changes,
+                    };
+                    this.show(page, cx);
+                }
+                FileInsightsEvent::Commit(id) => {
+                    this.show(Page::History, cx);
+                    this.history
+                        .update(cx, |history, cx| history.open_commit(*id, cx));
+                }
+            },
+        )
+        .detach();
         Self {
             session,
             page: Page::Changes,
             history,
+            file_insights,
             commit,
             branches,
             sync_buttons,
@@ -172,6 +211,41 @@ impl RepoView {
             last_read: None,
             request: 0,
         }
+    }
+
+    fn inspect_file(
+        &mut self,
+        file: FileVersion,
+        mode: FileMode,
+        back: FileBack,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_insights
+            .update(cx, |insights, cx| insights.open(file, mode, cx));
+        self.show(Page::FileInsights(back), cx);
+    }
+
+    fn inspect_change(&mut self, mode: FileMode, cx: &mut Context<Self>) {
+        let Some((section, path)) = self.selected.clone() else {
+            return;
+        };
+        let deleted = self.status(cx).is_some_and(|status| {
+            status.entries.iter().any(|entry| {
+                entry.path == path
+                    && (entry.unstaged == Some(FileChange::Deleted)
+                        || (section == Section::Staged
+                            && entry.staged == Some(FileChange::Deleted)))
+            })
+        });
+        self.inspect_file(
+            FileVersion {
+                path: path.0,
+                revision: deleted.then(|| "HEAD".to_owned()),
+            },
+            mode,
+            FileBack::Changes,
+            cx,
+        );
     }
 
     fn status(&self, cx: &Context<Self>) -> Option<StatusSnapshot> {
@@ -596,7 +670,7 @@ impl Render for RepoView {
                 Page::History => 1,
                 Page::Conflicts => 2,
                 // None is chosen while the review is open.
-                Page::Review => 3,
+                Page::Review | Page::FileInsights(_) => usize::MAX,
             },
             move |index, _, cx| {
                 switch.update(cx, |view, cx| {
@@ -687,6 +761,11 @@ impl Render for RepoView {
         });
 
         let body = match self.page {
+            Page::FileInsights(_) => div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .child(self.file_insights.clone()),
             Page::Conflicts => div()
                 .flex()
                 .flex_1()
@@ -721,7 +800,28 @@ impl Render for RepoView {
                         }))
                         .child(self.commit.clone()),
                 )
-                .child(div().flex_1().min_w(px(0.)).child(self.diff.clone())),
+                .child({
+                    let inspect = cx.entity();
+                    let buttons = self.selected.as_ref().map(|_| {
+                        file_actions(move |mode, cx| {
+                            inspect.update(cx, |view, cx| view.inspect_change(mode, cx));
+                        })
+                    });
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .children(buttons.map(|buttons| {
+                            div()
+                                .flex()
+                                .flex_none()
+                                .gap(px(SPACE_2))
+                                .p(px(SPACE_2))
+                                .children(buttons)
+                        }))
+                        .child(div().flex().flex_1().min_h(px(0.)).child(self.diff.clone()))
+                }),
         };
         let sidebar = div()
             .flex_none()

@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, Point,
-    Render, Styled, Subscription, Task, Window, anchored, deferred, div, px,
+    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
+    Pixels, Point, Render, Styled, Subscription, Task, Window, anchored, deferred, div, px,
 };
 use invoke_core::{Head, Oid, RefsSnapshot, Snapshot};
 use shell::history::{CommitId, CommitMeta, HistoryEvent, read_meta, walk};
@@ -20,7 +20,7 @@ use ui::{GraphEvent, GraphView, RowMeta, ref_labels::ref_labels};
 use ui::ThemeExt;
 use ui::convert::hsla;
 
-use crate::commit_pane::{CommitPane, replay_buttons};
+use crate::commit_pane::{CommitPane, InspectFile, replay_buttons};
 use crate::session::RepoSession;
 
 /// The width of the commit detail beside the graph.
@@ -37,6 +37,8 @@ pub struct HistoryPane {
     _walk: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<InspectFile> for HistoryPane {}
 
 /// What a row shows for `meta`, with the date relative to `now`.
 pub fn row_meta(meta: &CommitMeta, now: i64) -> RowMeta {
@@ -59,6 +61,9 @@ impl HistoryPane {
         let graph = cx.new(|_| GraphView::<CommitId>::new());
         let detail = cx.new(|cx| CommitPane::new(session.clone(), cx));
         let subscriptions = vec![
+            cx.subscribe(&detail, |_, _, event: &InspectFile, cx| {
+                cx.emit(InspectFile(event.0.clone(), event.1));
+            }),
             cx.subscribe(&graph, |this, graph, event: &GraphEvent, cx| match event {
                 GraphEvent::NeedMeta(range) => this.load_meta(range.clone(), cx),
                 GraphEvent::Selected(row) => {
@@ -99,6 +104,11 @@ impl HistoryPane {
         self.started = true;
         self.sync_refs(cx);
         self.start_walk(false, cx);
+    }
+
+    pub fn open_commit(&mut self, id: CommitId, cx: &mut Context<Self>) {
+        self.detail
+            .update(cx, |detail, cx| detail.show(Some(id), cx));
     }
 
     /// The refs and `HEAD` of the newest read, if one has landed.

@@ -4,8 +4,8 @@
 //! longer the chosen one is dropped.
 
 use gpui::{
-    AppContext, ClipboardItem, Context, Entity, IntoElement, ParentElement, Render, Styled, Window,
-    div, px,
+    AppContext, ClipboardItem, Context, Entity, EventEmitter, IntoElement, ParentElement, Render,
+    Styled, Window, div, px,
 };
 use invoke_core::{Event, FileChange, Oid, RepoPath, Snapshot};
 use shell::InputsError;
@@ -20,7 +20,11 @@ use ui::{
     split_message,
 };
 
+use crate::file_insights::{FileMode, FileVersion, file_actions};
 use crate::session::RepoSession;
+
+pub struct InspectFile(pub FileVersion, pub FileMode);
+impl EventEmitter<InspectFile> for CommitPane {}
 
 pub(crate) fn replay_buttons(
     oid: Oid,
@@ -287,6 +291,23 @@ impl Render for CommitPane {
                         session.update(cx, |session, cx| session.deliver(event, cx));
                     })
                 });
+                let file = selected.and_then(|ix| info.files.get(ix)).and_then(|file| {
+                    let revision = if matches!(file.change, FileChange::Deleted) {
+                        info.parents.first()?.to_string()
+                    } else {
+                        hash.clone()
+                    };
+                    Some(FileVersion {
+                        path: file.path.to_string(),
+                        revision: Some(revision),
+                    })
+                });
+                let inspect = cx.entity();
+                let file_buttons = file.map(|file| {
+                    file_actions(move |mode, cx| {
+                        inspect.update(cx, |_, cx| cx.emit(InspectFile(file.clone(), mode)));
+                    })
+                });
                 CommitDetail::new(
                     info.clone(),
                     *selected,
@@ -294,6 +315,7 @@ impl Render for CommitPane {
                     move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(hash.clone())),
                 )
                 .actions(actions.into_iter().flatten())
+                .actions(file_buttons.into_iter().flatten())
                 .diff(self.diff.clone())
                 .into_any_element()
             }
