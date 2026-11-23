@@ -405,7 +405,9 @@ impl Sim {
             | GitArgs::Abort { .. }
             // P2.
             | GitArgs::CherryPick { .. }
-            | GitArgs::Revert { .. } => {
+            | GitArgs::Revert { .. }
+            // P7.
+            | GitArgs::Reset { .. } => {
                 panic!("no commits, stashes or remotes in this simulation")
             }
         }
