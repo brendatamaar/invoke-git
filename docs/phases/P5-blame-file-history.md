@@ -1,5 +1,5 @@
 # P5 - Blame & File History
-Status: todo
+Status: in-progress
 Depends on: P1
 Parallel-safe with: P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11
 

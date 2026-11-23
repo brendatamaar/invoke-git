@@ -21,7 +21,7 @@
 | P3 | Tags (Create, Push, Delete) | todo | P1 | P1b, P2, P4a, P4b, P5, P6, P7, P8, P11 |
 | P4a | Interactive Rebase Core & v0.2 Law Gate | todo | P2 | P3, P5, P6, P7, P8, P11 |
 | P4b | Interactive Rebase Editor UI | todo | P4a | P3, P5, P6, P7, P8, P9, P10, P11 |
-| P5 | Blame & File History | todo | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
+| P5 | Blame & File History | in-progress | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
 | P6 | Commit Search | todo | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
 | P7 | Reflog View | todo | P1 | P1b, P2, P3, P4a, P4b, P5, P6, P8, P9, P10, P11 |
 | P8 | Forge Auth & Repo List (GitHub/GitLab) | todo | P1 | P1b, P2, P3, P4a, P4b, P5, P6, P7, P10, P11 |
