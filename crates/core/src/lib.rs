@@ -18,6 +18,7 @@ pub mod stash;
 pub mod state;
 mod step;
 pub mod undo;
+pub mod undo_codec;
 pub mod watch;
 
 pub use conflict::{
@@ -45,6 +46,6 @@ pub use state::{
 };
 pub use step::{open, step};
 pub use undo::{
-    DiscardRestore, HeadRestore, Irreversible, MAX_POINTS, RestoreRef, Reversal, Reversible,
-    StashRestore, UndoEntry, UndoPending, UndoReplay, UndoStack,
+    DiscardRestore, HeadRestore, Irreversible, MAX_POINTS, RestoreRef, Restored, Reversal,
+    Reversible, StashRestore, UndoEntry, UndoPending, UndoReplay, UndoStack,
 };

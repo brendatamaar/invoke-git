@@ -350,3 +350,108 @@ impl UndoRunner {
 fn failed(class: ErrorClass, details: String) -> OpOutcome {
     OpOutcome::Failed(Failure { class, details })
 }
+
+/// What is left of the undo points kept from an earlier run (task 22).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reconciled {
+    /// The points whose saved trees (and stash or discard copies) are still
+    /// in the repository, in their old order.
+    pub kept: Vec<invoke_core::UndoEntry>,
+    /// Ops that have refs under `refs/invoke-git/undo/` but no kept point:
+    /// to be pruned.
+    pub orphans: Vec<OpId>,
+}
+
+/// The op a ref under `refs/invoke-git/undo/` belongs to: `12`, `12-stash`,
+/// `12-discard` and `12-discard-after` are all op 12.
+pub fn op_of_ref(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("refs/invoke-git/undo/")?;
+    let digits = rest.split('-').next()?;
+    let op: u64 = digits.parse().ok()?;
+    // Only the spellings this app writes: no sign, no leading zero.
+    (op.to_string() == digits).then_some(op)
+}
+
+/// Checks the points kept from an earlier run against the refs now in the
+/// repository: a point whose saved tree is gone cannot be undone and is left
+/// out; refs of ops that are not kept (a point that fell off the stack, a
+/// crash between a snapshot and its record) are reported for pruning.
+pub fn reconcile(
+    paths: &RepoPaths,
+    entries: Vec<invoke_core::UndoEntry>,
+) -> Result<Reconciled, String> {
+    let repo = precondition::open(paths)?;
+    let platform = repo
+        .references()
+        .map_err(|error| format!("read refs: {error}"))?;
+    let found = platform
+        .prefixed("refs/invoke-git/undo/")
+        .map_err(|error| format!("read refs: {error}"))?;
+    let mut names = std::collections::BTreeSet::new();
+    for reference in found {
+        let reference = reference.map_err(|error| format!("read ref: {error}"))?;
+        names.insert(reference.name().as_bstr().to_string());
+    }
+    let has = |name: String| names.contains(&name);
+    let kept: Vec<invoke_core::UndoEntry> = entries
+        .into_iter()
+        .filter(|entry| {
+            let op = entry.point.op;
+            has(undo_ref(op))
+                && match &entry.point.reverse {
+                    Reversal::StashStore(_) | Reversal::StashKept(_) => has(stash_keep_ref(op)),
+                    Reversal::Discard { .. } => has(discard_ref(op)) && has(discard_after_ref(op)),
+                    Reversal::Refs | Reversal::Never(_) => true,
+                }
+        })
+        .collect();
+    let live: std::collections::BTreeSet<u64> = kept.iter().map(|entry| entry.point.op.0).collect();
+    let mut orphans: Vec<OpId> = names
+        .iter()
+        .filter_map(|name| op_of_ref(name))
+        .filter(|op| !live.contains(op))
+        .collect::<std::collections::BTreeSet<u64>>()
+        .into_iter()
+        .map(OpId)
+        .collect();
+    orphans.sort();
+    Ok(Reconciled { kept, orphans })
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn a_ref_belongs_to_the_op_in_its_name() {
+        for (name, op) in [
+            ("refs/invoke-git/undo/12", Some(12)),
+            ("refs/invoke-git/undo/12-stash", Some(12)),
+            ("refs/invoke-git/undo/12-discard-after", Some(12)),
+            ("refs/invoke-git/undo/0", Some(0)),
+            ("refs/invoke-git/undo/012", None),
+            ("refs/invoke-git/undo/x", None),
+            ("refs/invoke-git/undo/", None),
+            ("refs/heads/12", None),
+            ("refs/invoke-git/undo/-5", None),
+        ] {
+            assert_eq!(op_of_ref(name), op, "{name}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn the_op_of_a_ref_we_write_is_found(op in any::<u64>()) {
+            for name in [
+                undo_ref(OpId(op)),
+                stash_keep_ref(OpId(op)),
+                discard_ref(OpId(op)),
+                discard_after_ref(OpId(op)),
+            ] {
+                prop_assert_eq!(op_of_ref(&name), Some(op));
+            }
+        }
+    }
+}

@@ -154,6 +154,18 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         Event::RefreshRequested => request_read(&mut state, ReadScope::full(), &mut commands),
         Event::NoticeDismissed => state.notice = None,
         Event::RemoveStaleLockRequested => remove_stale_lock(&mut state, &mut commands),
+        Event::UndoStackRestored(entries) => {
+            if let Some(restored) = state.undo.restore(entries) {
+                // Op ids name the saved trees of the restored points, so new
+                // operations must not reuse them.
+                if let Some(max) = restored.max_op {
+                    state.ops.next = OpId(state.ops.next.0.max(max.0 + 1));
+                }
+                if !restored.dropped.is_empty() {
+                    commands.push(Command::PruneUndo(restored.dropped));
+                }
+            }
+        }
         // Law 11: a change on disk is never patched in; it is read again.
         Event::DiskChanged(ChangeSet(areas)) => {
             if !areas.is_empty() {

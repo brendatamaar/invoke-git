@@ -14,13 +14,40 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{Context, Task};
 use invoke_core::{
-    Area, ChangeSet, Command, Event, OpId, RepoId, RepoState, UndoPoint, open, step,
+    Area, ChangeSet, Command, Event, OpId, RepoId, RepoState, UndoEntry, UndoPoint, open, step,
 };
 use shell::undo::Snapshotted;
 use shell::{
     DiscardRunner, Discovered, Git, GitRunner, RepoWatcher, StagingRunner, UndoRunner,
     read::read_event,
 };
+
+/// Starts closed and opens once; waiting threads then go on.
+#[derive(Default)]
+struct Gate {
+    open: Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl Gate {
+    fn open(&self) {
+        if let Ok(mut open) = self.open.lock() {
+            *open = true;
+        }
+        self.changed.notify_all();
+    }
+
+    fn wait(&self) {
+        if let Ok(mut open) = self.open.lock() {
+            while !*open {
+                match self.changed.wait(open) {
+                    Ok(next) => open = next,
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+}
 
 pub struct RepoSession {
     pub discovered: Discovered,
@@ -35,6 +62,12 @@ pub struct RepoSession {
     undo: Arc<UndoRunner>,
     /// Operations whose undo snapshot failed: their git run is skipped.
     skip: Arc<Mutex<BTreeSet<OpId>>>,
+    /// Opens when the undo points of the last run have been checked against
+    /// the repo (and the refs of stale ones pruned): no new snapshot is taken
+    /// before, so its ref cannot be mistaken for a stale one.
+    ready: Arc<Gate>,
+    /// The undo points as last written to the store.
+    saved_undo: Vec<UndoEntry>,
     _watcher: Option<RepoWatcher>,
     _pump: Task<()>,
 }
@@ -61,11 +94,57 @@ impl RepoSession {
             discard: Arc::new(DiscardRunner::new(git.clone(), paths.clone())),
             undo: Arc::new(UndoRunner::new(git, paths)),
             skip: Arc::default(),
+            ready: Arc::new(Gate::default()),
+            saved_undo: Vec::new(),
             _watcher: watcher,
             _pump: Self::pump(inbox, cx),
         };
         session.exec_all(commands, cx);
+        session.restore_undo(cx);
         session
+    }
+
+    /// Brings back the undo points kept in the store by the last run: the
+    /// ones whose saved trees are still in the repo go to the core, the refs of
+    /// the others are removed. Whatever happens, the gate opens.
+    fn restore_undo(&self, cx: &mut Context<Self>) {
+        let (events, ready, undo) = (self.events.clone(), self.ready.clone(), self.undo.clone());
+        let paths = self.discovered.paths.clone();
+        let repo = crate::notes_db::repo_key(&paths.workdir);
+        let db = crate::notes_db::NotesDb::global();
+        cx.background_executor()
+            .spawn(async move {
+                let kept = db.load_undo(&repo).map(|(entries, _skipped)| entries);
+                let restored = kept.and_then(|entries| shell::undo::reconcile(&paths, entries));
+                if let Ok(restored) = restored {
+                    if !restored.orphans.is_empty() {
+                        undo.prune(&restored.orphans);
+                    }
+                    let _ = events.send(Event::UndoStackRestored(restored.kept));
+                }
+                ready.open();
+            })
+            .detach();
+    }
+
+    /// Writes the undo points to the store when they changed.
+    fn persist_undo(&mut self, cx: &mut Context<Self>) {
+        let entries: Vec<UndoEntry> = self.state.undo.entries.iter().cloned().collect();
+        if entries == self.saved_undo {
+            return;
+        }
+        self.saved_undo = entries.clone();
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let repo = crate::notes_db::repo_key(&self.discovered.paths.workdir);
+        let db = crate::notes_db::NotesDb::global();
+        cx.background_executor()
+            .spawn(async move {
+                // Best effort: undo that does not survive a restart is the
+                // old behaviour, not a failure.
+                let _ = db.save_undo(&repo, generation, entries);
+            })
+            .detach();
     }
 
     /// The runner for git commands. Network operations ask for credentials in
@@ -87,6 +166,7 @@ impl RepoSession {
         let (state, commands) = step(std::mem::replace(&mut self.state, placeholder), event);
         self.state = state;
         self.exec_all(commands, cx);
+        self.persist_undo(cx);
         cx.notify();
     }
 
@@ -166,8 +246,10 @@ impl RepoSession {
     fn snapshot(&self, point: UndoPoint, done: Option<Sender<()>>, cx: &mut Context<Self>) {
         let events = self.events.clone();
         let (undo, skip) = (self.undo.clone(), self.skip.clone());
+        let ready = self.ready.clone();
         cx.background_executor()
             .spawn(async move {
+                ready.wait();
                 let event = match undo.snapshot(&point) {
                     Snapshotted::Taken(event) => event,
                     Snapshotted::Failed(event) => {

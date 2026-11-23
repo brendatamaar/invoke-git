@@ -12,7 +12,41 @@ use invoke_core::notes::{Anchor, Note, NoteId, clean_body};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// The version of the schema this build writes.
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
+
+/// Each step takes the file from the version before it to its own. A step
+/// only adds; nothing here drops or rewrites what an older build wrote.
+const MIGRATIONS: [(i64, &str); 2] = [
+    (
+        1,
+        "CREATE TABLE notes (
+             id        INTEGER PRIMARY KEY AUTOINCREMENT,
+             repo      TEXT    NOT NULL,
+             branch    TEXT    NOT NULL,
+             commit_id TEXT    NOT NULL,
+             path      TEXT    NOT NULL,
+             line      INTEGER NOT NULL,
+             line_text TEXT    NOT NULL,
+             body      TEXT    NOT NULL,
+             todo      INTEGER NOT NULL,
+             resolved  INTEGER NOT NULL,
+             created   INTEGER NOT NULL,
+             updated   INTEGER NOT NULL
+         );
+         CREATE INDEX notes_by_repo ON notes (repo);",
+    ),
+    // Task 22, part 2: the undo stack, one line per point (see
+    // `invoke_core::undo_codec`), in order.
+    (
+        2,
+        "CREATE TABLE undo (
+             repo  TEXT    NOT NULL,
+             seq   INTEGER NOT NULL,
+             entry TEXT    NOT NULL,
+             PRIMARY KEY (repo, seq)
+         );",
+    ),
+];
 
 pub struct Store {
     conn: Connection,
@@ -47,34 +81,20 @@ impl Store {
         let found: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|e| failed("read the store version", e))?;
-        match found {
-            0 => conn
-                .execute_batch(&format!(
+        if found > VERSION {
+            return Err(format!(
+                "the store was written by a newer Invoke Git (version {found}); this one understands {VERSION}"
+            ));
+        }
+        for (version, sql) in MIGRATIONS {
+            if found < version {
+                conn.execute_batch(&format!(
                     "BEGIN;
-                     CREATE TABLE notes (
-                         id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                         repo      TEXT    NOT NULL,
-                         branch    TEXT    NOT NULL,
-                         commit_id TEXT    NOT NULL,
-                         path      TEXT    NOT NULL,
-                         line      INTEGER NOT NULL,
-                         line_text TEXT    NOT NULL,
-                         body      TEXT    NOT NULL,
-                         todo      INTEGER NOT NULL,
-                         resolved  INTEGER NOT NULL,
-                         created   INTEGER NOT NULL,
-                         updated   INTEGER NOT NULL
-                     );
-                     CREATE INDEX notes_by_repo ON notes (repo);
-                     PRAGMA user_version = {VERSION};
-                     COMMIT;"
+{sql}
+PRAGMA user_version = {version};
+COMMIT;"
                 ))
-                .map_err(|e| failed("create the store", e))?,
-            VERSION => {}
-            newer => {
-                return Err(format!(
-                    "the store was written by a newer Invoke Git (version {newer}); this one understands {VERSION}"
-                ));
+                .map_err(|e| failed(&format!("update the store to version {version}"), e))?;
             }
         }
         Ok(Self { conn })
@@ -207,6 +227,52 @@ impl Store {
             .map_err(|e| failed("change the note", e))
     }
 
+    /// Replaces the undo points kept for `repo` with `entries` (oldest
+    /// first), all or nothing.
+    pub fn save_undo(
+        &self,
+        repo: &str,
+        entries: impl IntoIterator<Item = invoke_core::UndoEntry>,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| failed("save the undo points", e))?;
+        tx.execute("DELETE FROM undo WHERE repo = ?1", params![repo])
+            .map_err(|e| failed("save the undo points", e))?;
+        for (seq, entry) in entries.into_iter().enumerate() {
+            tx.execute(
+                "INSERT INTO undo (repo, seq, entry) VALUES (?1, ?2, ?3)",
+                params![repo, seq as i64, invoke_core::undo_codec::encode(&entry)],
+            )
+            .map_err(|e| failed("save the undo points", e))?;
+        }
+        tx.commit().map_err(|e| failed("save the undo points", e))
+    }
+
+    /// The undo points kept for `repo`, oldest first, and how many rows could
+    /// not be read (a row from a build that wrote another format is skipped,
+    /// never guessed at).
+    pub fn load_undo(&self, repo: &str) -> Result<(Vec<invoke_core::UndoEntry>, usize), String> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT entry FROM undo WHERE repo = ?1 ORDER BY seq")
+            .map_err(|e| failed("read the undo points", e))?;
+        let rows = statement
+            .query_map(params![repo], |row| row.get::<_, String>(0))
+            .map_err(|e| failed("read the undo points", e))?;
+        let (mut entries, mut skipped) = (Vec::new(), 0);
+        for row in rows {
+            match invoke_core::undo_codec::decode(
+                &row.map_err(|e| failed("read the undo points", e))?,
+            ) {
+                Ok(entry) => entries.push(entry),
+                Err(_) => skipped += 1,
+            }
+        }
+        Ok((entries, skipped))
+    }
+
     /// The schema version found on disk (for tests and diagnostics).
     pub fn version(&self) -> Result<i64, String> {
         self.conn
@@ -310,6 +376,95 @@ mod tests {
             ("topic", "check", 1)
         );
         assert!(!store.reanchor("other", note.id, "c", 1).unwrap());
+    }
+
+    fn undo_entry(op: u64, label: &str) -> invoke_core::UndoEntry {
+        use invoke_core::{
+            HeadTarget, IndexEffect, IndexId, Oid, OpId, Reversal, Reversible, UndoEntry, UndoPoint,
+        };
+        UndoEntry {
+            point: UndoPoint {
+                op: OpId(op),
+                label: label.into(),
+                head: HeadTarget::Detached,
+                refs: Vec::new(),
+                index: IndexId::Absent,
+                index_effect: IndexEffect::Untouched,
+                reverse: Reversal::Refs,
+            },
+            tree: Oid::from_hex(&"a".repeat(40)).unwrap(),
+            after_refs: Vec::new(),
+            after_index: IndexId::Absent,
+            after_head: HeadTarget::Detached,
+            reversible: Reversible::Yes,
+        }
+    }
+
+    #[test]
+    fn undo_points_are_replaced_as_a_whole_and_kept_per_repo() {
+        let store = Store::open_in_memory().unwrap();
+        let (first, second, other) = (
+            vec![undo_entry(5, "a"), undo_entry(10, "b"), undo_entry(2, "c")],
+            vec![undo_entry(3, "c")],
+            vec![undo_entry(9, "z")],
+        );
+        store.save_undo("r", first.clone()).unwrap();
+        store.save_undo("other", other.clone()).unwrap();
+        assert_eq!(store.load_undo("r").unwrap(), (first, 0));
+        store.save_undo("r", second.clone()).unwrap();
+        assert_eq!(store.load_undo("r").unwrap(), (second, 0));
+        assert_eq!(store.load_undo("other").unwrap(), (other, 0));
+        store.save_undo("r", Vec::new()).unwrap();
+        assert_eq!(store.load_undo("r").unwrap(), (Vec::new(), 0));
+        assert_eq!(store.load_undo("nobody").unwrap(), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn a_row_in_another_format_is_skipped_and_counted() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_undo("r", vec![undo_entry(1, "a"), undo_entry(2, "b")])
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE undo SET entry = 'u9\tfuture' WHERE seq = 0", [])
+            .unwrap();
+        let (entries, skipped) = store.load_undo("r").unwrap();
+        assert_eq!((entries.len(), skipped), (1, 1));
+        assert_eq!(entries[0].point.op.0, 2);
+    }
+
+    #[test]
+    fn a_file_from_the_first_version_gains_the_undo_table_and_keeps_its_notes() {
+        let dir = std::env::temp_dir().join(format!("invoke-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("old.sqlite");
+        {
+            // What version 1 wrote: the notes table and nothing else.
+            let conn = Connection::open(&file).unwrap();
+            conn.execute_batch(&format!(
+                "BEGIN; {} PRAGMA user_version = 1; COMMIT;",
+                MIGRATIONS[0].1
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO notes (repo, branch, commit_id, path, line, line_text, body, todo, resolved, created, updated)
+                 VALUES ('r', 'main', 'c', 'a', 1, 't', 'old note', 1, 0, 5, 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&file).unwrap();
+        assert_eq!(store.version().unwrap(), VERSION);
+        assert_eq!(store.notes("r").unwrap()[0].body, "old note");
+        store.save_undo("r", vec![undo_entry(4, "x")]).unwrap();
+        assert_eq!(store.load_undo("r").unwrap().0.len(), 1);
+        drop(store);
+        // And opening it again changes nothing.
+        let again = Store::open(&file).unwrap();
+        assert_eq!(again.notes("r").unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

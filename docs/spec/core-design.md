@@ -147,7 +147,7 @@ Undo restores refs and the index to their exact values before an operation (law 
 
 **Scope and limits**
 
-- The stack keeps the last 50 points per repo, in memory and in the app's SQLite store so it survives a restart. The store arrives with task 22; until then the stack is in memory only, and undo refs are named by the session's op id. On start-up the stored rows are reconciled against `refs/invoke-git/undo/*` and orphan refs are deleted.
+- The stack keeps the last 50 points per repo, in memory and in the app's SQLite store so it survives a restart (task 22). Undo refs are named by op id, so on start-up the stored points are checked against `refs/invoke-git/undo/*` (a point whose saved tree is gone is left out; refs of ops that are not kept are deleted), and the core continues numbering ops after the highest restored id. No new snapshot is taken before that check is done, and points are taken only while nothing has been recorded in the new run.
 - Push is not undoable (it changed the remote); the UI says so in the push confirmation instead.
 - Saved trees and blobs are referenced from `refs/invoke-git/undo/*` so `git gc` keeps them; the oldest are pruned with their points.
 

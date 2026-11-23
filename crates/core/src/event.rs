@@ -9,7 +9,7 @@ use crate::ops::{
     Progress, PullMode, RemoteBranch, StageRequest,
 };
 use crate::state::{DiskState, Head};
-use crate::undo::{Reversal, UndoReplay};
+use crate::undo::{Reversal, UndoEntry, UndoReplay};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -106,6 +106,10 @@ pub enum Event {
         op: OpId,
         tree: Oid,
     },
+    /// Task 22: the undo points kept from an earlier run, oldest first, after
+    /// the shell checked that each one's saved tree is still in the repo. Taken
+    /// only while nothing has been recorded in this run.
+    UndoStackRestored(Vec<UndoEntry>),
 }
 
 /// Part of the repo a change touched. The watcher (task 6) maps paths to

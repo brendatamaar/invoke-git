@@ -184,7 +184,34 @@ pub struct RestoreRef {
     pub restore: Option<Oid>,
 }
 
+/// What taking restored entries changed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Restored {
+    /// The highest op id among the entries now on the stack.
+    pub max_op: Option<OpId>,
+    /// Entries that did not fit (only the newest [`MAX_POINTS`] are kept):
+    /// their saved trees are to be pruned.
+    pub dropped: Vec<OpId>,
+}
+
 impl UndoStack {
+    /// Task 22: takes the entries of an earlier run, but only while nothing has
+    /// been recorded in this one (an empty stack and no operation in flight):
+    /// anything recorded since is newer and wins. `None`: not taken.
+    pub fn restore(&mut self, mut entries: Vec<UndoEntry>) -> Option<Restored> {
+        if !self.entries.is_empty() || self.pending != UndoPending::Idle {
+            return None;
+        }
+        let excess = entries.len().saturating_sub(MAX_POINTS);
+        let dropped = entries
+            .drain(..excess)
+            .map(|entry| entry.point.op)
+            .collect();
+        let max_op = entries.iter().map(|entry| entry.point.op).max();
+        self.entries = entries.into();
+        Some(Restored { max_op, dropped })
+    }
+
     /// Records an operation that cannot be undone (a push, task 17) so an
     /// undo stops at it with a reason. Returns the points that fell off the
     /// bottom of the stack; the caller prunes them.

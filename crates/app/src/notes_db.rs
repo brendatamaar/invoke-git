@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use invoke_core::UndoEntry;
 use invoke_core::notes::{Anchor, Note, NoteId};
 use shell::store::Store;
 
@@ -14,6 +15,8 @@ pub struct NotesDb {
     /// `None` when the app has no data folder (no notes then, with a reason).
     file: Option<PathBuf>,
     store: Mutex<Option<Store>>,
+    /// The newest generation of undo points saved, by repo.
+    saved: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 /// The key a repo's notes are kept under: its folder, spelled the same way
@@ -34,6 +37,7 @@ impl NotesDb {
         Self {
             file,
             store: Mutex::new(None),
+            saved: Mutex::default(),
         }
     }
 
@@ -59,6 +63,34 @@ impl NotesDb {
             Some(store) => work(store),
             None => Err("the notes store is not open".to_owned()),
         }
+    }
+
+    /// The undo points kept for `repo` (oldest first), and how many rows were
+    /// unreadable.
+    pub fn load_undo(&self, repo: &str) -> Result<(Vec<UndoEntry>, usize), String> {
+        self.run(|store| store.load_undo(repo))
+    }
+
+    /// Keeps `entries` as the undo points of `repo`. `generation` numbers the
+    /// saves in the order they were asked for: two saves may run out of
+    /// order on background threads, and an older one must not overwrite a
+    /// newer one.
+    pub fn save_undo(
+        &self,
+        repo: &str,
+        generation: u64,
+        entries: Vec<UndoEntry>,
+    ) -> Result<(), String> {
+        let mut latest = self
+            .saved
+            .lock()
+            .map_err(|_| "the notes store was left in a bad state".to_owned())?;
+        if latest.get(repo).is_some_and(|last| *last >= generation) {
+            return Ok(());
+        }
+        self.run(|store| store.save_undo(repo, entries))?;
+        latest.insert(repo.to_owned(), generation);
+        Ok(())
     }
 
     pub fn notes(&self, repo: &str) -> Result<Vec<Note>, String> {
@@ -113,6 +145,47 @@ mod tests {
     fn without_a_data_folder_there_is_a_reason_not_a_panic() {
         let db = NotesDb::new(None);
         assert!(db.notes("r").unwrap_err().contains("no folder"));
+    }
+
+    fn point(op: u64) -> UndoEntry {
+        use invoke_core::{
+            HeadTarget, IndexEffect, IndexId, Oid, OpId, Reversal, Reversible, UndoPoint,
+        };
+        UndoEntry {
+            point: UndoPoint {
+                op: OpId(op),
+                label: format!("op {op}"),
+                head: HeadTarget::Detached,
+                refs: Vec::new(),
+                index: IndexId::Absent,
+                index_effect: IndexEffect::Untouched,
+                reverse: Reversal::Refs,
+            },
+            tree: Oid::from_hex(&"a".repeat(40)).unwrap(),
+            after_refs: Vec::new(),
+            after_index: IndexId::Absent,
+            after_head: HeadTarget::Detached,
+            reversible: Reversible::Yes,
+        }
+    }
+
+    #[test]
+    fn an_older_save_never_overwrites_a_newer_one() {
+        let dir = std::env::temp_dir().join(format!("invoke-undodb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = NotesDb::new(Some(dir.join("notes.sqlite")));
+        db.save_undo("r", 2, vec![point(1), point(2)]).unwrap();
+        // The save asked for first finishes last: it is dropped.
+        db.save_undo("r", 1, vec![point(1)]).unwrap();
+        db.save_undo("r", 2, vec![point(9)]).unwrap();
+        assert_eq!(db.load_undo("r").unwrap().0.len(), 2);
+        db.save_undo("r", 3, vec![point(7)]).unwrap();
+        let (entries, skipped) = db.load_undo("r").unwrap();
+        assert_eq!((entries.len(), skipped, entries[0].point.op.0), (1, 0, 7));
+        // Another repo has its own count.
+        db.save_undo("other", 1, vec![point(5)]).unwrap();
+        assert_eq!(db.load_undo("other").unwrap().0.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
