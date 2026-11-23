@@ -318,7 +318,7 @@ impl<'a> Driver<'a> {
                         next.extend(cmds);
                     }
                     Cmd::PruneUndo(ops) => {
-                        let _ = self.undo.prune(&ops);
+                        self.undo.prune(&ops);
                     }
                     other => panic!("unexpected command in reflog test: {other:?}"),
                 }
