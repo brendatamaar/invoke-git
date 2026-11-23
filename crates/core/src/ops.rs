@@ -6,6 +6,7 @@ use crate::conflict::{Operation, ResolveChoice, Side};
 use crate::event::{HeadTarget, RefValue};
 use crate::ids::{BranchName, IndexId, Oid, RefName, RepoPath, TagName};
 use crate::message::CommitMessage;
+use crate::reflog::ResetMode;
 
 /// A write the user asked for, waiting in or running from the op queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +130,14 @@ pub enum WriteRequest {
     },
     Revert {
         commit: Oid,
+        onto: HeadTarget,
+    },
+    // P7: reset the current ref (branch or detached HEAD) to `target`.
+    // `onto` is the kind of `HEAD` the user saw; refused if `HEAD` moved
+    // to another branch by the time it runs (law 9).
+    Reset {
+        target: Oid,
+        mode: ResetMode,
         onto: HeadTarget,
     },
 }
@@ -327,6 +336,13 @@ pub enum GitArgs {
         total: u32,
         origin: crate::RebaseOrigin,
     },
+    // P7. Resets the current ref (`expected_ref`) to `target`; the shell
+    // verifies `expected_ref` as well as `Expect` before running git reset.
+    Reset {
+        target: Oid,
+        mode: ResetMode,
+        expected_ref: RefValue,
+    },
 }
 
 impl GitArgs {
@@ -379,6 +395,7 @@ impl GitArgs {
                 .iter()
                 .map(|branch| at(branch, Some(&origin.tip)))
                 .collect(),
+            GitArgs::Reset { expected_ref, .. } => vec![expected_ref.clone()],
             GitArgs::CreateBranch { name, .. } => vec![at(name, None)],
             GitArgs::CreateTag { name, .. } => vec![tag_at(name, None)],
             GitArgs::DeleteTag { name, tip } | GitArgs::PushTag { name, tip, .. } => {

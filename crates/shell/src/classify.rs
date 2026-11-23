@@ -110,6 +110,10 @@ const MARKERS: [(ErrorClass, &[&str]); 5] = [
             "Your local changes to the following files would be overwritten",
             "already exists, no checkout",
             "could not restore untracked files from stash",
+            // P7: reflog recovery when the target object has been pruned/GC'd.
+            "Could not parse object",
+            "bad object",
+            "unknown revision",
             "No stash entries found",
             "No local changes to save",
             "You do not have the initial commit yet",
@@ -371,6 +375,10 @@ mod tests {
             ("error: no cherry-pick or revert in progress", Expected),
             (
                 "No changes - did you forget to use 'git add'?\nIf there is nothing left to stage, chances are that something else\nalready introduced the same changes; you might want to skip this patch.",
+                Expected,
+            ),
+            (
+                "fatal: Could not parse object '0123456789abcdef0123456789abcdef01234567'.",
                 Expected,
             ),
             ("fatal: something nobody expected", Bug),

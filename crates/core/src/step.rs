@@ -17,6 +17,7 @@ use crate::ops::{
 use crate::rebase::{
     RebaseControl, RebaseFinish, RebaseIntent, RebaseOrigin, RebaseRun, RebaseState, RebaseUndo,
 };
+use crate::reflog;
 use crate::stash;
 use crate::state::{
     Action, BranchRefusal, CommitRefusal, DiskState, Freshness, Head, LockState, Notice, OpPhase,
@@ -115,6 +116,12 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
                     Refusal::NothingSelected,
                 );
             }
+        }
+        // P7: reset the `HEAD` the user sees to a reflog/commit OID.
+        Event::ResetRequested { target, mode } => {
+            request_replay(&mut state, Action::Reset, target, |target, onto| {
+                WriteRequest::Reset { target, mode, onto }
+            })
         }
         Event::SkipRequested => request_conflict(&mut state, Action::Skip, |operation| {
             if operation.can_skip() {
@@ -382,9 +389,14 @@ fn cancel(state: &mut RepoState, op: OpId, commands: &mut Vec<Command>) {
         // continue half way would leave git between two states of its own.
         // Task 13: a discard is one patch run plus the records around it;
         // killing it between the two would lose the undo.
+        // P7: `git reset` is local and quick; killing `--mixed` mid-write could
+        // leave the ref updated without its index reset (law 13).
         if is_stash(&running.request)
             || is_conflict_flow(&running.request)
-            || matches!(running.request, WriteRequest::Discard(_))
+            || matches!(
+                running.request,
+                WriteRequest::Discard(_) | WriteRequest::Reset { .. }
+            )
         {
             return;
         }
@@ -1062,6 +1074,26 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     expect,
                 });
                 state.undo.pending = UndoPending::Recording { point };
+            }
+            // P7: reset the current ref (branch or detached HEAD) to a target
+            // commit (e.g. a reflog entry) with an expected-ref guard and an
+            // undo snapshot (laws 8, 9, 12).
+            WriteRequest::Reset { target, mode, onto } => {
+                match reflog::plan_reset(&disk, id, target, *mode, onto) {
+                    Ok((args, point)) => {
+                        commands.push(Command::SnapshotForUndo(point.clone()));
+                        commands.push(Command::RunGit {
+                            op: id,
+                            args,
+                            expect,
+                        });
+                        state.undo.pending = UndoPending::Recording { point };
+                    }
+                    Err(reason) => {
+                        refuse_because(state, Action::Reset, reason);
+                        continue;
+                    }
+                }
             }
             WriteRequest::Undo => match undo::plan(&state.undo, &disk, id) {
                 Ok(replay) => {

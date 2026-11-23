@@ -353,6 +353,8 @@ pub enum Action {
     CherryPick,
     Revert,
     InteractiveRebase,
+    // P7.
+    Reset,
     // Task 17: the user asked to remove a leftover `index.lock`.
     RemoveLock,
 }

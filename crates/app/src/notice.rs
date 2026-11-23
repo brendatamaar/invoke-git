@@ -52,6 +52,7 @@ fn action_name(action: Action) -> &'static str {
         Action::CherryPick => "Cherry-pick",
         Action::InteractiveRebase => "Interactive rebase",
         Action::Revert => "Revert",
+        Action::Reset => "Reset",
         Action::RemoveLock => "Remove lock",
     }
 }

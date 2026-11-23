@@ -407,7 +407,9 @@ impl Sim {
             | GitArgs::CherryPick { .. }
             | GitArgs::Revert { .. }
             | GitArgs::InteractiveRebase(_)
-            | GitArgs::GuardedRebase { .. } => {
+            | GitArgs::GuardedRebase { .. }
+            // P7.
+            | GitArgs::Reset { .. } => {
                 panic!("no commits, stashes or remotes in this simulation")
             }
         }

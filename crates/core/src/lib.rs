@@ -15,6 +15,7 @@ pub mod message;
 pub mod notes;
 pub mod ops;
 pub mod rebase;
+pub mod reflog;
 pub mod search;
 pub mod stash;
 pub mod state;
@@ -43,6 +44,7 @@ pub use ops::{
     WriteRequest,
 };
 pub use rebase::{PlanError, RebaseAction, RebaseOrigin, RebasePause, RebasePlan, RebaseState};
+pub use reflog::{ReflogEntry, ReflogTarget, ResetMode};
 pub use stash::StashEntry;
 pub use state::{
     Action, BranchRefusal, CommitRefusal, Conflicts, DiskState, FileChange, Freshness, Head,
