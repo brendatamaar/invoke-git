@@ -196,7 +196,17 @@ impl Render for FileInsights {
         let heading = self
             .file
             .as_ref()
-            .map(|file| file.path.clone())
+            .map(|file| {
+                let source =
+                    file.revision
+                        .as_deref()
+                        .map(ui::short_hash)
+                        .unwrap_or(match self.mode {
+                            FileMode::Blame => "Working tree",
+                            FileMode::History => "HEAD",
+                        });
+                format!("{} · {source}", file.path)
+            })
             .unwrap_or_default();
         let switch = cx.entity();
         let back = cx.entity();
