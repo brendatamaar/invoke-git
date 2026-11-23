@@ -87,3 +87,50 @@ fn interactive_rebase_pauses_and_restores_the_twin() {
         );
     }
 }
+
+#[test]
+fn cherry_pick_and_rebase_share_the_same_model_history() {
+    use harness::content::{Change, Eol};
+    use harness::transition::{RebaseEnd, RebaseShape, ReplayEnd, Transition};
+    use harness::world::World;
+
+    let mut world = World::with_rebase_editor(Some(std::path::Path::new(Editor::PROGRAM)));
+    let write = |text: &str| Transition::WriteFile {
+        file: 0,
+        change: Change::Whole {
+            lines: vec![text.into()],
+            eol: Eol::Lf,
+            final_newline: true,
+        },
+    };
+    world.step(write("main"));
+    world.step(Transition::OutsideCommitAll {
+        message: "main change".into(),
+    });
+    world.step(Transition::CreateBranch {
+        name: 1,
+        switch: true,
+        start_back: true,
+    });
+    world.step(write("feat"));
+    world.step(Transition::OutsideCommitAll {
+        message: "feat change".into(),
+    });
+    let main = world.twin.git(&["rev-parse", "main"]).text();
+    let commits = world.twin.git(&["rev-list", "--branches", "HEAD"]).text();
+    let commit = commits.lines().position(|id| id == main).unwrap();
+    world.step(Transition::WhileLocked(Box::new(Transition::Replay {
+        commit,
+        revert: false,
+        end: ReplayEnd::Abort,
+    })));
+    world.step(Transition::InteractiveRebase {
+        count: 2,
+        shape: RebaseShape::Edit,
+        end: RebaseEnd::Abort,
+    });
+    assert_eq!(
+        world.twin.git(&["log", "-1", "--format=%s"]).text(),
+        "feat change"
+    );
+}
