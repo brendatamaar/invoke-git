@@ -7,8 +7,8 @@ Parallel-safe with: P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11
 Menyediakan pencarian commit berdasarkan pesan, penulis, hash (penuh/prefix), dan path file secara inkremental dan cancellable pada riwayat commit, termasuk repo besar.
 
 ## Tasks
-- [ ] Tulis unit/property test parser query & matcher pencarian di `crates/core/tests/search_props.rs` dan integration test pada fixture repo di `crates/shell/tests/search.rs`.
-- [ ] Tambah model filter pencarian (`SearchQuery`: message, author, hash prefix, path) di `crates/core/src/search.rs` dan implementasikan scan bertahap (paged & cancellable via `gix`) di `crates/shell/src/search.rs`.
+- [x] Tulis unit/property test parser query & matcher pencarian di `crates/core/tests/search_props.rs` dan integration test pada fixture repo di `crates/shell/tests/search.rs`.
+- [x] Tambah model filter pencarian (`SearchQuery`: message, author, hash prefix, path) di `crates/core/src/search.rs` dan implementasikan scan bertahap (paged & cancellable via `gix`) di `crates/shell/src/search.rs`.
 - [ ] Tambah search bar + daftar hasil yang langsung melompat/memilih commit pada graph & detail view di `crates/app/src/history_view.rs` dan komponen UI di `crates/ui/` + Windows checklist di Handoff notes.
 
 ## Definition of Done
@@ -20,4 +20,16 @@ Menyediakan pencarian commit berdasarkan pesan, penulis, hash (penuh/prefix), da
 - Full-text grep isi file / pickaxe (`-S`/`-G`) dan command palette keyboard (non-goal di `docs/PRD.md`).
 
 ## Handoff notes
-- Manfaatkan walk halaman commit yang sudah ada di `crates/shell/src/history.rs` dan commit-graph agar scan cepat di repo ratusan ribu commit.
+- Search menggunakan starting points graph (HEAD, branch lokal/remote, dan tag), commit-graph jika tersedia, serta fallback walk gix breadth-first. Walk topologis graph tetap terpisah karena fallback-nya dapat membaca seluruh ancestry sebelum halaman pertama.
+- Worker mengirim progres per maksimal 256 commit dengan antrean satu halaman. Traversal menyimpan frontier dan ID yang sudah dilihat untuk deduplikasi. Metadata dan pohon dibaca per kandidat yang membutuhkannya. UI dapat membatalkan lewat token dan membuang hasil query lama.
+- Filter dipilih melalui `SearchField`. Message mencari seluruh pesan. Author mencari nama atau email. Hash mencocokkan awal ID heksadesimal. Path membandingkan ID dan mode entri Git terhadap parent pertama, konsisten dengan commit detail. Root dibandingkan dengan tree kosong. Perubahan path pada batas shallow tidak dapat ditentukan. Path memakai slash dan peka huruf besar/kecil.
+- Tes properti mencakup batas prefix hash, pencocokan field teks, dan perubahan identitas entri path. Ketiganya gagal saat matcher sengaja diubah, lalu matcher asli dipulihkan.
+
+### Windows verification checklist
+
+- [ ] Tambahkan pemilih mode dan search bar di `crates/app/src/history_view.rs`, serta komponen daftar hasil berbasis token di `crates/ui/`. Tampilkan validasi `QueryError`, progres, hasil kosong, dan kegagalan baca.
+- [ ] Hubungkan worker ke executor UI tanpa menunggu kanal pada thread UI. Batasi hasil yang disimpan atau dirender dan pastikan input, scroll graph, dan tab tetap responsif pada repo besar.
+- [ ] Uji pesan multi-baris, nama dan email penulis, hash penuh/prefix, path dengan spasi dan subdirektori, perbedaan kapitalisasi Git di Windows, serta root, delete, dan repo shallow.
+- [ ] Pilih hasil dekat dan jauh. Verifikasi graph scroll ke ID yang tepat dan membuka commit detail, termasuk ketika halaman graph yang memuat ID tersebut belum tiba.
+- [ ] Uji cancel, penggantian query cepat, pindah/tutup tab, serta refresh watcher setelah ref berubah. Abaikan halaman dari query atau repo lama dan ulangi scan dari disk saat referensi berubah.
+- [ ] Jalankan `cargo xtask check` di Windows dan verifikasi UI manual dengan GPUI yang dipin. Pemeriksaan source di VPS menemukan bahwa tipe dan signature publik history yang dipakai app tetap sama.

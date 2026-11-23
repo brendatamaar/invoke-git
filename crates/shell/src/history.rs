@@ -102,9 +102,21 @@ fn tips(repo: &gix::Repository) -> Result<Vec<CommitId>, String> {
     Ok(tips)
 }
 
+/// Search shares the graph's roots and commit-graph acceleration. A
+/// breadth-first walk can yield immediately even without a commit-graph.
+pub(crate) fn search_walk<'repo>(
+    repo: &'repo gix::Repository,
+    cancel: &'repo AtomicBool,
+) -> Result<gix::revision::Walk<'repo>, String> {
+    repo.rev_walk(tips(repo)?)
+        .sorting(gix::revision::walk::Sorting::BreadthFirst)
+        .selected(move |_| !cancel.load(Ordering::Relaxed))
+        .map_err(|e| format!("start commit search walk: {e}"))
+}
+
 /// The shallow boundary: the commits listed in `.git/shallow` (in a linked
 /// worktree, the common dir's file).
-fn shallow(paths: &RepoPaths, repo: &gix::Repository) -> HashSet<CommitId> {
+pub(crate) fn shallow(paths: &RepoPaths, repo: &gix::Repository) -> HashSet<CommitId> {
     let file = repo.common_dir().join("shallow");
     let text = fs::read_to_string(&file)
         .or_else(|_| fs::read_to_string(paths.git_dir.join("shallow")))

@@ -19,6 +19,7 @@ pub mod progress;
 pub mod read;
 mod resolve_undo;
 pub mod runner;
+pub mod search;
 pub mod staging;
 mod status;
 pub mod store;
