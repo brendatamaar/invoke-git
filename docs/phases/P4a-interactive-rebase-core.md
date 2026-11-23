@@ -1,5 +1,5 @@
 # P4a - Interactive Rebase Core & v0.2 Law Gate
-Status: review
+Status: done
 Depends on: P2
 Parallel-safe with: P3, P5, P6, P7, P8, P11
 

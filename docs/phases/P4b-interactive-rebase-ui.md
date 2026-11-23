@@ -22,3 +22,4 @@ Menyediakan layar Interactive Rebase Editor di GPUI dengan drag-to-reorder commi
 
 ## Handoff notes
 - Fase ini berat di GPUI; di headless VPS hanya boleh mengedit & mengetes logika pure/non-GPUI, verifikasi visual dilakukan di laptop Windows.
+- Ditunda di headless Linux VPS: dependensi `P4a` sudah `done` di `main`, mulai `P4b` di Windows agar kompilasi & verifikasi GPUI (`ui`/`app`) bisa dijalankan end-to-end.
