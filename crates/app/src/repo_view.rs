@@ -604,7 +604,7 @@ impl Render for RepoView {
                         .max_w(px(360.))
                         .truncate()
                         .text_style(&TEXT_SMALL, cx)
-                        .child(details.lines().next().unwrap_or_default().to_owned()),
+                        .child(crate::notice::headline(&details)),
                 );
             }
             banners = banners.child(banner);

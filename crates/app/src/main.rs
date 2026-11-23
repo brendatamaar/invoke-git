@@ -2,7 +2,9 @@
 
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
+mod auth_prompt;
 mod branch_panel;
+mod clone_view;
 mod commit_box;
 mod commit_pane;
 mod diff_load;

@@ -175,6 +175,8 @@ pub struct TextEditor {
     /// One line: Enter submits and line breaks are not accepted (branch
     /// names).
     single_line: bool,
+    /// A secret: shown as stars, never copied.
+    masked: bool,
 }
 
 impl EventEmitter<EditorEvent> for TextEditor {}
@@ -200,6 +202,7 @@ impl TextEditor {
             selecting: false,
             min_rows: min_rows.max(1),
             single_line: false,
+            masked: false,
         }
     }
 
@@ -207,6 +210,14 @@ impl TextEditor {
     /// spaces.
     pub fn single_line(mut self) -> Self {
         self.single_line = true;
+        self
+    }
+
+    /// Makes this a secret field (a password): one line, shown as stars,
+    /// and Copy and Cut do not put it on the clipboard.
+    pub fn masked(mut self) -> Self {
+        self.single_line = true;
+        self.masked = true;
         self
     }
 
@@ -319,7 +330,7 @@ impl TextEditor {
     }
 
     fn copy_selection(&self, cx: &mut Context<Self>) {
-        if !self.editor.selection().is_empty() {
+        if !self.masked && !self.editor.selection().is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.editor.selected_text().to_owned(),
             ));
@@ -491,6 +502,12 @@ impl EntityInputHandler for TextEditor {
     }
 }
 
+/// The stars shown for a secret: as many bytes as the text has, so every
+/// offset of the real text is also an offset of the shown text.
+pub fn mask_text(text: &str) -> String {
+    "*".repeat(text.len())
+}
+
 /// Shapes the whole text with `wrap` as the line width. The marked span is
 /// underlined (IME composition shows inline, in the text).
 fn shape(
@@ -594,7 +611,13 @@ impl gpui::Element for EditorElement {
                 _ => px(300.),
             });
             let color = hsla(cx.palette().ink);
-            let shown: SharedString = if text.is_empty() { " ".into() } else { text };
+            let shown: SharedString = if text.is_empty() {
+                " ".into()
+            } else if editor.masked {
+                mask_text(&text).into()
+            } else {
+                text
+            };
             let lines = shape(&shown, None, window, width, color);
             let height = lines
                 .iter()
@@ -621,7 +644,13 @@ impl gpui::Element for EditorElement {
         let (text, color): (SharedString, _) = if empty {
             (input.placeholder.clone(), hsla(p.ink_faint))
         } else {
-            (input.editor.text().to_owned().into(), hsla(p.ink))
+            let text = input.editor.text();
+            let shown: SharedString = if input.masked {
+                mask_text(text).into()
+            } else {
+                text.to_owned().into()
+            };
+            (shown, hsla(p.ink))
         };
         let marked = input.editor.marked();
         let selection = input.editor.selection();
@@ -885,5 +914,33 @@ impl Render for TextEditor {
         });
         let root = on!(root, Submit, |_this, _w, cx| cx.emit(EditorEvent::Submit));
         root.child(EditorElement { input: cx.entity() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn a_secret_shows_only_stars() {
+        assert_eq!(mask_text(""), "");
+        assert_eq!(mask_text("hunter2"), "*******");
+        assert!(!mask_text("pässwörd").contains('p'));
+    }
+
+    proptest! {
+        /// Every offset of the real text is an offset of the shown text,
+        /// and nothing of the secret shows.
+        #[test]
+        fn the_mask_keeps_every_offset_and_hides_every_character(secret in any::<String>()) {
+            let shown = mask_text(&secret);
+            prop_assert_eq!(shown.len(), secret.len());
+            prop_assert!(shown.chars().all(|c| c == '*'));
+            for (offset, _) in secret.char_indices() {
+                prop_assert!(shown.is_char_boundary(offset));
+            }
+        }
     }
 }

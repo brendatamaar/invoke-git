@@ -17,6 +17,7 @@ type OnClick = Rc<dyn Fn(&mut Window, &mut App)>;
 pub struct Welcome {
     on_open: OnClick,
     on_init: OnClick,
+    on_clone: Option<OnClick>,
     notices: Vec<AnyElement>,
 }
 
@@ -28,8 +29,15 @@ impl Welcome {
         Self {
             on_open: Rc::new(on_open),
             on_init: Rc::new(on_init),
+            on_clone: None,
             notices: Vec::new(),
         }
+    }
+
+    /// Adds the "Clone repository" button.
+    pub fn on_clone(mut self, on_clone: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_clone = Some(Rc::new(on_clone));
+        self
     }
 
     /// An error or hint shown above the buttons (a banner).
@@ -42,7 +50,7 @@ impl Welcome {
 impl RenderOnce for Welcome {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = cx.palette();
-        let (on_open, on_init) = (self.on_open, self.on_init);
+        let (on_open, on_init, on_clone) = (self.on_open, self.on_init, self.on_clone);
         div().flex().flex_1().items_center().justify_center().child(
             div()
                 .flex()
@@ -77,7 +85,11 @@ impl RenderOnce for Welcome {
                         .child(
                             Button::new("welcome-init", "Initialize repository…")
                                 .on_click(move |_, window, cx| on_init(window, cx)),
-                        ),
+                        )
+                        .children(on_clone.map(|on_clone| {
+                            Button::new("welcome-clone", "Clone repository…")
+                                .on_click(move |_, window, cx| on_clone(window, cx))
+                        })),
                 ),
         )
     }

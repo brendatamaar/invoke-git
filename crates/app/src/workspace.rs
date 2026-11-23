@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use gpui::{
     AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    PathPromptOptions, Render, Styled, Window, actions, div, px,
+    PathPromptOptions, Render, Styled, Subscription, Window, actions, div, px,
 };
 use invoke_core::Event;
 use shell::{DiscoverError, Discovered, Git, git::SetupError};
@@ -14,6 +14,7 @@ use tokens::{SPACE_3, SPACE_4, TEXT_BODY, TEXT_TITLE};
 use ui::convert::hsla;
 use ui::{Banner, BannerKind, Button, Summary, TabBar, TabItem, TextStyleExt, ThemeExt, Welcome};
 
+use crate::clone_view::{CloneView, CloneViewEvent};
 use crate::paths;
 use crate::persist::{self, Saved};
 use crate::repo_view::RepoView;
@@ -45,6 +46,8 @@ pub struct Workspace {
     git: Result<Git, SetupError>,
     tabs: Tabs<Entity<RepoView>>,
     notice: Option<Notice>,
+    /// The clone dialog, shown in place of the welcome screen.
+    cloning: Option<(Entity<CloneView>, Subscription)>,
     pub focus: FocusHandle,
     title: String,
 }
@@ -55,6 +58,7 @@ impl Workspace {
             git: Git::detect("git"),
             tabs: Tabs::new(),
             notice: None,
+            cloning: None,
             focus: cx.focus_handle(),
             title: String::new(),
         };
@@ -264,6 +268,23 @@ impl Workspace {
         }
     }
 
+    /// Opens the clone dialog.
+    fn start_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(git) = self.git.clone() else { return };
+        let view = cx.new(|cx| CloneView::new(git, cx));
+        view.update(cx, |view, cx| view.focus(window, cx));
+        let subscription = cx.subscribe(&view, |this, _, event: &CloneViewEvent, cx| {
+            this.cloning = None;
+            if let CloneViewEvent::Cloned(path) = event {
+                this.open_path(path.clone(), cx);
+            }
+            cx.notify();
+        });
+        self.cloning = Some((view, subscription));
+        self.tabs.show_welcome();
+        self.changed(cx);
+    }
+
     fn show_welcome(&mut self, cx: &mut Context<Self>) {
         self.tabs.show_welcome();
         self.changed(cx);
@@ -353,6 +374,9 @@ impl Workspace {
     }
 
     fn render_welcome(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if let Some((view, _)) = &self.cloning {
+            return view.clone().into_any_element();
+        }
         let mut welcome = Welcome::new(
             {
                 let this = cx.entity();
@@ -362,7 +386,11 @@ impl Workspace {
                 let this = cx.entity();
                 move |_, cx| this.update(cx, |this, cx| this.choose_init(cx))
             },
-        );
+        )
+        .on_clone({
+            let this = cx.entity();
+            move |window, cx| this.update(cx, |this, cx| this.start_clone(window, cx))
+        });
         match &self.notice {
             Some(Notice::NotARepo(path)) => {
                 let target = path.clone();

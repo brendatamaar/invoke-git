@@ -161,6 +161,35 @@ fn failure_text(failure: &Failure) -> (Tone, String) {
     (tone, text.into())
 }
 
+/// The one line of git's output worth showing beside the words: git ends
+/// with the line that says what went wrong (`fatal: Authentication
+/// failed`), after the progress and the `Cloning into` lines.
+pub fn headline(details: &str) -> String {
+    details
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The words for a failed operation: the class's own, or the sentence for a
+/// refusal git gave that the user can act on; the raw output is the details.
+pub fn failure_message(failure: &Failure) -> Message {
+    let (tone, mut text) = failure_text(failure);
+    if failure.class == ErrorClass::Expected
+        && let Some(words) = known_refusal(&failure.details)
+    {
+        text = words.into();
+    }
+    Message {
+        tone,
+        text,
+        details: (!failure.details.is_empty()).then(|| failure.details.clone()),
+    }
+}
+
 /// The message for the newest notice, or `None` when it needs no words (an
 /// operation that succeeded).
 pub fn message(notice: &Notice) -> Option<Message> {
@@ -177,19 +206,7 @@ pub fn message(notice: &Notice) -> Option<Message> {
                 text: "Cancelled.".into(),
                 details: None,
             }),
-            OpOutcome::Failed(failure) => {
-                let (tone, mut text) = failure_text(failure);
-                if failure.class == ErrorClass::Expected
-                    && let Some(words) = known_refusal(&failure.details)
-                {
-                    text = words.into();
-                }
-                Some(Message {
-                    tone,
-                    text,
-                    details: (!failure.details.is_empty()).then(|| failure.details.clone()),
-                })
-            }
+            OpOutcome::Failed(failure) => Some(failure_message(failure)),
         },
         Notice::ReadFailed { failure, .. } => Some(Message {
             tone: Tone::Error,
@@ -308,6 +325,16 @@ mod tests {
         assert!(!stash_hint(true, true).contains("stay"));
         assert!(stash_hint(true, true).contains("new files"));
         assert!(stash_hint(true, false).contains("new files stay"));
+    }
+
+    #[test]
+    fn the_headline_is_the_last_line_git_printed() {
+        assert_eq!(
+            headline("Cloning into 'x'...\nremote: no\nfatal: Authentication failed\n\n"),
+            "fatal: Authentication failed"
+        );
+        assert_eq!(headline(""), "");
+        assert_eq!(headline("only line"), "only line");
     }
     #[test]
     fn every_error_class_has_words() {
