@@ -75,7 +75,7 @@ impl SignInRunner {
                     if sleep_unless_cancelled(wait, &cancel) {
                         return;
                     }
-                    let event = poll_once(&service, &device);
+                    let event = poll_once(&service, &device, &cancel);
                     send(&cancel, &events, event);
                 });
             }
@@ -166,7 +166,11 @@ fn request_device_code(
 
 /// One poll, as the event the machine understands. A network blip while
 /// polling is "not yet": the code stays valid, so the machine polls again.
-fn poll_once(service: &ForgeService, device: &Mutex<Option<DeviceSession>>) -> SignInEvent {
+fn poll_once(
+    service: &ForgeService,
+    device: &Mutex<Option<DeviceSession>>,
+    cancel: &AtomicBool,
+) -> SignInEvent {
     let (code, client_id, deadline) = {
         let guard = device.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_ref() {
@@ -198,7 +202,9 @@ fn poll_once(service: &ForgeService, device: &Mutex<Option<DeviceSession>>) -> S
                 Ok(origin) => origin,
                 Err(error) => return SignInEvent::Errored(error.user_message()),
             };
-            match service.finish_oauth(ForgeKind::GitHub, origin, credential) {
+            match service.finish_oauth(ForgeKind::GitHub, origin, credential, &|| {
+                cancel.load(Ordering::SeqCst)
+            }) {
                 Ok(account) => SignInEvent::Granted(account),
                 Err(error) => SignInEvent::Errored(error.user_message()),
             }
@@ -252,11 +258,18 @@ pub(super) fn read_callback(request_line: &str, expected_state: &str) -> Callbac
     }
 }
 
+/// How long one connection may take to send its request line.
+const CONNECTION_LIMIT: Duration = Duration::from_secs(3);
+
 fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let text = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n\r\n{body}",
         body.len()
     );
+    // The answer is a few hundred bytes; a client that does not read it
+    // must not hold the flow up.
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
     let _ = stream.write_all(text.as_bytes());
 }
 
@@ -264,19 +277,33 @@ fn page(message: &str) -> String {
     format!("<!doctype html><meta charset=utf-8><title>Invoke Git</title><p>{message}</p>")
 }
 
-fn request_line(stream: &mut TcpStream) -> Option<String> {
-    stream.set_nonblocking(false).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+/// Reads the request line of one connection without ever outliving the
+/// flow: reads do not block, and cancellation, the connection's own limit
+/// and the flow's deadline are checked between them. A client that connects
+/// and says nothing therefore cannot keep the port past Cancel or the
+/// deadline.
+fn request_line(stream: &mut TcpStream, cancel: &AtomicBool, flow_end: Instant) -> Option<String> {
+    stream.set_nonblocking(true).ok()?;
+    let end = (Instant::now() + CONNECTION_LIMIT).min(flow_end);
     let mut buffer = [0u8; 4096];
     let mut filled = 0;
     while filled < buffer.len() {
-        let read = stream.read(&mut buffer[filled..]).ok()?;
-        if read == 0 {
-            break;
-        }
-        filled += read;
-        if buffer[..filled].windows(2).any(|w| w == b"\r\n") {
-            break;
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => {
+                filled += read;
+                if buffer[..filled].windows(2).any(|w| w == b"\r\n") {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if cancel.load(Ordering::SeqCst) || Instant::now() >= end {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
         }
     }
     let text = std::str::from_utf8(&buffer[..filled]).ok()?;
@@ -340,7 +367,7 @@ fn browser_flow(
                 continue;
             }
         };
-        let Some(line) = request_line(&mut stream) else {
+        let Some(line) = request_line(&mut stream, cancel, end) else {
             continue;
         };
         match read_callback(&line, &state) {
@@ -369,7 +396,11 @@ fn browser_flow(
             }
         }
     };
+    // The port is released as soon as the redirect is in.
     drop(listener);
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(());
+    }
 
     let credential = api::gitlab::exchange_code(
         service.http(),
@@ -380,7 +411,9 @@ fn browser_flow(
         pkce.verifier(),
         service.now(),
     )?;
-    let account = service.finish_oauth(ForgeKind::GitLab, origin, credential)?;
+    let account = service.finish_oauth(ForgeKind::GitLab, origin, credential, &|| {
+        cancel.load(Ordering::SeqCst)
+    })?;
     send(cancel, events, SignInEvent::Granted(account));
     Ok(())
 }

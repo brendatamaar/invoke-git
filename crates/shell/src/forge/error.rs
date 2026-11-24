@@ -38,6 +38,11 @@ pub enum ForgeError {
     UnknownAccount,
     /// The account exists but its token is gone from the keychain.
     NoCredential,
+    /// The user cancelled; nothing was kept.
+    Cancelled,
+    /// Connecting failed part way and the undo failed too: a token may still
+    /// be in the keychain, or an account in the list.
+    RollbackFailed,
     /// The pasted token is empty or has spaces or line breaks in it.
     InvalidToken,
     /// Signing in is not possible right now (for example the loopback port
@@ -106,6 +111,8 @@ impl ForgeError {
             ForgeError::NoCredential => {
                 "The saved token is missing from the keychain. Connect the account again.".into()
             }
+            ForgeError::Cancelled => "Cancelled.".into(),
+            ForgeError::RollbackFailed => "Connecting did not finish and could not be fully undone. Open Accounts and disconnect the account, or remove the \"Invoke Git forge accounts\" entry from the system keychain.".into(),
             ForgeError::InvalidToken => {
                 "That does not look like a token: it is empty or has spaces or line breaks.".into()
             }

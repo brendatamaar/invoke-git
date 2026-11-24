@@ -237,18 +237,32 @@ impl ForgeService {
             &username,
             AuthMethod::Pat,
             Credential::token(secret),
+            &|| false,
         )
     }
 
-    /// Records an account whose OAuth tokens were just obtained.
+    /// Records an account whose OAuth tokens were just obtained. `cancelled`
+    /// is asked before anything is stored and again after each write: a flow
+    /// the user cancelled leaves no account and no token behind.
     pub(super) fn finish_oauth(
         &self,
         kind: ForgeKind,
         origin: Origin,
         credential: Credential,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<ForgeAccount, ForgeError> {
+        if cancelled() {
+            return Err(ForgeError::Cancelled);
+        }
         let username = self.user_of(kind, &origin, &credential.access)?;
-        self.register(kind, origin, &username, AuthMethod::OAuth, credential)
+        self.register(
+            kind,
+            origin,
+            &username,
+            AuthMethod::OAuth,
+            credential,
+            cancelled,
+        )
     }
 
     pub(super) fn origin_for_new(
@@ -270,16 +284,23 @@ impl ForgeService {
         origin: &Origin,
         token: &Secret,
     ) -> Result<String, ForgeError> {
-        match kind {
+        let username = match kind {
             ForgeKind::GitHub => {
-                api::github::current_user(&self.inner.http, &self.inner.config.github.api, token)
+                api::github::current_user(&self.inner.http, &self.inner.config.github.api, token)?
             }
-            ForgeKind::GitLab => api::gitlab::current_user(&self.inner.http, origin, token),
+            ForgeKind::GitLab => api::gitlab::current_user(&self.inner.http, origin, token)?,
+        };
+        if acceptable_username(&username, token) {
+            Ok(username)
+        } else {
+            Err(ForgeError::BadResponse("unusable user name"))
         }
     }
 
     /// Keychain first, then the list: an account never appears without its
-    /// token, and a failed write leaves nothing behind.
+    /// token. Whatever stops the registration (the list cannot be written, or
+    /// the user cancelled) puts both back as they were, and if even that
+    /// fails the error says so, because a token may then be left behind.
     fn register(
         &self,
         kind: ForgeKind,
@@ -287,39 +308,68 @@ impl ForgeService {
         username: &str,
         method: AuthMethod,
         credential: Credential,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<ForgeAccount, ForgeError> {
         let account = ForgeAccount::new(kind, origin, username, method)
             .ok_or(ForgeError::BadResponse("unusable user name"))?;
         let key = account.key();
+        if cancelled() {
+            return Err(ForgeError::Cancelled);
+        }
+        let previous = self.inner.store.load(&key)?;
         self.inner.store.save(&key, &credential)?;
         let mut book = self.book_lock();
         let before = book.clone();
         book.add(account.clone());
-        if let Err(error) = self.save_book(&book) {
-            *book = before;
-            // Roll the token back unless it replaced one the list still has.
-            if book.get(&key).is_none() {
-                let _ = self.inner.store.delete(&key);
-            }
-            return Err(error);
+        let (failure, list_written) = match self.save_book(&book) {
+            Err(error) => (Some(error), false),
+            Ok(()) if cancelled() => (Some(ForgeError::Cancelled), true),
+            Ok(()) => (None, true),
+        };
+        let Some(failure) = failure else {
+            return Ok(account);
+        };
+        *book = before;
+        let list_back = if list_written {
+            self.save_book(&book)
+        } else {
+            Ok(())
+        };
+        let token_back = match previous {
+            Some(previous) => self.inner.store.save(&key, &previous),
+            None => self.inner.store.delete(&key),
+        };
+        if list_back.is_err() || token_back.is_err() {
+            return Err(ForgeError::RollbackFailed);
         }
-        Ok(account)
+        Err(failure)
     }
 
-    /// Forgets an account: its token leaves the keychain, then it leaves the
-    /// list. If the keychain refuses, the account stays, so nothing is left
-    /// behind unseen.
+    /// Forgets an account. The list changes first, so a restart cannot bring
+    /// back an account whose token is gone; then the token leaves the
+    /// keychain. If the keychain refuses, the account is put back (so the
+    /// token is not left unseen) and the error is reported.
     pub fn disconnect(&self, key: &str) -> Result<(), ForgeError> {
-        if self.book_lock().get(key).is_none() {
+        let mut book = self.book_lock();
+        let before = book.clone();
+        if book.remove(key).is_none() {
             return Err(ForgeError::UnknownAccount);
         }
-        self.inner.store.delete(key)?;
-        let mut book = self.book_lock();
-        book.remove(key);
-        self.save_book(&book)
+        if let Err(error) = self.save_book(&book) {
+            *book = before;
+            return Err(error);
+        }
+        if let Err(error) = self.inner.store.delete(key) {
+            *book = before;
+            return match self.save_book(&book) {
+                Ok(()) => Err(error),
+                Err(_) => Err(ForgeError::RollbackFailed),
+            };
+        }
+        Ok(())
     }
 
-    // -- using the token ---------------------------------------------------------
+    // -- using the token ------------------------------------------------
 
     fn account(&self, key: &str) -> Result<ForgeAccount, ForgeError> {
         self.book_lock()
@@ -364,8 +414,25 @@ impl ForgeService {
         if fresh.refresh.is_none() {
             fresh.refresh = old.refresh.clone();
         }
-        self.inner.store.save(&account.key(), &fresh)?;
-        Ok(fresh)
+        // Write only if the account is still connected and its token is still
+        // the one this refresh started from. Holding the list lock keeps a
+        // disconnect from interleaving, so a refresh can never put back the
+        // keychain entry of an account that was just removed.
+        let key = account.key();
+        let book = self.book_lock();
+        if book.get(&key).is_none() {
+            return Err(ForgeError::UnknownAccount);
+        }
+        match self.inner.store.load(&key)? {
+            Some(current) if &current == old => {
+                self.inner.store.save(&key, &fresh)?;
+                Ok(fresh)
+            }
+            // Something else replaced it meanwhile (another refresh, or a new
+            // sign-in): that one is newer than ours.
+            Some(current) => Ok(current),
+            None => Err(ForgeError::NoCredential),
+        }
     }
 
     /// One page of the account's repositories. A token the server rejects is
@@ -441,4 +508,17 @@ fn save_book(path: &Path, book: &AccountBook) -> Result<(), ForgeError> {
     let temporary = path.with_extension("tmp");
     std::fs::write(&temporary, book.encode()).map_err(disk)?;
     std::fs::rename(&temporary, path).map_err(disk)
+}
+
+/// A user name a forge may report: ASCII letters, digits, `-`, `_` and `.`,
+/// at most 100 of them, and never the token itself (or anything that holds
+/// it): the name is shown and written to the account list, so a hostile
+/// server must not be able to echo a token there.
+pub(crate) fn acceptable_username(name: &str, token: &Secret) -> bool {
+    !name.is_empty()
+        && name.len() <= 100
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !name.contains(token.expose())
 }

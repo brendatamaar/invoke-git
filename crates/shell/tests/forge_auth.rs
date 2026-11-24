@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use invoke_core::forge::{
     AccountBook, AuthMethod, ForgeAccount, ForgeKind, OriginProblem, Resolution, SignInCommand,
@@ -284,7 +284,7 @@ fn github_handler(port: u16) -> Handler {
     Box::new(move |request| {
         match (request.method.as_str(), request.path()) {
         ("GET", "/user") => match request.header("authorization") {
-            Some("Bearer ghp_ANA") => Reply::json(r#"{"login":"ana"}"#),
+            Some("Bearer ghp_ANA" | "Bearer ghp_ANA_SECOND") => Reply::json(r#"{"login":"ana"}"#),
             Some("Bearer ghp_WORK") => Reply::json(r#"{"login":"ana-corp"}"#),
             _ => Reply::status(401, r#"{"message":"Bad credentials"}"#),
         },
@@ -327,7 +327,19 @@ fn loaded(store: &MemoryStore, account: &ForgeAccount) -> Option<Credential> {
 fn sign_in(
     runner: &SignInRunner,
     method: SignInMethod,
+    on_prompt: impl FnMut(&UserPrompt),
+) -> SignInPhase {
+    sign_in_until(runner, method, on_prompt, || false)
+}
+
+/// Like `sign_in`, but also returns (with whatever phase the machine is in)
+/// once `stop` says so: for tests that cancel from the outside, where the
+/// machine is not told.
+fn sign_in_until(
+    runner: &SignInRunner,
+    method: SignInMethod,
     mut on_prompt: impl FnMut(&UserPrompt),
+    stop: impl Fn() -> bool,
 ) -> SignInPhase {
     let (events, inbox) = mpsc::channel();
     let (mut phase, commands) = step_sign_in(SignInPhase::Idle, SignInEvent::Begin(method));
@@ -335,10 +347,19 @@ fn sign_in(
         runner.execute(command, events.clone());
     }
     let mut prompted = false;
+    let started = Instant::now();
     while phase.is_active() {
-        let event = inbox
-            .recv_timeout(Duration::from_secs(15))
-            .expect("the sign-in stalled");
+        let event = match inbox.recv_timeout(Duration::from_millis(25)) {
+            Ok(event) => event,
+            Err(_) if stop() => break,
+            Err(_) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(15),
+                    "the sign-in stalled"
+                );
+                continue;
+            }
+        };
         let (next, commands) = step_sign_in(phase, event);
         phase = next;
         if let SignInPhase::AwaitingUser { prompt, .. } = &phase
@@ -491,14 +512,15 @@ fn cancelling_stops_the_polling() {
         Box::new(move |request| match request.path() {
             "/login/device/code" => Reply::json(&format!(
                 r#"{{"device_code":"d","user_code":"AAAA-BBBB",
-                    "verification_uri":"http://127.0.0.1:{port}/device","expires_in":900,"interval":300}}"#
+                    "verification_uri":"http://127.0.0.1:{port}/device","expires_in":900,"interval":5}}"#
             )),
             _ => Reply::json(r#"{"error":"authorization_pending"}"#),
         })
     });
-    // One poll interval lasts minutes of test time: a poll would show.
+    // The first poll is due after 5 x 60 ms: a flow that ignored the abort
+    // would poll well inside the 700 ms watched below.
     let mut config = config(&mock.origin());
-    config.poll_unit = Duration::from_millis(100);
+    config.poll_unit = Duration::from_millis(60);
     let service = ForgeService::new(memory(), config, None).unwrap();
     let runner = SignInRunner::new(service);
     let (events, inbox) = mpsc::channel();
@@ -517,10 +539,11 @@ fn cancelling_stops_the_polling() {
     }
     let (phase, commands) = step_sign_in(phase, SignInEvent::Cancel);
     assert_eq!(phase, SignInPhase::Failed(SignInFailure::Cancelled));
+    assert_eq!(commands, vec![SignInCommand::Abort]);
     for command in commands {
         runner.execute(command, events.clone());
     }
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(700));
     assert!(mock.requests_to("/login/oauth/access_token").is_empty());
     assert!(
         inbox.try_recv().is_err(),
@@ -1402,4 +1425,481 @@ fn assert_no_secret_on_disk(dir: &Path, secrets: &[&str]) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross review fixes
+// ---------------------------------------------------------------------------
+
+/// A keychain that runs a hook right after each save.
+#[derive(Default)]
+struct HookStore {
+    inner: MemoryStore,
+    after_save: Mutex<Option<Box<dyn Fn() + Send>>>,
+}
+
+impl TokenStore for HookStore {
+    fn save(&self, key: &str, credential: &Credential) -> Result<(), ForgeError> {
+        self.inner.save(key, credential)?;
+        if let Some(hook) = self.after_save.lock().unwrap().as_ref() {
+            hook();
+        }
+        Ok(())
+    }
+    fn load(&self, key: &str) -> Result<Option<Credential>, ForgeError> {
+        self.inner.load(key)
+    }
+    fn delete(&self, key: &str) -> Result<(), ForgeError> {
+        self.inner.delete(key)
+    }
+}
+
+/// Waits (up to 5 s) for something that happens on another thread.
+fn eventually(what: &str, condition: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !condition() {
+        assert!(started.elapsed() < Duration::from_secs(5), "{what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn github_with_login(login: String) -> Mock {
+    Mock::start(move |_| {
+        Box::new(move |request| match request.path() {
+            "/user" => Reply::json(&format!(r#"{{"login":{login:?}}}"#)),
+            _ => Reply::status(404, "{}"),
+        })
+    })
+}
+
+#[test]
+fn a_user_name_the_server_made_up_is_refused() {
+    for login in [
+        "ghp_ANA".to_string(),
+        "x-ghp_ANA-y".to_string(),
+        "ana corp".to_string(),
+        "ana\tcorp".to_string(),
+        "<b>ana</b>".to_string(),
+        "ana/../etc".to_string(),
+        String::new(),
+        "a".repeat(101),
+    ] {
+        let mock = github_with_login(login.clone());
+        let data = TempDir::new("username");
+        let store = memory();
+        let service = service(&mock, store.clone(), Some(data.book()));
+        let result = service.connect_with_token(ForgeKind::GitHub, "", "ghp_ANA");
+        assert_eq!(
+            result,
+            Err(ForgeError::BadResponse("unusable user name")),
+            "{login:?}"
+        );
+        assert!(store.is_empty(), "{login:?}");
+        assert!(service.accounts().is_empty(), "{login:?}");
+        assert!(!data.book().exists(), "{login:?}");
+    }
+    for login in ["ana", "ana.gl", "Ana_Corp-2"] {
+        let mock = github_with_login(login.to_string());
+        let service = service(&mock, memory(), None);
+        assert!(
+            service
+                .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+                .is_ok(),
+            "{login}"
+        );
+    }
+}
+
+#[test]
+fn oauth_error_text_from_a_server_is_never_shown() {
+    let mock = Mock::start(|_| {
+        Box::new(|request| match request.path() {
+            "/login/device/code" => Reply::status(
+                400,
+                r#"{"error":"ghp_SECRET_hostile_text_that_looks_like_a_token"}"#,
+            ),
+            _ => Reply::status(404, "{}"),
+        })
+    });
+    let runner = SignInRunner::new(service(&mock, memory(), None));
+    let phase = sign_in(&runner, SignInMethod::GitHubDevice, |_| {});
+    match phase {
+        SignInPhase::Failed(SignInFailure::Error(message)) => {
+            assert!(message.contains("unknown_error"), "{message}");
+            assert!(!message.contains("ghp_SECRET"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn cancelling_while_the_token_is_saved_leaves_nothing_connected() {
+    let mock = device_mock("granted");
+    let data = TempDir::new("cancel-write");
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), Some(data.book()));
+    let runner = Arc::new(SignInRunner::new(service.clone()));
+    let fired = Arc::new(AtomicBool::new(false));
+    {
+        // The user presses Cancel at the moment the keychain write lands.
+        let (runner, fired) = (runner.clone(), fired.clone());
+        let (sender, _unused) = mpsc::channel();
+        *store.after_save.lock().unwrap() = Some(Box::new(move || {
+            runner.execute(SignInCommand::Abort, sender.clone());
+            fired.store(true, Ordering::SeqCst);
+        }));
+    }
+    sign_in_until(
+        &runner,
+        SignInMethod::GitHubDevice,
+        |_| {},
+        || fired.load(Ordering::SeqCst),
+    );
+    assert!(fired.load(Ordering::SeqCst), "the token was never saved");
+    eventually("the cancelled sign-in must be rolled back", || {
+        store.inner.is_empty() && service.accounts().is_empty()
+    });
+    if let Ok(text) = std::fs::read_to_string(data.book()) {
+        assert!(AccountBook::decode(&text).is_empty());
+    }
+}
+
+#[test]
+fn cancelling_during_the_code_exchange_stores_nothing() {
+    let slot: Arc<Mutex<Option<Arc<SignInRunner>>>> = Arc::default();
+    let hook = slot.clone();
+    let mock = Mock::start(move |_| {
+        Box::new(move |request| match request.path() {
+            "/oauth/token" => {
+                // Cancel arrives while the server is answering the exchange.
+                if let Some(runner) = hook.lock().unwrap().as_ref() {
+                    let (sender, _unused) = mpsc::channel();
+                    runner.execute(SignInCommand::Abort, sender);
+                }
+                Reply::json(r#"{"access_token":"glpat-LATE","expires_in":7200}"#)
+            }
+            "/api/v4/user" => Reply::json(r#"{"username":"ana.gl"}"#),
+            _ => Reply::status(404, "{}"),
+        })
+    });
+    let store = memory();
+    let service = service(&mock, store.clone(), None);
+    let runner = Arc::new(SignInRunner::new(service.clone()));
+    *slot.lock().unwrap() = Some(runner.clone());
+    sign_in_until(
+        &runner,
+        SignInMethod::GitLabBrowser,
+        |prompt| {
+            let UserPrompt::Browser { url } = prompt else {
+                panic!()
+            };
+            let query = parse_query(url.split_once('?').unwrap().1);
+            let get = |k: &str| query.iter().find(|(key, _)| key == k).unwrap().1.clone();
+            let redirect = get("redirect_uri");
+            let local = redirect
+                .strip_prefix("http://")
+                .unwrap()
+                .strip_suffix("/callback")
+                .unwrap();
+            browser_get(local, &format!("/callback?code=c&state={}", get("state")));
+        },
+        || !mock.requests_to("/oauth/token").is_empty(),
+    );
+    thread::sleep(Duration::from_millis(400));
+    assert!(store.is_empty());
+    assert!(service.accounts().is_empty());
+    assert!(
+        mock.requests_to("/api/v4/user").is_empty(),
+        "a cancelled flow must not go on to look the user up"
+    );
+}
+
+// -- a refresh must not undo a disconnect -----------------------------------
+
+type Hook = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
+
+fn refresh_mock(hook: Hook) -> Mock {
+    Mock::start(move |_| {
+        Box::new(move |request| match request.path() {
+            "/oauth/token" => {
+                if let Some(run) = hook.lock().unwrap().as_ref() {
+                    run();
+                }
+                Reply::json(
+                    r#"{"access_token":"glpat-NEW","refresh_token":"glrt-NEW","expires_in":7200}"#,
+                )
+            }
+            "/api/v4/user" => Reply::json(r#"{"username":"ana.gl"}"#),
+            "/api/v4/projects" => Reply::json("[]"),
+            _ => Reply::status(404, "{}"),
+        })
+    })
+}
+
+/// A GitLab account whose access token ran out (the clock says 2000).
+fn expired_account(mock: &Mock, store: &Arc<MemoryStore>) -> (ForgeService, ForgeAccount) {
+    let service =
+        ForgeService::with_clock(store.clone(), config(&mock.origin()), None, || 2000).unwrap();
+    let account = service
+        .connect_with_token(ForgeKind::GitLab, &mock.origin(), "glpat-OLD")
+        .unwrap();
+    store
+        .save(
+            &account.key(),
+            &Credential {
+                access: Secret::new("glpat-OLD").unwrap(),
+                refresh: Secret::new("glrt-OLD"),
+                expires_at: Some(1000),
+            },
+        )
+        .unwrap();
+    (service, account)
+}
+
+#[test]
+fn a_refresh_never_brings_back_an_account_disconnected_meanwhile() {
+    let hook: Hook = Arc::default();
+    let mock = refresh_mock(hook.clone());
+    let store = memory();
+    let (service, account) = expired_account(&mock, &store);
+    let (again, key) = (service.clone(), account.key());
+    *hook.lock().unwrap() = Some(Box::new(move || {
+        again.disconnect(&key).unwrap();
+    }));
+    let error = service.list_repos_page(&account.key(), None).unwrap_err();
+    assert_eq!(error, ForgeError::UnknownAccount);
+    assert!(
+        store.is_empty(),
+        "the refreshed token was written back to the keychain"
+    );
+    assert!(service.accounts().is_empty());
+}
+
+#[test]
+fn a_refresh_does_not_overwrite_a_newer_sign_in() {
+    let hook: Hook = Arc::default();
+    let mock = refresh_mock(hook.clone());
+    let store = memory();
+    let (service, account) = expired_account(&mock, &store);
+    let (again, key) = (store.clone(), account.key());
+    *hook.lock().unwrap() = Some(Box::new(move || {
+        again
+            .save(
+                &key,
+                &Credential::token(Secret::new("glpat-REPLACED").unwrap()),
+            )
+            .unwrap();
+    }));
+    service.list_repos_page(&account.key(), None).unwrap();
+    let kept = loaded(&store, &account).unwrap();
+    assert_eq!(kept.access.expose(), "glpat-REPLACED");
+}
+
+// -- registering and disconnecting are undone cleanly --------------------------
+
+/// Makes writing the account list fail (its temporary file is a folder).
+fn break_list(data: &TempDir) {
+    std::fs::create_dir_all(data.book().with_extension("tmp")).unwrap();
+}
+
+#[test]
+fn a_failed_reconnect_puts_the_previous_token_back() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("reconnect");
+    let store = memory();
+    let service = service(&mock, store.clone(), Some(data.book()));
+    let account = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    break_list(&data);
+    let error = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA_SECOND")
+        .unwrap_err();
+    assert!(matches!(error, ForgeError::Disk(_)), "{error:?}");
+    // The account still has the token it had, not the one that failed.
+    assert_eq!(loaded(&store, &account).unwrap().access.expose(), "ghp_ANA");
+    assert_eq!(service.accounts(), vec![account]);
+}
+
+#[test]
+fn an_undo_that_fails_is_reported_not_hidden() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("rollback");
+    break_list(&data);
+    let stubborn = Arc::new(StubbornStore(MemoryStore::new()));
+    let service = service(&mock, stubborn.clone(), Some(data.book()));
+    let error = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap_err();
+    assert_eq!(error, ForgeError::RollbackFailed);
+    let message = error.user_message();
+    assert!(message.contains("keychain"), "{message}");
+    assert!(!message.contains("ghp_ANA"));
+    assert!(service.accounts().is_empty());
+}
+
+/// Records what the account list on disk said when the token was deleted.
+struct ProbeStore {
+    inner: MemoryStore,
+    book: PathBuf,
+    listed_at_delete: Mutex<Option<bool>>,
+}
+
+impl TokenStore for ProbeStore {
+    fn save(&self, key: &str, credential: &Credential) -> Result<(), ForgeError> {
+        self.inner.save(key, credential)
+    }
+    fn load(&self, key: &str) -> Result<Option<Credential>, ForgeError> {
+        self.inner.load(key)
+    }
+    fn delete(&self, key: &str) -> Result<(), ForgeError> {
+        let text = std::fs::read_to_string(&self.book).unwrap_or_default();
+        self.listed_at_delete
+            .lock()
+            .unwrap()
+            .get_or_insert(!AccountBook::decode(&text).is_empty());
+        self.inner.delete(key)
+    }
+}
+
+#[test]
+fn disconnecting_removes_the_account_from_the_list_before_the_token() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("order");
+    let probe = Arc::new(ProbeStore {
+        inner: MemoryStore::new(),
+        book: data.book(),
+        listed_at_delete: Mutex::new(None),
+    });
+    let service = service(&mock, probe.clone(), Some(data.book()));
+    let account = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    service.disconnect(&account.key()).unwrap();
+    // A restart between the two steps must not find a token-less account.
+    assert_eq!(*probe.listed_at_delete.lock().unwrap(), Some(false));
+}
+
+#[test]
+fn a_disconnect_that_cannot_save_the_list_keeps_the_token() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("disconnect-disk");
+    let store = memory();
+    let service = service(&mock, store.clone(), Some(data.book()));
+    let account = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    break_list(&data);
+    let error = service.disconnect(&account.key()).unwrap_err();
+    assert!(matches!(error, ForgeError::Disk(_)), "{error:?}");
+    assert!(loaded(&store, &account).is_some());
+    assert_eq!(service.accounts(), vec![account]);
+}
+
+#[test]
+fn a_refused_token_delete_puts_the_account_back_on_disk_too() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("disconnect-keychain");
+    let service = service(
+        &mock,
+        Arc::new(StubbornStore(MemoryStore::new())),
+        Some(data.book()),
+    );
+    let account = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    assert!(matches!(
+        service.disconnect(&account.key()),
+        Err(ForgeError::Keychain(_))
+    ));
+    // After a restart the account is still there, with its token.
+    let text = std::fs::read_to_string(data.book()).unwrap();
+    assert_eq!(AccountBook::decode(&text).accounts().len(), 1);
+}
+
+// -- the loopback listener never outlives the flow -----------------------------
+
+#[test]
+fn a_stalled_connection_cannot_hold_the_port_past_cancel() {
+    let mock = gitlab_mock();
+    let runner = SignInRunner::new(service(&mock, memory(), None));
+    let released = Arc::new(AtomicBool::new(false));
+    let flag = released.clone();
+    let stalled = Mutex::new(None);
+    sign_in_until(
+        &runner,
+        SignInMethod::GitLabBrowser,
+        |prompt| {
+            let UserPrompt::Browser { url } = prompt else {
+                panic!()
+            };
+            let query = parse_query(url.split_once('?').unwrap().1);
+            let redirect = query
+                .iter()
+                .find(|(k, _)| k == "redirect_uri")
+                .unwrap()
+                .1
+                .clone();
+            let local = redirect
+                .strip_prefix("http://")
+                .unwrap()
+                .strip_suffix("/callback")
+                .unwrap()
+                .to_owned();
+            // Connect and say nothing; give the listener time to take it.
+            *stalled.lock().unwrap() = Some(TcpStream::connect(&local).unwrap());
+            thread::sleep(Duration::from_millis(150));
+            let (sender, _unused) = mpsc::channel();
+            runner.execute(SignInCommand::Abort, sender);
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(1500) {
+                if TcpListener::bind(&local).is_ok() {
+                    flag.store(true, Ordering::SeqCst);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        },
+        || true,
+    );
+    assert!(
+        released.load(Ordering::SeqCst),
+        "the port stayed taken after Cancel"
+    );
+}
+
+#[test]
+fn a_stalled_connection_cannot_hold_the_flow_past_its_deadline() {
+    let mock = gitlab_mock();
+    let mut config = config(&mock.origin());
+    config.browser_timeout = Duration::from_millis(300);
+    let service = ForgeService::new(memory(), config, None).unwrap();
+    let runner = SignInRunner::new(service);
+    let stalled = Mutex::new(None);
+    let started = Instant::now();
+    let phase = sign_in(&runner, SignInMethod::GitLabBrowser, |prompt| {
+        let UserPrompt::Browser { url } = prompt else {
+            panic!()
+        };
+        let query = parse_query(url.split_once('?').unwrap().1);
+        let redirect = query
+            .iter()
+            .find(|(k, _)| k == "redirect_uri")
+            .unwrap()
+            .1
+            .clone();
+        let local = redirect
+            .strip_prefix("http://")
+            .unwrap()
+            .strip_suffix("/callback")
+            .unwrap()
+            .to_owned();
+        *stalled.lock().unwrap() = Some(TcpStream::connect(local).unwrap());
+    });
+    assert_eq!(phase, SignInPhase::Failed(SignInFailure::Expired));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the deadline waited for a silent connection: {:?}",
+        started.elapsed()
+    );
 }
