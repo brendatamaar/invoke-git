@@ -496,13 +496,11 @@ fn write_link(bytes: &[u8], link: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::{symlink_dir, symlink_file};
     let (kind, bytes) = bytes.split_first().ok_or(io::ErrorKind::InvalidData)?;
-    if !bytes.len().is_multiple_of(2) || *kind > 1 {
+    let (units, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() || *kind > 1 {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    let target: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
+    let target: Vec<u16> = units.iter().copied().map(u16::from_le_bytes).collect();
     let target = OsString::from_wide(&target);
     if *kind == 1 {
         symlink_dir(target, link)
