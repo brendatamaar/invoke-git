@@ -1,5 +1,5 @@
 # P10 - Worktrees, Submodules & Git LFS
-Status: in-progress
+Status: review
 Depends on: P1
 Parallel-safe with: P4b, P5, P6, P7, P8, P9, P11
 
@@ -10,7 +10,7 @@ Menyediakan dukungan operasional untuk git worktrees (list, add, switch/open in 
 - [x] Tulis integration test fixture repo untuk worktrees, submodules, dan deteksi Git LFS di `crates/shell/tests/advanced_repos.rs` serta property test state di `crates/core/tests/advanced_props.rs`.
 - [x] Tambah deteksi & pembacaan worktree list, submodule status, dan LFS status/pointer di `crates/shell/src/` dan `crates/core/src/state.rs`.
 - [x] Tambah perintah CLI untuk `git worktree add/remove`, `git submodule update --init --recursive`, dan `git lfs pull` (bila `git-lfs` terpasang) dengan progress/cancel & lock guard di `crates/shell/src/git.rs`.
-- [ ] Tambah section Worktrees & Submodules di sidebar (`crates/ui/src/sidebar.rs`, `crates/app/src/branch_panel.rs`) serta indikator file LFS di diff viewer + Windows checklist di Handoff notes.
+- [x] Tambah section Worktrees & Submodules di sidebar (`crates/ui/src/sidebar.rs`, `crates/app/src/branch_panel.rs`) serta indikator file LFS di diff viewer + Windows checklist di Handoff notes.
 
 ## Definition of Done
 - `cargo xtask check --core` (VPS/CI) atau `cargo xtask check` (Windows) lulus.
@@ -25,3 +25,11 @@ Menyediakan dukungan operasional untuk git worktrees (list, add, switch/open in 
 - Task 1 selesai: fixture integration tests (`crates/shell/tests/advanced_repos.rs`) dan property test awal (`crates/core/tests/advanced_props.rs`) ditambahkan untuk linked worktree (`.git` relatif `../.git/worktrees/<name>`), submodule, dan file pointer Git LFS tanpa `git-lfs`.
 - Task 2 selesai: `AdvancedSnapshot` (worktrees, submodules, LFS) ditambahkan ke `DiskState` (`crates/core/src/advanced.rs`, `state.rs`, `watch.rs`) dan pembacaan read-only berbasis `gix`/file ditambahkan di `crates/shell/src/advanced.rs`, `read.rs`, `precondition.rs`, `staging.rs` (termasuk fallback status/diff saat `filter.lfs.required=true` tetapi `git-lfs` tidak terpasang).
 - Task 3 selesai: planner & event core (`WorktreeAddRequested`, `WorktreeRemoveRequested`, `SubmoduleRequested`, `LfsPullRequested`) dan CLI runner (`git worktree add/remove`, `git submodule init/update --init --recursive/sync --recursive`, `git lfs pull`) ditambahkan dengan expected-state guard, `index.lock` guard, progress/cancel, serta fallback `ErrorClass::Environment` saat `git-lfs` tidak terpasang. Proptest `invalid_lfs_oid_is_rejected` terbukti menangkap planted bug.
+- Task 4 selesai: section `WORKTREES` (Open di tab baru / Remove) dan `SUBMODULES` (Update / Sync + badge status) ditambahkan di `crates/ui/src/sidebar.rs` dan `crates/app/src/branch_panel.rs`; event buka tab worktree disambungkan lewat `repo_view.rs` -> `workspace.rs`; indikator file LFS (pill `LFS` + banner ukuran/SHA-256 + tombol `Pull LFS`) ditambahkan di `crates/ui/src/diff_view.rs` & `crates/app/src/diff_load.rs`; label progress/cancel ditambahkan di `crates/app/src/sync.rs`.
+- Checklist verifikasi manual Windows (UI):
+  - [ ] Buka repo utama, klik `+ Worktree`, buat linked worktree baru dengan branch baru; pastikan muncul di section `WORKTREES` sidebar.
+  - [ ] Klik `Open` (atau double-click) pada linked worktree di sidebar (termasuk worktree dengan `.git` relatif `../.git/worktrees/<name>`); pastikan terbuka di tab terpisah tanpa merusak atau mengganti tab repo utama, dan masing-masing tab menampilkan branch/status sendiri.
+  - [ ] Klik `Remove` pada linked worktree non-aktif (uji normal & force pada worktree locked/modified); pastikan dialog konfirmasi muncul dan worktree terhapus dari disk serta sidebar.
+  - [ ] Buka repo dengan submodule (uninitialized, clean, dirty, out-of-sync); verifikasi badge status di section `SUBMODULES`, klik `Update` dan `Sync`, cek progress bar + tombol `Cancel` di strip atas.
+  - [ ] Buka repo dengan file pointer Git LFS di halaman Changes; verifikasi pill `LFS` dan banner ukuran/SHA-256 tampil di diff viewer, staging/unstaging pointer tetap berfungsi, dan tombol `Pull LFS` berjalan saat `git-lfs` terpasang (serta menampilkan error Environment yang jelas saat `git-lfs` tidak tersedia).
+  - [ ] Cek tema light & dark memastikan seluruh badge/warna/spacing berasal dari `crates/tokens`.
