@@ -42,6 +42,7 @@ fn disk_with(
         },
         stashes: Vec::new(),
         lock,
+        advanced: Default::default(),
     }
 }
 

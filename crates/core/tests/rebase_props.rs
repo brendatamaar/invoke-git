@@ -17,6 +17,7 @@ fn disk(number: u8) -> DiskState {
         refs: RefsSnapshot::default(),
         stashes: Vec::new(),
         lock: LockState::Free,
+        advanced: Default::default(),
     }
 }
 

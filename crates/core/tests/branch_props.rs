@@ -78,6 +78,7 @@ impl World {
             },
             stashes: Vec::new(),
             lock: self.lock,
+            advanced: Default::default(),
         }
     }
 
@@ -754,6 +755,7 @@ fn arb_disk() -> impl Strategy<Value = DiskState> {
                 },
                 stashes: Vec::new(),
                 lock: LockState::Free,
+                advanced: Default::default(),
             }
         })
 }

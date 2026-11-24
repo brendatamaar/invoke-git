@@ -116,7 +116,25 @@ fn classify_own(rel: &[String], ci: bool) -> Option<Area> {
 
 fn classify_common(rel: &[String], ci: bool) -> Option<Area> {
     let name = rel.first()?;
-    (names_match(name, "refs", ci) || names_match(name, "packed-refs", ci)).then_some(Area::Refs)
+    if names_match(name, "refs", ci) || names_match(name, "packed-refs", ci) {
+        return Some(Area::Refs);
+    }
+    // P10: adding, removing, locking, or switching another linked worktree
+    // updates `<common_dir>/worktrees/<name>/{gitdir,locked,HEAD}`. Ignore
+    // other worktrees' `index` and `logs` so edits in one tab do not churn
+    // unrelated tabs.
+    if names_match(name, "worktrees", ci) {
+        let relevant = match rel.get(2) {
+            None => true,
+            Some(entry) => {
+                names_match(entry, "gitdir", ci)
+                    || names_match(entry, "locked", ci)
+                    || names_match(entry, "HEAD", ci)
+            }
+        };
+        return relevant.then_some(Area::Refs);
+    }
+    None
 }
 
 /// `name` is already case-folded when `ci`; `want` is the canonical spelling.

@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::advanced::AdvancedSnapshot;
 use crate::conflict::ConflictRefusal;
 use crate::ids::{
     BranchName, IndexId, NameProblem, Oid, OpId, ReadId, RefName, RepoId, RepoPath, TagName,
@@ -78,6 +79,8 @@ pub struct DiskState {
     /// The stash list, newest first (`stash@{0}` is first). Task 20.
     pub stashes: Vec<StashEntry>,
     pub lock: LockState,
+    /// P10: worktrees, submodules, and Git LFS state read from disk.
+    pub advanced: AdvancedSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -8,7 +8,7 @@ Menyediakan dukungan operasional untuk git worktrees (list, add, switch/open in 
 
 ## Tasks
 - [x] Tulis integration test fixture repo untuk worktrees, submodules, dan deteksi Git LFS di `crates/shell/tests/advanced_repos.rs` serta property test state di `crates/core/tests/advanced_props.rs`.
-- [ ] Tambah deteksi & pembacaan worktree list, submodule status, dan LFS status/pointer di `crates/shell/src/` dan `crates/core/src/state.rs`.
+- [x] Tambah deteksi & pembacaan worktree list, submodule status, dan LFS status/pointer di `crates/shell/src/` dan `crates/core/src/state.rs`.
 - [ ] Tambah perintah CLI untuk `git worktree add/remove`, `git submodule update --init --recursive`, dan `git lfs pull` (bila `git-lfs` terpasang) dengan progress/cancel & lock guard di `crates/shell/src/git.rs`.
 - [ ] Tambah section Worktrees & Submodules di sidebar (`crates/ui/src/sidebar.rs`, `crates/app/src/branch_panel.rs`) serta indikator file LFS di diff viewer + Windows checklist di Handoff notes.
 
@@ -23,3 +23,4 @@ Menyediakan dukungan operasional untuk git worktrees (list, add, switch/open in 
 ## Handoff notes
 - Catatan Windows: path worktree dan submodule rawan panjang path dan file lock; uji juga kasus `.git` file yang menunjuk ke `../.git/worktrees/<name>`.
 - Task 1 selesai: fixture integration tests (`crates/shell/tests/advanced_repos.rs`) dan property test awal (`crates/core/tests/advanced_props.rs`) ditambahkan untuk linked worktree (`.git` relatif `../.git/worktrees/<name>`), submodule, dan file pointer Git LFS tanpa `git-lfs`.
+- Task 2 selesai: `AdvancedSnapshot` (worktrees, submodules, LFS) ditambahkan ke `DiskState` (`crates/core/src/advanced.rs`, `state.rs`, `watch.rs`) dan pembacaan read-only berbasis `gix`/file ditambahkan di `crates/shell/src/advanced.rs`, `read.rs`, `precondition.rs`, `staging.rs` (termasuk fallback status/diff saat `filter.lfs.required=true` tetapi `git-lfs` tidak terpasang).

@@ -37,7 +37,7 @@ pub fn use_user_config(on: bool) {
     USER_CONFIG.store(on, Ordering::Relaxed);
 }
 
-fn options() -> gix::open::Options {
+pub(crate) fn options() -> gix::open::Options {
     if USER_CONFIG.load(Ordering::Relaxed) {
         gix::open::Options::default()
     } else {
@@ -58,6 +58,20 @@ pub(crate) fn open(paths: &RepoPaths) -> Result<gix::Repository, String> {
 pub(crate) fn open_with_worktree(paths: &RepoPaths) -> Result<gix::Repository, String> {
     gix::open_opts(&paths.workdir, options())
         .map_err(|error| format!("open {}: {error}", paths.workdir.display()))
+}
+
+/// P10: fallback opener when `filter.lfs.*` is configured (with `required=true`)
+/// but `git-lfs` is not installed, so read-only status/diff inspection still
+/// succeeds instead of failing on the missing external filter process.
+pub(crate) fn open_with_worktree_without_lfs_filter(
+    paths: &RepoPaths,
+) -> Result<gix::Repository, String> {
+    let mut repo = open_with_worktree(paths)?;
+    {
+        let mut cfg = repo.config_snapshot_mut();
+        while cfg.remove_section("filter", Some("lfs".into())).is_some() {}
+    }
+    Ok(repo)
 }
 
 /// What `HEAD` says, as the core's [`Head`].

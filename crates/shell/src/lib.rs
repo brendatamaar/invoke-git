@@ -3,6 +3,7 @@
 //! outcome into an event. It holds no business logic; the parsing here is
 //! the boundary between git's text and the core's types.
 
+pub mod advanced;
 pub mod askpass;
 pub mod blame;
 pub mod classify;

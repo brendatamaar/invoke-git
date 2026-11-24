@@ -54,10 +54,21 @@ pub fn read_state(paths: &RepoPaths) -> Result<DiskState, Failure> {
     let conflicts = read_conflicts(&repo, &index_path, in_progress).map_err(fail)?;
     let phase = detect_phase(&markers, conflicts);
     let refs = read_refs(&repo).map_err(fail)?;
-    let status = precondition::open_with_worktree(paths)
-        .and_then(|worktree| read_status(&worktree))
-        .map_err(fail)?;
+    let worktree = precondition::open_with_worktree(paths).map_err(fail)?;
+    let (worktree, status) = match read_status(&worktree) {
+        Ok(status) => (worktree, status),
+        Err(first_err) => {
+            if let Ok(fallback) = precondition::open_with_worktree_without_lfs_filter(paths)
+                && let Ok(status) = read_status(&fallback)
+            {
+                (fallback, status)
+            } else {
+                return Err(fail(first_err));
+            }
+        }
+    };
     let stashes = read_stashes(&repo).map_err(fail)?;
+    let advanced = crate::advanced::read_advanced(&repo, &worktree, paths, &status);
     let lock = if paths.git_dir.join("index.lock").exists() {
         LockState::HeldByOther
     } else {
@@ -71,6 +82,7 @@ pub fn read_state(paths: &RepoPaths) -> Result<DiskState, Failure> {
         refs,
         stashes,
         lock,
+        advanced,
     })
 }
 

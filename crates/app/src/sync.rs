@@ -444,6 +444,7 @@ mod tests {
                     refs: RefsSnapshot::default(),
                     stashes: Vec::new(),
                     lock,
+                    advanced: Default::default(),
                 },
             };
             state

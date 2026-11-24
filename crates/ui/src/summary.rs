@@ -300,6 +300,7 @@ mod tests {
             refs,
             stashes: Vec::new(),
             lock: LockState::Free,
+            advanced: Default::default(),
         }
     }
 
