@@ -97,8 +97,9 @@ pub struct RepoView {
     selected: Option<(Section, RepoPath)>,
     collapsed: HashSet<(Section, String)>,
     queue: VecDeque<QueuedFile>,
-    /// A discard waiting for the user's yes.
-    confirm: Option<Confirm>,
+    /// A discard waiting for the user's yes, or being prepared for it.
+    /// Not tied to `request`, which every watcher read bumps.
+    confirm: discard::Confirmation,
     bulk: Bulk,
     /// Something the app itself has to say (a file that cannot be staged).
     local_notice: Option<String>,
@@ -106,9 +107,6 @@ pub struct RepoView {
     last_read: Option<ReadId>,
     /// Numbers each diff request; an answer for an older one is dropped.
     request: u64,
-    /// The discard confirmation being prepared. Not tied to `request`, which
-    /// every watcher read bumps.
-    preparing: discard::Preparing,
 }
 
 fn has(status: &StatusSnapshot, section: Section, path: &RepoPath) -> bool {
@@ -260,12 +258,11 @@ impl RepoView {
             selected: None,
             collapsed: HashSet::new(),
             queue: VecDeque::new(),
-            confirm: None,
+            confirm: discard::Confirmation::default(),
             bulk: Bulk::Idle,
             local_notice: None,
             last_read: None,
             request: 0,
-            preparing: discard::Preparing::default(),
         }
     }
 
@@ -423,7 +420,7 @@ impl RepoView {
     }
 
     fn clear(&mut self, cx: &mut Context<Self>) {
-        self.confirm = None;
+        self.confirm.clear();
         self.selected = None;
         self.request += 1;
         self.diff.update(cx, |diff, cx| {
@@ -432,7 +429,7 @@ impl RepoView {
     }
 
     fn select(&mut self, section: Section, path: RepoPath, cx: &mut Context<Self>) {
-        self.confirm = None;
+        self.confirm.clear();
         self.selected = Some((section, path.clone()));
         self.diff
             .update(cx, |diff, cx| diff.set_content(DiffContent::Loading, cx));
@@ -577,9 +574,8 @@ impl RepoView {
         };
         // This confirmation is the newest; a file list still being prepared
         // must not replace it.
-        self.preparing.drop_pending();
         self.local_notice = None;
-        self.confirm = Some(confirm);
+        self.confirm.show(confirm);
         cx.notify();
     }
 
@@ -588,22 +584,17 @@ impl RepoView {
             return;
         }
         let paths = self.session.read(cx).discovered.paths.clone();
-        let ticket = self.preparing.start();
+        let ticket = self.confirm.start();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { discard::prepare(&paths, files) })
                 .await;
             this.update(cx, |this, cx| {
-                if !this.preparing.is_current(ticket) {
-                    return;
-                }
-                match result {
-                    Ok(confirm) => {
-                        this.local_notice = None;
-                        this.confirm = Some(confirm);
-                    }
-                    Err(error) => this.local_notice = Some(error),
+                match this.confirm.finish(ticket, result) {
+                    None => return,
+                    Some(Ok(())) => this.local_notice = None,
+                    Some(Err(error)) => this.local_notice = Some(error),
                 }
                 cx.notify();
             })
@@ -632,8 +623,7 @@ impl RepoView {
     }
 
     fn cancel_discard(&mut self, cx: &mut Context<Self>) {
-        self.preparing.drop_pending();
-        self.confirm = None;
+        self.confirm.clear();
         cx.notify();
     }
 
@@ -886,7 +876,7 @@ impl Render for RepoView {
             banners = banners.child(banner);
             any = true;
         }
-        if let Some(confirm) = &self.confirm {
+        if let Some(confirm) = self.confirm.shown() {
             let (yes, no) = (cx.entity(), cx.entity());
             banners = banners.child(
                 Banner::new(BannerKind::Warning, confirm.text.clone())

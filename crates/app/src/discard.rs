@@ -158,27 +158,60 @@ pub fn describe_files(count: usize) -> (String, String) {
     )
 }
 
-/// Numbers the discard confirmations being prepared off the main thread.
-/// Only the latest one may open, and only while the user has not moved on
-/// (cancelled, picked another file). Diff reloads, which run on every
-/// watcher read, have their own count and never drop one.
+/// The discard confirmation on screen, and the one being prepared off the
+/// main thread (the file list for Discard file / Discard all).
+///
+/// A preparation opens only if it is still the latest thing asked for: a
+/// newer preparation, a confirmation built on the spot, a cancel, or a new
+/// file on show (selection or clearing) all drop it. Diff reloads, which run
+/// on every watcher read, have their own count and never drop one.
 #[derive(Debug, Default)]
-pub struct Preparing(u64);
+pub struct Confirmation {
+    shown: Option<Confirm>,
+    ticket: u64,
+}
 
-impl Preparing {
-    /// A new preparation; any older one is dropped when it answers.
+impl Confirmation {
+    pub fn shown(&self) -> Option<&Confirm> {
+        self.shown.as_ref()
+    }
+
+    /// The user said yes: the confirmation leaves the screen.
+    pub fn take(&mut self) -> Option<Confirm> {
+        self.shown.take()
+    }
+
+    /// Shows a confirmation built now; nothing prepared earlier replaces it.
+    pub fn show(&mut self, confirm: Confirm) {
+        self.ticket += 1;
+        self.shown = Some(confirm);
+    }
+
+    /// Cancel, or the file on show changed: nothing stays on screen, and
+    /// nothing being prepared opens later for the wrong file.
+    pub fn clear(&mut self) {
+        self.ticket += 1;
+        self.shown = None;
+    }
+
+    /// A new preparation; its ticket goes back to [`Confirmation::finish`].
     pub fn start(&mut self) -> u64 {
-        self.0 += 1;
-        self.0
+        self.ticket += 1;
+        self.ticket
     }
 
-    /// Drops whatever is being prepared.
-    pub fn drop_pending(&mut self) {
-        self.0 += 1;
-    }
-
-    pub fn is_current(&self, ticket: u64) -> bool {
-        self.0 == ticket
+    /// A preparation answered. `None` when it is no longer wanted (nothing
+    /// changes); otherwise the confirmation is shown, or the error is
+    /// handed back to report.
+    pub fn finish(
+        &mut self,
+        ticket: u64,
+        result: Result<Confirm, String>,
+    ) -> Option<Result<(), String>> {
+        if ticket != self.ticket {
+            return None;
+        }
+        Some(result.map(|confirm| self.shown = Some(confirm)))
     }
 }
 
@@ -189,18 +222,60 @@ mod tests {
 
     use super::*;
 
+    fn confirm(button: &str) -> Confirm {
+        Confirm {
+            text: String::new(),
+            button: button.into(),
+            what: What::Files(Vec::new()),
+        }
+    }
+
+    fn button(confirmation: &Confirmation) -> Option<&str> {
+        confirmation.shown().map(|confirm| confirm.button.as_str())
+    }
+
+    /// Re-check: what the repo view does with a confirmation being
+    /// prepared, step by step: picking or clearing a file, a confirmation
+    /// built on the spot, a newer preparation and a cancel all drop it; a
+    /// diff reload (nothing happens here) does not.
     #[test]
-    fn only_the_latest_preparation_that_was_not_dropped_opens() {
-        let mut preparing = Preparing::default();
-        let first = preparing.start();
-        assert!(preparing.is_current(first));
-        let second = preparing.start();
-        assert!(!preparing.is_current(first));
-        assert!(preparing.is_current(second));
-        preparing.drop_pending();
-        assert!(!preparing.is_current(second));
-        let third = preparing.start();
-        assert!(preparing.is_current(third));
+    fn a_prepared_confirmation_opens_only_while_still_wanted() {
+        let mut view = Confirmation::default();
+        let ticket = view.start();
+        assert_eq!(view.finish(ticket, Ok(confirm("all"))), Some(Ok(())));
+        assert_eq!(button(&view), Some("all"));
+
+        // Another file is picked (or the list is cleared) while preparing.
+        let ticket = view.start();
+        view.clear();
+        assert_eq!(view.finish(ticket, Ok(confirm("stale"))), None);
+        assert_eq!(button(&view), None);
+        let ticket = view.start();
+        view.clear();
+        assert_eq!(view.finish(ticket, Err("stale error".into())), None);
+
+        // A hunk confirmation built on the spot wins over an older list.
+        let ticket = view.start();
+        view.show(confirm("hunk"));
+        assert_eq!(view.finish(ticket, Ok(confirm("stale"))), None);
+        assert_eq!(button(&view), Some("hunk"));
+
+        // Only the newest of two preparations opens.
+        let first = view.start();
+        let second = view.start();
+        assert_eq!(view.finish(first, Ok(confirm("first"))), None);
+        assert_eq!(
+            view.finish(second, Err("read failed".into())),
+            Some(Err("read failed".into()))
+        );
+        assert_eq!(button(&view), Some("hunk"));
+
+        // Yes takes it off the screen.
+        assert_eq!(
+            view.take().map(|confirm| confirm.button),
+            Some("hunk".into())
+        );
+        assert_eq!(button(&view), None);
     }
 
     fn inputs(old: bool, new: bool) -> InputsMeta {
