@@ -61,7 +61,7 @@ impl SignInRunner {
                         SignInMethod::GitLabBrowser => browser_flow(&service, &cancel, &events),
                     };
                     if let Err(error) = outcome {
-                        send(&cancel, &events, SignInEvent::Errored(error.user_message()));
+                        send(&cancel, &events, failure_event(&cancel, &error));
                     }
                 });
             }
@@ -79,9 +79,12 @@ impl SignInRunner {
                 });
             }
             SignInCommand::Abort => {
-                // Waits for a commit in progress, then undoes it if there was
-                // one: what is stored always matches the "cancelled" shown.
-                self.service.cancel_flow(&self.current_cancel());
+                // Never waits for a write in progress (that flow undoes its own
+                // write); undoes a finished commit. What is stored matches the
+                // "cancelled" shown, and a failed undo is reported, not dropped.
+                if let Err(error) = self.service.cancel_flow(&self.current_cancel()) {
+                    let _ = events.send(SignInEvent::CleanupFailed(error.user_message()));
+                }
                 if let Ok(mut device) = self.device.lock() {
                     *device = None;
                 }
@@ -107,8 +110,18 @@ impl SignInRunner {
 }
 
 /// Sends an event unless the flow was cancelled meanwhile.
+/// The event for a failed step. A failed undo after a cancel is the one error a
+/// cancelled flow still reports.
+fn failure_event(cancel: &FlowControl, error: &ForgeError) -> SignInEvent {
+    if cancel.is_cancelled() && *error == ForgeError::RollbackFailed {
+        SignInEvent::CleanupFailed(error.user_message())
+    } else {
+        SignInEvent::Errored(error.user_message())
+    }
+}
+
 fn send(cancel: &FlowControl, events: &Sender<SignInEvent>, event: SignInEvent) {
-    if !cancel.is_cancelled() {
+    if !cancel.is_cancelled() || matches!(event, SignInEvent::CleanupFailed(_)) {
         let _ = events.send(event);
     }
 }
@@ -202,15 +215,15 @@ fn poll_once(
         Ok(DevicePoll::Granted(credential)) => {
             let origin = match service.origin_for_new(ForgeKind::GitHub, "") {
                 Ok(origin) => origin,
-                Err(error) => return SignInEvent::Errored(error.user_message()),
+                Err(error) => return failure_event(cancel, &error),
             };
             match service.finish_oauth(ForgeKind::GitHub, origin, credential, cancel) {
                 Ok(account) => SignInEvent::Granted(account),
-                Err(error) => SignInEvent::Errored(error.user_message()),
+                Err(error) => failure_event(cancel, &error),
             }
         }
         Err(ForgeError::Network | ForgeError::TimedOut) => SignInEvent::Pending,
-        Err(error) => SignInEvent::Errored(error.user_message()),
+        Err(error) => failure_event(cancel, &error),
     }
 }
 

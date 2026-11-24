@@ -106,10 +106,16 @@ pub struct Listing {
 /// One sign-in's say over whether it may still commit, shared by the threads
 /// of the flow and the runner's cancel.
 ///
-/// Cancel and commit exclude each other: a commit happens entirely under the
-/// gate, and cancel takes the same gate. So either the flow was cancelled
-/// first and stores nothing, or it committed first and cancel undoes exactly
-/// that commit. The result on screen (cancelled) and the stored state agree.
+/// Cancel and commit exclude each other, and cancel never waits for a commit:
+///
+/// - cancelled first: the flow stores nothing
+/// - cancelled while the flow is writing (`Committing`): cancel only leaves a
+///   note, and the flow undoes its own write when it is done
+/// - cancelled after the commit: cancel undoes exactly that commit
+///
+/// So the "cancelled" on screen and the stored state agree, and a store that
+/// calls back into cancel from inside a write (the same thread) cannot
+/// deadlock: the gate is only ever held for a moment, never across IO.
 #[derive(Default)]
 pub(super) struct FlowControl {
     /// A fast flag for loops and for suppressing late events.
@@ -121,9 +127,13 @@ pub(super) struct FlowControl {
 enum Gate {
     #[default]
     Open,
-    Cancelled,
+    /// The flow is writing its account.
+    Committing {
+        cancel_requested: bool,
+    },
     /// The flow stored its account; kept so cancel can undo only this write.
     Committed(Box<Commit>),
+    Cancelled,
 }
 
 struct Commit {
@@ -142,8 +152,8 @@ impl FlowControl {
         self.gate.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// The flow is over or replaced: it may not commit any more, but what it
-    /// already committed stays (it was shown to the user).
+    /// The flow is over or replaced: it may not start a commit any more, but
+    /// what it already committed (or is committing) stays: the user saw it.
     pub(super) fn retire(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
         let mut gate = self.gate();
@@ -310,26 +320,46 @@ impl ForgeService {
         self.register(kind, origin, &username, AuthMethod::OAuth, credential, flow)
     }
 
-    /// Cancels a flow. If it already committed (and the user was not yet
+    /// Cancels a flow without ever waiting for a write in progress (see
+    /// [`FlowControl`]). If it already committed (and the user was not yet
     /// told), that commit is undone, so what is stored matches the
     /// "cancelled" the user sees. Undoing is compare-and-restore: it only
     /// touches the account and token this flow wrote, and only if they are
-    /// still as it left them (a later sign-in or disconnect wins).
-    pub(super) fn cancel_flow(&self, flow: &FlowControl) {
+    /// still as it left them (a later sign-in or disconnect wins). An undo
+    /// that fails is returned (`RollbackFailed`), never dropped.
+    pub(super) fn cancel_flow(&self, flow: &FlowControl) -> Result<(), ForgeError> {
         flow.cancelled.store(true, Ordering::SeqCst);
-        let mut gate = flow.gate();
-        if let Gate::Committed(commit) = std::mem::replace(&mut *gate, Gate::Cancelled) {
-            self.undo_commit(&commit);
+        let committed = {
+            let mut gate = flow.gate();
+            match std::mem::replace(&mut *gate, Gate::Cancelled) {
+                Gate::Committed(commit) => Some(commit),
+                Gate::Committing { .. } => {
+                    // The flow undoes its own write when it finishes.
+                    *gate = Gate::Committing {
+                        cancel_requested: true,
+                    };
+                    None
+                }
+                Gate::Open | Gate::Cancelled => None,
+            }
+        };
+        match committed {
+            Some(commit) => {
+                let mut book = self.book_lock();
+                self.undo_locked(&mut book, &commit)
+            }
+            None => Ok(()),
         }
     }
 
-    fn undo_commit(&self, commit: &Commit) {
+    /// Puts back what `commit` replaced, if it is still what the flow wrote.
+    /// The caller holds the list lock.
+    fn undo_locked(&self, book: &mut AccountBook, commit: &Commit) -> Result<(), ForgeError> {
         let key = commit.account.key();
-        let mut book = self.book_lock();
         let still_ours = book.get(&key) == Some(&commit.account)
             && matches!(self.inner.store.load(&key), Ok(Some(current)) if current == commit.written);
         if !still_ours {
-            return;
+            return Ok(());
         }
         match &commit.previous_account {
             Some(previous) => book.add(previous.clone()),
@@ -337,14 +367,17 @@ impl ForgeService {
                 book.remove(&key);
             }
         }
-        // Best effort, list first like a disconnect: there is nobody left to
-        // report to, and a leftover is at worst an account the user can
-        // disconnect.
-        let _ = self.save_book(&book);
-        let _ = match &commit.previous_credential {
+        // The list first, like a disconnect: a restart must not find an
+        // account whose token is gone.
+        let list = self.save_book(book);
+        let token = match &commit.previous_credential {
             Some(previous) => self.inner.store.save(&key, previous),
             None => self.inner.store.delete(&key),
         };
+        if list.is_err() || token.is_err() {
+            return Err(ForgeError::RollbackFailed);
+        }
+        Ok(())
     }
 
     pub(super) fn origin_for_new(
@@ -382,9 +415,9 @@ impl ForgeService {
 
     /// Keychain first, then the list: an account never appears without its
     /// token. The whole sequence (look at what is there, write the token,
-    /// write the list, record the commit) runs under the flow's gate and the
-    /// list lock, so a cancel, a disconnect or another sign-in cannot
-    /// interleave with it. If the list cannot be written the token is put
+    /// write the list) runs under the list lock, so a disconnect or another
+    /// sign-in cannot interleave with it, and the flow's gate says what to do
+    /// about a cancel that arrives meanwhile. If the list cannot be written the token is put
     /// back as it was, and if even that fails the error says so, because a
     /// token may then be left behind.
     fn register(
@@ -398,19 +431,60 @@ impl ForgeService {
     ) -> Result<ForgeAccount, ForgeError> {
         let account = ForgeAccount::new(kind, origin, username, method)
             .ok_or(ForgeError::BadResponse("unusable user name"))?;
-        let key = account.key();
-        // Lock order everywhere: gate, then list.
-        let mut gate = flow.gate();
-        if matches!(*gate, Gate::Cancelled) {
-            return Err(ForgeError::Cancelled);
+        {
+            // Only a moment under the gate: it is never held across IO.
+            let mut gate = flow.gate();
+            match *gate {
+                Gate::Open => {
+                    *gate = Gate::Committing {
+                        cancel_requested: false,
+                    }
+                }
+                _ => return Err(ForgeError::Cancelled),
+            }
         }
         let mut book = self.book_lock();
+        let written = self.write_account(&mut book, &account, &credential);
+        let commit = match written {
+            Ok(commit) => commit,
+            Err(error) => {
+                *flow.gate() = Gate::Cancelled;
+                return Err(error);
+            }
+        };
+        let mut gate = flow.gate();
+        match std::mem::replace(&mut *gate, Gate::Cancelled) {
+            Gate::Committing {
+                cancel_requested: false,
+            } => {
+                *gate = Gate::Committed(Box::new(commit));
+                Ok(account)
+            }
+            // Cancelled while writing: undo this write now.
+            _ => {
+                drop(gate);
+                self.undo_locked(&mut book, &commit)?;
+                Err(ForgeError::Cancelled)
+            }
+        }
+    }
+
+    /// Writes the token and then the list, putting the token back as it was
+    /// if the list cannot be written (and saying so if even that fails).
+    /// The caller holds the list lock.
+    fn write_account(
+        &self,
+        book: &mut AccountBook,
+        account: &ForgeAccount,
+        credential: &Credential,
+    ) -> Result<Commit, ForgeError> {
+        let key = account.key();
         let previous_account = book.get(&key).cloned();
         let previous_credential = self.inner.store.load(&key)?;
-        self.inner.store.save(&key, &credential)?;
+        self.inner.store.save(&key, credential)?;
         let before = book.clone();
         book.add(account.clone());
-        if let Err(error) = self.save_book(&book) {
+        if let Err(error) = self.save_book(book) {
             *book = before;
             let token_back = match &previous_credential {
                 Some(previous) => self.inner.store.save(&key, previous),
@@ -422,13 +496,12 @@ impl ForgeService {
                 error
             });
         }
-        *gate = Gate::Committed(Box::new(Commit {
+        Ok(Commit {
             account: account.clone(),
-            written: credential,
+            written: credential.clone(),
             previous_account,
             previous_credential,
-        }));
-        Ok(account)
+        })
     }
 
     /// Forgets an account. The list changes first, so a restart cannot bring

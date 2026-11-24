@@ -1441,6 +1441,8 @@ fn assert_no_secret_on_disk(dir: &Path, secrets: &[&str]) {
 struct HookStore {
     inner: MemoryStore,
     after_save: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Makes every delete fail (a keychain that refuses).
+    fail_delete: AtomicBool,
 }
 
 impl TokenStore for HookStore {
@@ -1455,6 +1457,11 @@ impl TokenStore for HookStore {
         self.inner.load(key)
     }
     fn delete(&self, key: &str) -> Result<(), ForgeError> {
+        if self.fail_delete.load(Ordering::SeqCst) {
+            return Err(ForgeError::Keychain(
+                "access to the keychain was refused".into(),
+            ));
+        }
         self.inner.delete(key)
     }
 }
@@ -1538,7 +1545,7 @@ fn oauth_error_text_from_a_server_is_never_shown() {
 }
 
 #[test]
-fn cancelling_while_the_token_is_saved_leaves_nothing_connected() {
+fn a_cancel_from_another_thread_while_the_token_is_saved_leaves_nothing_connected() {
     let mock = device_mock("granted");
     let data = TempDir::new("cancel-write");
     let store = Arc::new(HookStore::default());
@@ -2125,4 +2132,122 @@ fn a_cancel_between_the_user_lookup_and_the_commit_stores_nothing() {
     thread::sleep(Duration::from_millis(300));
     assert!(store.is_empty());
     assert!(service.accounts().is_empty());
+}
+
+// -- cancel never waits for a write, and never hides a failed undo --------------
+
+#[test]
+fn a_cancel_from_inside_the_keychain_write_neither_deadlocks_nor_keeps_the_account() {
+    // The store calls Cancel synchronously from its own save, on the thread
+    // that holds the write: Cancel must not wait for that write.
+    let mock = device_mock("granted");
+    let data = TempDir::new("cancel-same-thread");
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), Some(data.book()));
+    let runner = Arc::new(SignInRunner::new(service.clone()));
+    let fired = Arc::new(AtomicBool::new(false));
+    {
+        let (runner, fired) = (runner.clone(), fired.clone());
+        *store.after_save.lock().unwrap() = Some(Box::new(move || {
+            abort(&runner);
+            fired.store(true, Ordering::SeqCst);
+        }));
+    }
+    sign_in_until(
+        &runner,
+        SignInMethod::GitHubDevice,
+        |_| {},
+        || fired.load(Ordering::SeqCst),
+    );
+    assert!(fired.load(Ordering::SeqCst), "the token was never saved");
+    eventually("the write never finished (deadlock?) or was kept", || {
+        store.inner.is_empty() && service.accounts().is_empty()
+    });
+    if let Ok(text) = std::fs::read_to_string(data.book()) {
+        assert!(AccountBook::decode(&text).is_empty());
+    }
+}
+
+/// Reads events until a `CleanupFailed` comes (up to 5 s).
+fn wait_for_cleanup_failed(inbox: &mpsc::Receiver<SignInEvent>) -> Option<String> {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        if let Ok(SignInEvent::CleanupFailed(message)) =
+            inbox.recv_timeout(Duration::from_millis(25))
+        {
+            return Some(message);
+        }
+    }
+    None
+}
+
+#[test]
+fn a_cancel_whose_undo_fails_says_so_instead_of_staying_silent() {
+    let mock = device_mock("granted");
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), None);
+    let runner = SignInRunner::new(service.clone());
+    run_until_committed(&runner, &service);
+    store.fail_delete.store(true, Ordering::SeqCst);
+    let (events, inbox) = mpsc::channel();
+    runner.execute(SignInCommand::Abort, events);
+    let message = wait_for_cleanup_failed(&inbox).expect("the failed undo was not reported");
+    assert!(message.contains("keychain"), "{message}");
+    assert!(message.contains("Invoke Git forge accounts"), "{message}");
+    for secret in ["ghp_ANA", "dev-secret-code"] {
+        assert!(!message.contains(secret), "{message}");
+    }
+    // The leftover is real and said so: the account is gone, the token is not.
+    assert!(service.accounts().is_empty());
+    assert!(!store.inner.is_empty());
+    // The machine shows it on the cancelled screen.
+    let (phase, _) = step_sign_in(
+        SignInPhase::Failed(SignInFailure::Cancelled),
+        SignInEvent::CleanupFailed(message),
+    );
+    assert!(matches!(
+        phase,
+        SignInPhase::Failed(SignInFailure::CancelledWithLeftover(_))
+    ));
+}
+
+#[test]
+fn a_failed_undo_of_a_write_cancelled_midway_is_reported_by_the_flow() {
+    let mock = device_mock("granted");
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), None);
+    let runner = Arc::new(SignInRunner::new(service.clone()));
+    store.fail_delete.store(true, Ordering::SeqCst);
+    {
+        let runner = runner.clone();
+        *store.after_save.lock().unwrap() = Some(Box::new(move || abort(&runner)));
+    }
+    let (events, inbox) = mpsc::channel();
+    let (mut phase, commands) = step_sign_in(
+        SignInPhase::Idle,
+        SignInEvent::Begin(SignInMethod::GitHubDevice),
+    );
+    for command in commands {
+        runner.execute(command, events.clone());
+    }
+    let started = Instant::now();
+    let mut message = None;
+    while message.is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "no report of the failed undo"
+        );
+        match inbox.recv_timeout(Duration::from_millis(25)) {
+            Ok(SignInEvent::CleanupFailed(text)) => message = Some(text),
+            Ok(event) => {
+                let (next, commands) = step_sign_in(phase, event);
+                phase = next;
+                for command in commands {
+                    runner.execute(command, events.clone());
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(message.unwrap().contains("keychain"));
 }

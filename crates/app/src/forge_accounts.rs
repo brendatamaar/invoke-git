@@ -95,6 +95,9 @@ pub fn failure_text(failure: &SignInFailure) -> String {
         SignInFailure::Expired => "The code expired. Start again.".into(),
         SignInFailure::Cancelled => "Cancelled.".into(),
         SignInFailure::Error(message) => message.clone(),
+        SignInFailure::CancelledWithLeftover(message) => {
+            format!("Cancelled, but it could not be fully undone. {message}")
+        }
     }
 }
 
@@ -161,11 +164,22 @@ impl EventEmitter<AccountsEvent> for AccountsView {}
 
 impl Drop for AccountsView {
     /// Closing the screen mid sign-in stops the poll timer or the local
-    /// listener, so nothing keeps running unseen.
+    /// listener, so nothing keeps running unseen. What to send comes from the
+    /// sign-in machine (see [`commands_on_close`]): a flow that already
+    /// finished, as "Connected" shows, is never undone by closing.
     fn drop(&mut self) {
-        self.runner
-            .execute(SignInCommand::Abort, self.events.clone());
+        for command in commands_on_close(&self.phase) {
+            self.runner.execute(command, self.events.clone());
+        }
     }
+}
+
+/// What closing the screen asks of the runner in this phase. It is the
+/// machine's own answer to Cancel, so only a flow still running is stopped:
+/// after success (`Authorized`) or any other end there is nothing to send,
+/// and closing the view cannot roll back a connected account.
+pub fn commands_on_close(phase: &SignInPhase) -> Vec<SignInCommand> {
+    step_sign_in(phase.clone(), SignInEvent::Cancel).1
 }
 
 impl AccountsView {
@@ -839,6 +853,38 @@ mod tests {
         assert!(!shares_origin(&book, &other_port));
         assert!(!shares_origin(&book, &elsewhere));
         assert_eq!(host_of(&other_port), "git.corp:8443");
+    }
+
+    #[test]
+    fn closing_the_screen_stops_a_running_sign_in_and_never_undoes_a_finished_one() {
+        for running in [
+            SignInPhase::Requesting(SignInMethod::GitHubDevice),
+            SignInPhase::AwaitingUser {
+                method: SignInMethod::GitLabBrowser,
+                prompt: UserPrompt::Browser {
+                    url: "https://gitlab.com/oauth/authorize".into(),
+                },
+                interval_secs: 1,
+            },
+        ] {
+            assert_eq!(commands_on_close(&running), vec![SignInCommand::Abort]);
+        }
+        for finished in [
+            SignInPhase::Idle,
+            SignInPhase::Authorized(account()),
+            SignInPhase::Failed(SignInFailure::Denied),
+            SignInPhase::Failed(SignInFailure::Cancelled),
+            SignInPhase::Failed(SignInFailure::Error("x".into())),
+        ] {
+            assert!(commands_on_close(&finished).is_empty(), "{finished:?}");
+        }
+    }
+
+    #[test]
+    fn a_cancel_that_left_something_behind_is_said_so() {
+        let text = failure_text(&SignInFailure::CancelledWithLeftover("Remove it.".into()));
+        assert!(text.starts_with("Cancelled, but"), "{text}");
+        assert!(text.contains("Remove it."));
     }
 
     #[test]
