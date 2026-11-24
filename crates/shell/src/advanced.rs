@@ -472,7 +472,11 @@ fn check_submodules_in(
     prefix: &str,
     target: Option<&RepoPath>,
 ) -> Result<(), Failure> {
-    let Ok(Some(submodules)) = repo.submodules() else {
+    let submodules = repo.submodules().map_err(|error| Failure {
+        class: ErrorClass::Expected,
+        details: format!("Refused to update submodules: could not read submodule list ({error})."),
+    })?;
+    let Some(submodules) = submodules else {
         return Ok(());
     };
     for sub in submodules {
@@ -494,10 +498,14 @@ fn check_submodules_in(
         if !sub_workdir.join(".git").exists() {
             continue;
         }
-        let sub_repo = match gix::open_opts(&sub_workdir, precondition::options()) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let sub_repo = gix::open_opts(&sub_workdir, precondition::options()).map_err(|error| {
+            Failure {
+                class: ErrorClass::Expected,
+                details: format!(
+                    "Refused to update submodule '{display_path}': could not open submodule repository to verify cleanliness ({error})."
+                ),
+            }
+        })?;
         let lock = sub_repo.git_dir().join("index.lock");
         if lock.exists() {
             return Err(Failure {
@@ -509,9 +517,13 @@ fn check_submodules_in(
                 ),
             });
         }
-        if let Ok(Head::Branch { name, .. } | Head::Unborn(name)) =
-            precondition::read_head(&sub_repo)
-        {
+        let head = precondition::read_head(&sub_repo).map_err(|error| Failure {
+            class: ErrorClass::Expected,
+            details: format!(
+                "Refused to update submodule '{display_path}': could not read submodule HEAD ({error})."
+            ),
+        })?;
+        if let Head::Branch { name, .. } | Head::Unborn(name) = head {
             return Err(Failure {
                 class: ErrorClass::Expected,
                 details: format!(
@@ -520,17 +532,22 @@ fn check_submodules_in(
                 ),
             });
         }
-        let status_res = crate::status::read_status(&sub_repo).or_else(|_| {
-            let sub_paths = RepoPaths {
-                workdir: sub_workdir.clone(),
-                git_dir: sub_repo.git_dir().to_path_buf(),
-            };
-            precondition::open_with_worktree_without_lfs_filter(&sub_paths)
-                .and_then(|r| crate::status::read_status(&r))
-        });
-        if let Ok(status) = status_res
-            && !status.entries.is_empty()
-        {
+        let status = crate::status::read_status(&sub_repo)
+            .or_else(|_| {
+                let sub_paths = RepoPaths {
+                    workdir: sub_workdir.clone(),
+                    git_dir: sub_repo.git_dir().to_path_buf(),
+                };
+                precondition::open_with_worktree_without_lfs_filter(&sub_paths)
+                    .and_then(|r| crate::status::read_status(&r))
+            })
+            .map_err(|error| Failure {
+                class: ErrorClass::Expected,
+                details: format!(
+                    "Refused to update submodule '{display_path}': could not verify working tree cleanliness ({error})."
+                ),
+            })?;
+        if !status.entries.is_empty() {
             return Err(Failure {
                 class: ErrorClass::Expected,
                 details: format!(

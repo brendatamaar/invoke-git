@@ -822,11 +822,25 @@ fn worktree_remove_missing_dir_only_removes_selected_worktree() {
     let wt_b = sb.root.join("wt-gone-b");
     sb.git(
         &main,
-        &["worktree", "add", "-q", "-b", "br-a", wt_a.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "br-a",
+            wt_a.to_str().unwrap(),
+        ],
     );
     sb.git(
         &main,
-        &["worktree", "add", "-q", "-b", "br-b", wt_b.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "br-b",
+            wt_b.to_str().unwrap(),
+        ],
     );
     // Both checkout folders are missing on disk (e.g. unmounted drives).
     fs::remove_dir_all(&wt_a).unwrap();
@@ -1089,6 +1103,81 @@ fn submodule_action_uses_literal_pathspec_for_glob_names() {
     assert_eq!(a1.state, SubmoduleState::Uninitialized);
     assert!(clone_dir.join("libs/a[12]/lib.txt").is_file());
     assert!(!clone_dir.join("libs/a1/lib.txt").exists());
+}
+
+#[test]
+fn submodule_update_refuses_when_status_read_fails() {
+    let sb = Sandbox::new();
+    let child = sb.init_repo("sub-unreadable-child");
+    sb.commit(&child, "lib.txt", b"v1\n", "child v1");
+
+    let super_repo = sb.init_repo("sub-unreadable-super");
+    sb.commit(&super_repo, "README.md", b"root\n", "super c1");
+    sb.git(
+        &super_repo,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            child.to_str().unwrap(),
+            "libs/child",
+        ],
+    );
+    sb.git(&super_repo, &["commit", "-q", "-m", "add child"]);
+
+    let clone_dir = sb.root.join("sub-unreadable-clone");
+    sb.git(
+        &sb.root,
+        &[
+            "clone",
+            "-q",
+            super_repo.to_str().unwrap(),
+            clone_dir.to_str().unwrap(),
+        ],
+    );
+    let found = discover(&clone_dir).unwrap();
+    let mut driver = Driver::open(found.paths.clone(), sb.env.clone());
+
+    // Initialize submodule (detached, clean).
+    driver.deliver(Event::SubmoduleRequested {
+        op: SubmoduleOp::UpdateInitRecursive,
+        path: None,
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+
+    // Corrupt the submodule's index file so `read_status` fails inside the
+    // preflight check: update MUST be refused, never treated as clean.
+    let sub_git_dir = clone_dir.join(".git/modules/libs/child");
+    fs::write(sub_git_dir.join("index"), b"not-a-valid-git-index").unwrap();
+
+    let expect = shell::precondition::current(&found.paths).unwrap();
+    let runner =
+        GitRunner::new(Git::detect("git").unwrap(), found.paths.clone()).with_env(sb.env.clone());
+    let (tx, rx) = mpsc::channel();
+    runner.run(
+        OpId(99),
+        invoke_core::GitArgs::Submodule {
+            op: SubmoduleOp::UpdateInitRecursive,
+            path: Some(RepoPath("libs/child".into())),
+        },
+        expect,
+        tx,
+    );
+    let event = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("submodule preflight refusal must finish promptly");
+    match event {
+        Event::OpFinished(OpId(99), OpOutcome::Failed(f)) => {
+            assert_eq!(f.class, ErrorClass::Expected);
+            assert!(
+                f.details
+                    .contains("could not verify working tree cleanliness"),
+                "expected clear read-failure refusal, got: {}",
+                f.details
+            );
+        }
+        other => panic!("expected Expected refusal on unreadable submodule status, got {other:?}"),
+    }
 }
 
 #[test]

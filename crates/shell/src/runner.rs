@@ -346,10 +346,18 @@ impl Job {
             op: invoke_core::SubmoduleOp::UpdateInitRecursive,
             path,
         } = &self.args
-            && let Err(failure) =
-                crate::advanced::check_submodule_update(&self.paths, path.as_ref())
         {
-            return OpOutcome::Failed(failure);
+            if let Err(failure) = run_submodule_preflight(
+                &self.paths,
+                &self.expect,
+                path.as_ref(),
+                crate::advanced::check_submodule_update,
+            ) {
+                return OpOutcome::Failed(failure);
+            }
+            if self.cancelled() {
+                return OpOutcome::Cancelled;
+            }
         }
         // P10: run the `git lfs version` probe through the cancellable runner,
         // then re-check the final guard (`index.lock`, HEAD, index) right
@@ -641,10 +649,66 @@ fn collect(drained: Drained) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Runs the submodule disk check and immediately re-verifies the calling repo's
+/// precondition (`index.lock`, `HEAD`, `index`) right before spawning `git submodule update`.
+fn run_submodule_preflight(
+    paths: &RepoPaths,
+    expect: &Expect,
+    path: Option<&invoke_core::RepoPath>,
+    check_sub: impl FnOnce(&RepoPaths, Option<&invoke_core::RepoPath>) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    check_sub(paths, path)?;
+    precondition::check(paths, expect)
+}
+
 pub(crate) fn failed(class: ErrorClass, details: String) -> OpOutcome {
     OpOutcome::Failed(Failure { class, details })
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submodule_preflight_rechecks_precondition_after_submodule_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "invoke-sub-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let paths = RepoPaths {
+            workdir: dir.clone(),
+            git_dir: dir.join(".git"),
+        };
+        let expect = precondition::current(&paths).unwrap();
+
+        // Simulate `index.lock` appearing during the submodule disk scan.
+        let lock_path = paths.git_dir.join("index.lock");
+        let res = run_submodule_preflight(&paths, &expect, None, |_, _| {
+            std::fs::write(&lock_path, b"lock").unwrap();
+            Ok(())
+        });
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match res {
+            Err(f) => assert_eq!(f.class, ErrorClass::PreconditionChanged),
+            Ok(()) => panic!("expected PreconditionChanged when index.lock appeared during scan"),
+        }
+    }
 }
