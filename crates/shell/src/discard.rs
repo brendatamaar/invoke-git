@@ -479,24 +479,11 @@ fn same_name_on_disk(_: &Path, _: &RepoPath) -> Result<(), Failure> {
 /// a cloud placeholder is not downloaded.
 #[cfg(windows)]
 fn disk_name(full: &Path) -> io::Result<OsString> {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
 
-    let absolute: Vec<u16> = std::path::absolute(full)?
-        .as_os_str()
-        .encode_wide()
-        .collect();
-    let units = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
-    // A verbatim path, so long paths work without the process opting in.
-    let mut wide = if absolute.starts_with(&units(r"\\?\")) {
-        absolute
-    } else if let Some(share) = absolute.strip_prefix(&units(r"\\")[..]) {
-        [units(r"\\?\UNC\"), share.to_vec()].concat()
-    } else {
-        [units(r"\\?\"), absolute].concat()
-    };
-    wide.push(0);
+    let wide = verbatim_path(full)?;
     // SAFETY: `wide` is NUL-terminated, `data` is a plain struct written by
     // the call, and the search handle is closed right away.
     let data = unsafe {
@@ -650,11 +637,7 @@ impl UndoRunner {
         let private = scratch.0.join("index");
         let env = [("GIT_INDEX_FILE", private.as_os_str())];
         if let Some(file) = file {
-            let blob = self.run(
-                &["hash-object", "-w", "--no-filters", "--stdin"],
-                &[],
-                Some(&file.bytes),
-            )?;
+            let blob = self.save_blob(&file.bytes)?;
             let mode = match file.mode {
                 WorktreeMode::Regular => "100644",
                 WorktreeMode::Executable => "100755",
@@ -923,15 +906,67 @@ fn install_file(
     if !(error.kind() == io::ErrorKind::PermissionDenied && blocks_rename(target)) {
         return Err(InstallError::Failed(error));
     }
-    let aside = scratch.0.join("previous");
+    // The prepared checkout may itself be named "previous". A separate
+    // directory keeps the backup from replacing any checkout path.
+    let backup = precondition::ScratchDir::create(&scratch.0).map_err(InstallError::Failed)?;
+    let aside = backup.0.join("previous");
     fs::rename(target, &aside).map_err(|_| InstallError::Failed(error))?;
-    match fs::rename(source, target) {
+    match rename_into_vacant_path(source, target) {
         Ok(()) => Ok(()),
-        Err(error) => match fs::rename(&aside, target) {
+        Err(error) => match rename_into_vacant_path(&aside, target) {
             Ok(()) => Err(InstallError::Failed(error)),
-            Err(_) => Err(InstallError::Stranded { error, kept: aside }),
+            Err(_) => {
+                std::mem::forget(backup);
+                Err(InstallError::Stranded { error, kept: aside })
+            }
         },
     }
+}
+
+#[cfg(windows)]
+fn rename_into_vacant_path(source: &Path, target: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let source = verbatim_path(source)?;
+    let target = verbatim_path(target)?;
+    // SAFETY: both path buffers are NUL-terminated and live through the call.
+    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A NUL-terminated Win32 path that also supports paths over MAX_PATH.
+#[cfg(windows)]
+fn verbatim_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let absolute: Vec<u16> = std::path::absolute(path)?
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| {
+            if unit == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                unit
+            }
+        })
+        .collect();
+    let units = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+    let mut wide = if absolute.starts_with(&units(r"\\?\")) {
+        absolute
+    } else if let Some(share) = absolute.strip_prefix(&units(r"\\")[..]) {
+        [units(r"\\?\UNC\"), share.to_vec()].concat()
+    } else {
+        [units(r"\\?\"), absolute].concat()
+    };
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(not(windows))]
+fn rename_into_vacant_path(source: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(source, target)
 }
 
 /// A target Windows refuses to be renamed over, though it may be moved: a
@@ -1174,7 +1209,7 @@ mod windows_tests {
         fs::write(&target, b"user's").unwrap();
         set_read_only(&target, true);
         let scratch = precondition::ScratchDir::create(&root).unwrap();
-        let source = scratch.0.join("file");
+        let source = scratch.0.join("previous");
         fs::write(&source, b"new").unwrap();
         let result = install_file(&source, &target, &scratch).map_err(|e| e.to_string());
         let scratch_path = scratch.0.clone();
