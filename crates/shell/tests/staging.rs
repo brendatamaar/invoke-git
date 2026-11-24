@@ -178,6 +178,20 @@ impl<'a> Driver<'a> {
                 expect_index,
             } => self.deliver(self.staging.apply(op, &patch, &expect_index)),
             Cmd::ReplayUndo(replay) => self.deliver(self.undo.replay(&replay)),
+            Cmd::RunGit { op, args, expect } => {
+                let runner =
+                    shell::GitRunner::new(Git::detect("git").unwrap(), self.repo.paths.clone())
+                        .with_env(self.repo.env.clone());
+                let (send, receive) = std::sync::mpsc::channel();
+                runner.run(op, args, expect, send);
+                while let Ok(event) = receive.recv() {
+                    let finished = matches!(event, Event::OpFinished(..));
+                    self.deliver(event);
+                    if finished {
+                        break;
+                    }
+                }
+            }
             Cmd::PruneUndo(ops) => self.undo.prune(&ops),
             other => panic!("unexpected command {other:?}"),
         }
@@ -578,6 +592,46 @@ fn binary_and_non_utf8_files_are_reported_not_diffed() {
             matches!(result, Err(InputsError::NotText(_))),
             "{path}: {result:?}"
         );
+    }
+}
+
+#[test]
+fn whole_file_stage_unstage_and_undo_keep_worktree_and_intent_to_add() {
+    use invoke_core::{FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("base", "base\n");
+    repo.commit_all("base");
+    for (name, bytes) in [("binary[1]", &b"x\0\x01"[..]), ("encoded", &b"\xffabc"[..])] {
+        fs::write(repo.paths.workdir.join(name), bytes).unwrap();
+        repo.git(&["--literal-pathspecs", "add", "-N", "--", name]);
+        let before = fs::read(repo.paths.git_dir.join("index")).unwrap();
+        let mut driver = Driver::open(&repo);
+        let path = RepoPath(name.into());
+        for action in [FileAction::Stage, FileAction::Unstage] {
+            let based_on = shell::precondition::current(&repo.paths).unwrap().index;
+            driver.deliver(Event::FileRequested(FileRequest {
+                path: path.clone(),
+                action: action.clone(),
+                based_on,
+            }));
+            assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+            assert_eq!(repo.worktree_bytes(name), bytes);
+            assert_eq!(
+                repo.index_bytes(name).as_deref(),
+                if action == FileAction::Stage {
+                    Some(bytes)
+                } else {
+                    None
+                },
+            );
+        }
+        for _ in 0..2 {
+            driver.deliver(Event::UndoRequested);
+            assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+        }
+        assert_eq!(fs::read(repo.paths.git_dir.join("index")).unwrap(), before);
+        assert_eq!(repo.worktree_bytes(name), bytes);
     }
 }
 

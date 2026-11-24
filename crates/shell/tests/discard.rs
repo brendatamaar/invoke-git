@@ -246,6 +246,23 @@ impl<'a> Driver<'a> {
                 self.deliver(done);
             }
             Cmd::ReplayUndo(replay) => self.deliver(self.undo.replay(&replay)),
+            Cmd::RunGit { op, args, expect } => {
+                if self.skip.remove(&op) {
+                    return;
+                }
+                let runner =
+                    shell::GitRunner::new(Git::detect("git").unwrap(), self.repo.paths.clone())
+                        .with_env(self.repo.env.clone());
+                let (send, receive) = std::sync::mpsc::channel();
+                runner.run(op, args, expect, send);
+                while let Ok(event) = receive.recv() {
+                    let finished = matches!(event, Event::OpFinished(..));
+                    self.deliver(event);
+                    if finished {
+                        break;
+                    }
+                }
+            }
             Cmd::PruneUndo(ops) => self.undo.prune(&ops),
             other => panic!("unexpected command {other:?}"),
         }
@@ -300,6 +317,83 @@ impl<'a> Driver<'a> {
             self.state.notice
         );
     }
+}
+
+fn whole_file_request(repo: &TempRepo, name: &str) -> Event {
+    use invoke_core::{FileAction, FileRequest};
+
+    let path = RepoPath(name.into());
+    let inputs = shell::discard::file_inputs(&repo.paths, &path).unwrap();
+    Event::FileRequested(FileRequest {
+        path,
+        action: FileAction::Discard { file: inputs.file },
+        based_on: inputs.based_on,
+    })
+}
+
+#[test]
+fn whole_file_discard_and_undo_preserve_exact_bytes_and_index() {
+    let repo = TempRepo::new();
+    repo.git(&["config", "core.autocrlf", "true"]);
+    let cases = [
+        ("binary", Some(&b"old\0\x01"[..]), &b"changed\0\x02"[..]),
+        ("non-utf8", Some(&b"old\xff"[..]), &b"changed\xff"[..]),
+        ("crlf", Some(&b"old\r\n"[..]), &b"changed\r\nmixed\n"[..]),
+        ("untracked[1]", None, &b"untracked\0\xff"[..]),
+        ("intent", None, &b"intent\0"[..]),
+    ];
+    for (name, old, _) in cases {
+        if let Some(old) = old {
+            repo.write_bytes(name, old);
+        }
+    }
+    repo.commit_all("base");
+    for (name, old, edited) in cases {
+        repo.write_bytes(name, edited);
+        if name == "intent" {
+            repo.git(&["add", "-N", "--", name]);
+        }
+        let index = repo.index_file_bytes();
+        let mut driver = Driver::open(&repo);
+        driver.deliver(whole_file_request(&repo, name));
+        assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded), "{name}");
+        assert_eq!(repo.worktree_bytes(name).as_deref(), old, "{name}");
+        assert_eq!(repo.index_file_bytes(), index);
+        driver.undo();
+        assert_eq!(repo.worktree_bytes(name).as_deref(), Some(edited));
+        assert_eq!(repo.index_file_bytes(), index);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn whole_file_discard_and_undo_restore_mode_and_symlink() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let repo = TempRepo::new();
+    let root = &repo.paths.workdir;
+    let link = root.join("link");
+    let script = root.join("script");
+    repo.write("script", "script\n");
+    symlink("first", &link).unwrap();
+    repo.commit_all("base");
+    fs::remove_file(&link).unwrap();
+    symlink("second", &link).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "link"));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("first"));
+    driver.undo();
+    assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("second"));
+    driver.deliver(whole_file_request(&repo, "script"));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(script.metadata().unwrap().permissions().mode() & 0o111, 0);
+    driver.undo();
+    assert_eq!(
+        script.metadata().unwrap().permissions().mode() & 0o111,
+        0o111
+    );
 }
 
 /// Reads the sides, diffs them and builds the request, like the UI will.
