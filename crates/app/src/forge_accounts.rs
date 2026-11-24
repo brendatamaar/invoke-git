@@ -113,6 +113,26 @@ pub fn method_text(method: AuthMethod) -> &'static str {
     }
 }
 
+/// Where a pasted token is meant to go: the forge and, for GitLab, the
+/// server. Two targets are the same only when the token is valid for both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenTarget {
+    kind: ForgeKind,
+    /// The server as typed, trimmed and lower case; empty for GitHub (it has
+    /// one server) and for gitlab.com typed as nothing.
+    instance: String,
+}
+
+impl TokenTarget {
+    pub fn new(kind: ForgeKind, instance_text: &str) -> Self {
+        let instance = match kind {
+            ForgeKind::GitHub => String::new(),
+            ForgeKind::GitLab => instance_text.trim().to_lowercase(),
+        };
+        Self { kind, instance }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Panel {
     List,
@@ -126,6 +146,8 @@ pub struct AccountsView {
     events: Sender<SignInEvent>,
     panel: Panel,
     token_kind: ForgeKind,
+    /// Where the token field's content was meant to go.
+    target: TokenTarget,
     token: Entity<TextEditor>,
     instance: Entity<TextEditor>,
     /// A token is being checked with the server.
@@ -159,7 +181,7 @@ impl AccountsView {
                 EditorEvent::Submit => this.connect_token(cx),
             }),
             cx.subscribe(&instance, |this, _, event: &EditorEvent, cx| match event {
-                EditorEvent::Changed => cx.notify(),
+                EditorEvent::Changed => this.retarget(cx),
                 EditorEvent::Submit => this.connect_token(cx),
             }),
         ];
@@ -170,6 +192,7 @@ impl AccountsView {
             events,
             panel: Panel::List,
             token_kind: ForgeKind::GitHub,
+            target: TokenTarget::new(ForgeKind::GitHub, ""),
             token,
             instance,
             checking: false,
@@ -255,6 +278,19 @@ impl AccountsView {
     }
 
     // -- sign in with a token -----------------------------------------------------
+
+    /// The forge or the server changed: whatever is in the token field was
+    /// meant for the old one, so it is cleared rather than sent to the new
+    /// one.
+    fn retarget(&mut self, cx: &mut Context<Self>) {
+        let target = TokenTarget::new(self.token_kind, self.instance.read(cx).text());
+        if target != self.target {
+            self.target = target;
+            self.token.update(cx, |token, cx| token.set_text("", cx));
+            self.notice = None;
+        }
+        cx.notify();
+    }
 
     fn can_connect_token(&self, cx: &Context<Self>) -> bool {
         !self.checking && !self.token.read(cx).is_empty()
@@ -640,7 +676,7 @@ impl AccountsView {
                     } else {
                         ForgeKind::GitLab
                     };
-                    cx.notify();
+                    this.retarget(cx);
                 })
             },
         ));
@@ -740,6 +776,33 @@ mod tests {
         assert_eq!(
             sign_in_screen(&SignInPhase::Failed(SignInFailure::Denied)),
             SignInScreen::Failed("The request was declined on the website.".into())
+        );
+    }
+
+    #[test]
+    fn a_token_is_kept_only_while_its_target_is_unchanged() {
+        let gitlab = TokenTarget::new(ForgeKind::GitLab, "https://git.corp");
+        // Switching forge, or editing the server, is a new target (the
+        // token field is cleared).
+        assert_ne!(TokenTarget::new(ForgeKind::GitHub, ""), gitlab);
+        assert_ne!(
+            gitlab,
+            TokenTarget::new(ForgeKind::GitLab, "https://git.corp.evil.example")
+        );
+        assert_ne!(
+            gitlab,
+            TokenTarget::new(ForgeKind::GitLab, "https://git.cor")
+        );
+        assert_ne!(gitlab, TokenTarget::new(ForgeKind::GitLab, ""));
+        // Spelling the same server differently is not (nothing is lost).
+        assert_eq!(
+            gitlab,
+            TokenTarget::new(ForgeKind::GitLab, "  HTTPS://Git.Corp ")
+        );
+        // GitHub has one server: the hidden server field does not matter.
+        assert_eq!(
+            TokenTarget::new(ForgeKind::GitHub, ""),
+            TokenTarget::new(ForgeKind::GitHub, "https://anything.example")
         );
     }
 
