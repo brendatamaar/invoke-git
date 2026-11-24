@@ -123,6 +123,9 @@ impl UndoRunner {
                 .save_index_bytes(op, &real)
                 .map_err(|details| fail(ErrorClass::Bug, details));
         }
+        let discard_lock = matches!(point.reverse, Reversal::Discard { .. })
+            .then(|| precondition::IndexLock::acquire(&self.paths, &current))
+            .transpose()?;
         let copy = self
             .paths
             .git_dir
@@ -139,7 +142,9 @@ impl UndoRunner {
         );
         let _ = fs::remove_file(&copy);
         let tree = written.map_err(|details| fail(ErrorClass::Bug, details))?;
-        if self.paths.git_dir.join("index.lock").exists() {
+        if let Some(lock) = &discard_lock {
+            lock.verify(&self.paths, &current)?;
+        } else if self.paths.git_dir.join("index.lock").exists() {
             return Err(fail(
                 ErrorClass::PreconditionChanged,
                 "index.lock is held".into(),

@@ -27,7 +27,7 @@ pub enum What {
     /// it if the index or the file changed meanwhile (rule 5).
     Request(Box<Event>),
     /// Requests read before confirmation and delivered one at a time.
-    Files(Vec<Box<Event>>),
+    Files(Vec<Event>),
 }
 
 fn lines(count: usize) -> String {
@@ -51,16 +51,16 @@ fn whole_file(path: RepoPath, inputs: FileInputs) -> Confirm {
     Confirm {
         text,
         button: button.into(),
-        what: What::Request(file_event(path, inputs)),
+        what: What::Request(Box::new(file_event(path, inputs))),
     }
 }
 
-fn file_event(path: RepoPath, inputs: FileInputs) -> Box<Event> {
-    Box::new(Event::FileRequested(FileRequest {
+fn file_event(path: RepoPath, inputs: FileInputs) -> Event {
+    Event::FileRequested(FileRequest {
         path,
         action: FileAction::Discard { file: inputs.file },
         based_on: inputs.based_on,
-    }))
+    })
 }
 
 pub fn prepare(paths: &RepoPaths, files: Vec<RepoPath>) -> Result<Confirm, String> {

@@ -613,8 +613,11 @@ impl RepoView {
         match confirm.what {
             What::Request(event) => self.deliver(*event, cx),
             What::Files(files) => {
-                self.queue
-                    .extend(files.into_iter().map(QueuedFile::Discard));
+                self.queue.extend(
+                    files
+                        .into_iter()
+                        .map(|event| QueuedFile::Discard(Box::new(event))),
+                );
                 self.next_in_queue(cx);
             }
         }

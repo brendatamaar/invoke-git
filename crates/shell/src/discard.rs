@@ -364,7 +364,7 @@ fn checkout_entry(repo: &gix::Repository, path: &RepoPath) -> Result<bool, Strin
 /// `path` under `workdir`, refusing anything that could leave the repo or
 /// reach `.git`: a discard (and its undo) writes and deletes files.
 pub(crate) fn worktree_path(workdir: &Path, path: &RepoPath) -> Result<PathBuf, String> {
-    let invalid = || format!("{:?} is not a file path inside the working tree", path.0);
+    let invalid = || format!("{:?} is not a path inside the working tree", path.0);
     let mut full = workdir.to_path_buf();
     let mut parts = path.0.split('/').peekable();
     while let Some(part) = parts.next() {
