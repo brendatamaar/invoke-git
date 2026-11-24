@@ -37,6 +37,16 @@ cargo xtask check                       # fmt, clippy, tests
 
 On the headless VPS, build only the non-UI crates (see `docs/PLAN.md`). `cargo xtask check` skips the UI crates by itself when Linux has no display; `cargo xtask check --core` skips them on any machine.
 
+## Bundled MinGit (Windows)
+
+Invoke Git always uses the `git` on `PATH` when it is 2.40 or newer. Only when that is missing or too old does it run the MinGit installed in `mingit\cmd\git.exe` next to the app executable; with neither, the setup screen says so.
+
+`cargo xtask package-windows` builds the release binaries and writes `dist\windows\` (`invoke-git.exe`, `askpass.exe`, `invoke-rebase-editor.exe`, `mingit\`). It downloads the pinned MinGit and refuses to continue unless its SHA-256 matches.
+
+Pinned: **MinGit 2.56.1 64-bit** (`v2.56.1.windows.1`), SHA-256 `4a92850b6e917da4fd010669b614b55dccf5b0ec333a534cc4be4700dfefdafd`.
+
+To update the pin: take the new tag and the `MinGit-<version>-64-bit.zip` digest from the git-for-windows release page, download the file and confirm the digest yourself (`Get-FileHash -Algorithm SHA256`), then change the four `MINGIT_*` constants in `xtask/src/package.rs`, this section, and add a row to `docs/DECISIONS.md`.
+
 ## CI
 
 GitHub Actions runs on every push (`.github/workflows/ci.yml`), following the matrix in `docs/spec/verification.md`:
