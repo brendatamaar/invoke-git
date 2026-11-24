@@ -1,5 +1,5 @@
 # P8 - Forge Auth & Repo List (GitHub/GitLab)
-Status: in-progress
+Status: review
 Depends on: P1
 Parallel-safe with: P1b, P2, P3, P4a, P4b, P5, P6, P7, P10, P11
 
@@ -9,7 +9,7 @@ Menyediakan koneksi opsional akun GitHub (OAuth device flow), GitLab.com (OAuth 
 ## Tasks
 - [x] Tulis unit/integration test mock HTTP untuk client GitHub & GitLab API, pencocokan host multi-akun, dan alur penyimpanan/hapus token (dengan backend in-memory untuk CI) di `crates/shell/tests/forge_auth.rs` (atau crate `forge` bila dipisah).
 - [x] Tambah `reqwest` dan `keyring` sesuai tabel Build-vs-Library `docs/PRD.md`, lalu implementasikan auth flow (GitHub device flow, GitLab OAuth PKCE / PAT, self-hosted PAT) dan API list repositories.
-- [ ] Tambah UI manajemen akun forge (opsional, tanpa login wall) dan tab "Clone from account" pada dialog clone (`crates/app/src/clone_view.rs`, `crates/app/src/workspace.rs`) + Windows checklist di Handoff notes.
+- [x] Tambah UI manajemen akun forge (opsional, tanpa login wall) dan tab "Clone from account" pada dialog clone (`crates/app/src/clone_view.rs`, `crates/app/src/workspace.rs`) + Windows checklist di Handoff notes.
 
 ## Definition of Done
 - `cargo xtask check --core` (VPS/CI) atau `cargo xtask check` (Windows) lulus.
