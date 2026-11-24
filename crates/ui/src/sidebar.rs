@@ -531,15 +531,13 @@ impl RenderOnce for Sidebar {
                                 .flex_none()
                                 .size(px(WORKTREE_DOT_SIZE))
                                 .rounded(px(WORKTREE_DOT_RADIUS))
-                                .bg(hsla(
-                                if *current {
+                                .bg(hsla(if *current {
                                     p.accent
                                 } else if *prunable || *locked {
                                     p.warning
                                 } else {
                                     p.line_control
-                                },
-                            ));
+                                }));
                             let mut row = base_row(
                                 ElementId::from(("side-worktree", index)),
                                 window,

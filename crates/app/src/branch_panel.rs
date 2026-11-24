@@ -1115,7 +1115,12 @@ mod tests {
 
     #[test]
     fn remove_worktree_form_always_defaults_force_to_false() {
-        for (locked, prunable) in [(None, false), (Some("usb".into()), false), (None, true), (Some("usb".into()), true)] {
+        for (locked, prunable) in [
+            (None, false),
+            (Some("usb".into()), false),
+            (None, true),
+            (Some("usb".into()), true),
+        ] {
             let wt = WorktreeEntry {
                 path: "/repo-wt".into(),
                 name: "repo-wt".into(),

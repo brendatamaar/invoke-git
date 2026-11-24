@@ -345,7 +345,8 @@ impl Job {
             op: invoke_core::SubmoduleOp::UpdateInitRecursive,
             path,
         } = &self.args
-            && let Err(failure) = crate::advanced::check_submodule_update(&self.paths, path.as_ref())
+            && let Err(failure) =
+                crate::advanced::check_submodule_update(&self.paths, path.as_ref())
         {
             return OpOutcome::Failed(failure);
         }

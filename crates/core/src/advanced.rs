@@ -263,7 +263,11 @@ fn is_valid_lfs_ext_entry(key: &str, value: &str) -> bool {
     let Some((method, hex)) = value.split_once(':') else {
         return false;
     };
-    if method.is_empty() || !method.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9')) {
+    if method.is_empty()
+        || !method
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9'))
+    {
         return false;
     }
     if method == "sha256" {

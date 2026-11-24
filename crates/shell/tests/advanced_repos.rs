@@ -875,7 +875,10 @@ fn submodule_update_forces_checkout_and_refuses_dirty_or_on_branch() {
     let v2_oid = sb.git(&sub_dir, &["rev-parse", "HEAD"]);
 
     // Configure `submodule.libs/child.update = rebase` to prove `--checkout` overrides it.
-    sb.git(&clone_dir, &["config", "submodule.libs/child.update", "rebase"]);
+    sb.git(
+        &clone_dir,
+        &["config", "submodule.libs/child.update", "rebase"],
+    );
     // Detach at v1 (OutOfSync, clean, detached) -> update must check out v2 cleanly.
     sb.git(&sub_dir, &["checkout", "-q", "--detach", "HEAD~1"]);
     driver.deliver(Event::RefreshRequested);
@@ -1021,7 +1024,8 @@ fn lfs_pull_reports_environment_error_when_git_lfs_is_missing_and_respects_lock_
     // 1. Deterministically simulate a machine where `git-lfs` is NOT installed
     // using a wrapper around real `git` that rejects `git lfs ...` unconditionally.
     let git_missing_lfs = write_fake_git_script(&sb.root, "git-no-lfs", FakeGitMode::NoLfs);
-    let git_abs = Git::detect(&git_missing_lfs).expect("fake git wrapper must report real git version");
+    let git_abs =
+        Git::detect(&git_missing_lfs).expect("fake git wrapper must report real git version");
 
     // Unconditional assertion: probe detects absence and LfsPull reports Environment error.
     assert_eq!(
@@ -1090,7 +1094,11 @@ fn lfs_staging_refuses_raw_text_when_clean_filter_is_unavailable() {
     let path = RepoPath("data.dat".into());
 
     // Replace pointer in worktree with plain UTF-8 text (no NUL bytes).
-    fs::write(repo.join("data.dat"), b"plain text that must not be staged raw\n").unwrap();
+    fs::write(
+        repo.join("data.dat"),
+        b"plain text that must not be staged raw\n",
+    )
+    .unwrap();
 
     // Case A: no `[filter "lfs"]` configured at all (git-lfs never installed).
     match load_inputs(&paths, &path, Source::IndexToWorktree) {
@@ -1190,7 +1198,9 @@ fn lfs_pull_probe_is_cancellable_and_rechecks_lock_before_pull() {
         Event::OpFinished(OpId(2), OpOutcome::Failed(f)) => {
             assert_eq!(f.class, ErrorClass::PreconditionChanged);
         }
-        other => panic!("expected PreconditionChanged after lock appeared during probe, got {other:?}"),
+        other => {
+            panic!("expected PreconditionChanged after lock appeared during probe, got {other:?}")
+        }
     }
     assert!(
         !pull_sentinel.exists(),
