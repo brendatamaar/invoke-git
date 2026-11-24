@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use crate::conflict::ResolveChoice;
 use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName, RepoPath, TagName};
 use crate::ops::{
-    AuthAnswer, AuthPrompt, BranchStart, DiscardRequest, Failure, GitArgs, OpOutcome, Patch,
-    Progress, PullMode, RemoteBranch, StageRequest,
+    AuthAnswer, AuthPrompt, BranchStart, DiscardRequest, Failure, FileRequest, GitArgs, OpOutcome,
+    Patch, Progress, PullMode, RemoteBranch, StageRequest,
 };
 use crate::reflog::ResetMode;
 use crate::state::{DiskState, Head};
@@ -17,6 +17,7 @@ pub enum Event {
     // From the UI.
     StageRequested(StageRequest),
     UnstageRequested(StageRequest),
+    FileRequested(FileRequest),
     // Task 13.
     DiscardRequested(DiscardRequest),
     CommitRequested {
@@ -232,6 +233,8 @@ pub struct UndoPoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexEffect {
     Rewrites,
+    /// Undo restores the full index file (or its absence), including entry flags.
+    RestoreBytes,
     Untouched,
 }
 

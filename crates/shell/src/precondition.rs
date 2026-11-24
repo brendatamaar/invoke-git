@@ -1,8 +1,8 @@
 //! What a write expects to find on disk, read fresh just before it runs
 //! (rule 5, law 12).
 
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
@@ -137,6 +137,14 @@ pub fn check(paths: &RepoPaths, expect: &Expect) -> Result<(), Failure> {
             lock.display()
         )));
     }
+    check_values(paths, expect)
+}
+
+fn check_values(paths: &RepoPaths, expect: &Expect) -> Result<(), Failure> {
+    let refuse = |details| Failure {
+        class: ErrorClass::PreconditionChanged,
+        details,
+    };
     let found = current(paths).map_err(|error| Failure {
         class: ErrorClass::Bug,
         details: error,
@@ -154,6 +162,65 @@ pub fn check(paths: &RepoPaths, expect: &Expect) -> Result<(), Failure> {
         )));
     }
     Ok(())
+}
+
+/// Hold Git's index lock across a guarded write. Git commands inside this
+/// guard must use a private index if they need to write it.
+pub(crate) struct IndexLock {
+    path: Option<PathBuf>,
+    file: Option<File>,
+}
+
+impl IndexLock {
+    pub(crate) fn acquire(paths: &RepoPaths, expect: &Expect) -> Result<Self, Failure> {
+        let path = paths.git_dir.join("index.lock");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| Failure {
+                class: if error.kind() == io::ErrorKind::AlreadyExists {
+                    ErrorClass::PreconditionChanged
+                } else {
+                    ErrorClass::Environment
+                },
+                details: format!("{}: {error}", path.display()),
+            })?;
+        let lock = Self {
+            path: Some(path),
+            file: Some(file),
+        };
+        check_values(paths, expect)?;
+        Ok(lock)
+    }
+
+    /// Install an index using Git's lock-and-rename protocol. An empty
+    /// snapshot denotes an absent index.
+    pub(crate) fn replace(mut self, git_dir: &Path, bytes: &[u8]) -> io::Result<()> {
+        let index = git_dir.join("index");
+        if bytes.is_empty() {
+            return match fs::remove_file(index) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            };
+        }
+        let mut file = self.file.take().expect("open lock file");
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(self.path.as_ref().expect("owned lock"), index)?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for IndexLock {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// Refuses a write when a ref it names is not where the core saw it (`None`:

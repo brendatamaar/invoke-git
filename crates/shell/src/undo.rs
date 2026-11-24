@@ -117,6 +117,32 @@ impl UndoRunner {
             ));
         }
         let real = self.paths.git_dir.join("index");
+        if point.index_effect == IndexEffect::RestoreBytes {
+            let bytes = match fs::read(&real) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => {
+                    return Err(fail(
+                        ErrorClass::Environment,
+                        format!("read index: {error}"),
+                    ));
+                }
+            };
+            precondition::check(&self.paths, &current)?;
+            let blob = self
+                .run(
+                    &["hash-object", "-w", "--no-filters", "--stdin"],
+                    &[],
+                    Some(&bytes),
+                )
+                .map_err(|details| fail(ErrorClass::Bug, details))?;
+            let id = Oid::from_hex(blob.trim())
+                .map_err(|error| fail(ErrorClass::Bug, format!("hash index: {error:?}")))?;
+            precondition::check(&self.paths, &current)?;
+            self.run(&["update-ref", &undo_ref(op), id.as_hex()], &[], None)
+                .map_err(|details| fail(ErrorClass::Bug, details))?;
+            return Ok(id);
+        }
         let copy = self
             .paths
             .git_dir
@@ -180,6 +206,9 @@ impl UndoRunner {
         // and not the index.
         if let Some(restore) = &replay.discard {
             return self.restore_discard(restore);
+        }
+        if replay.index_effect == IndexEffect::RestoreBytes {
+            return self.restore_index_bytes(replay);
         }
         let zero = "0".repeat(replay.tree.as_hex().len());
         let transaction = |restore: bool| {
@@ -253,6 +282,28 @@ impl UndoRunner {
             return failed(ErrorClass::Bug, format!("{details}\n{rollback}"));
         }
         OpOutcome::Succeeded
+    }
+
+    fn restore_index_bytes(&self, replay: &UndoReplay) -> OpOutcome {
+        let lock = match precondition::IndexLock::acquire(&self.paths, &replay.expect) {
+            Ok(lock) => lock,
+            Err(failure) => return OpOutcome::Failed(failure),
+        };
+        let result = (|| {
+            let repo = precondition::open(&self.paths)?;
+            let id = gix::ObjectId::from_hex(replay.tree.as_hex().as_bytes())
+                .map_err(|error| error.to_string())?;
+            repo.find_blob(id)
+                .map(|blob| blob.data.clone())
+                .map_err(|error| error.to_string())
+        })();
+        match result {
+            Ok(bytes) => match lock.replace(&self.paths.git_dir, &bytes) {
+                Ok(()) => OpOutcome::Succeeded,
+                Err(error) => failed(ErrorClass::Environment, format!("restore index: {error}")),
+            },
+            Err(details) => failed(ErrorClass::Bug, details),
+        }
     }
 
     /// Puts `HEAD` where the operation found it.

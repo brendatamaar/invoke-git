@@ -27,6 +27,7 @@ pub enum WriteRequest {
     Unstage(StageRequest),
     // Task 13: takes lines out of a worktree file; undoable.
     Discard(DiscardRequest),
+    File(FileRequest),
     // Task 15: branches. Checked against the fresh snapshot at dispatch.
     CreateBranch {
         name: BranchName,
@@ -210,6 +211,12 @@ pub struct Lease {
 /// typed here lets tests check what the core asked for without parsing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitArgs {
+    AddPath(RepoPath),
+    RestoreStagedPath(RepoPath),
+    DiscardPath {
+        path: RepoPath,
+        file: Option<FileVersion>,
+    },
     Commit {
         message: String,
         amend: bool,
@@ -368,7 +375,10 @@ impl GitArgs {
             oid: oid.cloned(),
         };
         match self {
-            GitArgs::Commit { .. }
+            GitArgs::AddPath(_)
+            | GitArgs::RestoreStagedPath(_)
+            | GitArgs::DiscardPath { .. }
+            | GitArgs::Commit { .. }
             | GitArgs::StashSave { .. }
             | GitArgs::StashApply { .. }
             | GitArgs::StashPop { .. }
@@ -560,6 +570,35 @@ pub struct StageRequest {
     pub selection: Selection,
     pub patch: Patch,
     pub based_on: IndexId,
+}
+
+/// A whole-file action, independent of the contents shown in the text diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRequest {
+    pub path: RepoPath,
+    pub action: FileAction,
+    pub based_on: IndexId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileAction {
+    Stage,
+    Unstage,
+    Discard { file: Option<FileVersion> },
+}
+
+/// Identity of a worktree entry, including Git's executable and symlink modes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileVersion {
+    pub blob: Oid,
+    pub mode: WorktreeMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeMode {
+    Regular,
+    Executable,
+    Symlink,
 }
 
 /// A discard the user asked for (task 13): selected changes are taken out of

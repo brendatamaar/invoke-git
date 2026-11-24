@@ -23,6 +23,7 @@ pub fn action_of(request: &WriteRequest) -> Option<Action> {
         WriteRequest::Commit { .. }
         | WriteRequest::Undo
         | WriteRequest::Stage(_)
+        | WriteRequest::File(_)
         | WriteRequest::Unstage(_)
         | WriteRequest::Discard(_)
         | WriteRequest::StashSave { .. }
@@ -207,6 +208,7 @@ fn check(
         WriteRequest::Commit { .. }
         | WriteRequest::Undo
         | WriteRequest::Stage(_)
+        | WriteRequest::File(_)
         | WriteRequest::Unstage(_)
         | WriteRequest::Discard(_)
         | WriteRequest::StashSave { .. }

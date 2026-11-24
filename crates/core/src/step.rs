@@ -10,6 +10,7 @@ use crate::event::{
 };
 use crate::ids::{BranchName, Oid, OpId, ReadId, RefName, RepoId, TagName};
 use crate::message::CommitMessage;
+use crate::ops::FileAction;
 use crate::ops::{
     ErrorClass, Failure, GitArgs, Lease, OpOutcome, PullMode, RemoteBranch, StageRequest,
     WriteRequest,
@@ -46,6 +47,7 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         Event::UnstageRequested(request) => {
             enqueue_index_write(&mut state, Action::Unstage, request, WriteRequest::Unstage);
         }
+        Event::FileRequested(request) => enqueue(&mut state, WriteRequest::File(request)),
         // Task 13: an empty patch changes nothing and is refused up front.
         Event::DiscardRequested(request) => {
             if request.patch.0.is_empty() {
@@ -395,7 +397,7 @@ fn cancel(state: &mut RepoState, op: OpId, commands: &mut Vec<Command>) {
             || is_conflict_flow(&running.request)
             || matches!(
                 running.request,
-                WriteRequest::Discard(_) | WriteRequest::Reset { .. }
+                WriteRequest::Discard(_) | WriteRequest::File(_) | WriteRequest::Reset { .. }
             )
         {
             return;
@@ -799,6 +801,59 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     expect_file: discard.expect_file.clone(),
                 });
                 state.undo.pending = UndoPending::Recording { point };
+            }
+            WriteRequest::File(file) => {
+                let path = &file.path;
+                let (action, verb, args) = match &file.action {
+                    FileAction::Stage => (Action::Stage, "Stage", GitArgs::AddPath(path.clone())),
+                    FileAction::Unstage => (
+                        Action::Unstage,
+                        "Unstage",
+                        GitArgs::RestoreStagedPath(path.clone()),
+                    ),
+                    FileAction::Discard { file } => (
+                        Action::Discard,
+                        "Discard",
+                        GitArgs::DiscardPath {
+                            path: path.clone(),
+                            file: file.clone(),
+                        },
+                    ),
+                };
+                if action == Action::Discard && disk.phase != Phase::Clean {
+                    refuse_because(state, action, Refusal::RepoBusy);
+                    continue;
+                }
+                if file.based_on != expect.index {
+                    refuse_because(state, action, Refusal::StaleDiff);
+                    continue;
+                }
+                let (index_effect, reverse) = if action == Action::Discard {
+                    (
+                        IndexEffect::Untouched,
+                        Reversal::Discard { path: path.clone() },
+                    )
+                } else {
+                    (IndexEffect::RestoreBytes, Reversal::Refs)
+                };
+                if !matches!(state.rebase, RebaseState::Paused(_)) {
+                    let point = UndoPoint {
+                        op: id,
+                        label: format!("{verb} {}", path.0),
+                        head: HeadTarget::of(&disk.head),
+                        refs: Vec::new(),
+                        index: expect.index.clone(),
+                        index_effect,
+                        reverse,
+                    };
+                    commands.push(Command::SnapshotForUndo(point.clone()));
+                    state.undo.pending = UndoPending::Recording { point };
+                }
+                commands.push(Command::RunGit {
+                    op: id,
+                    args,
+                    expect,
+                });
             }
             // Task 20: stash. Planned against the snapshot the write runs on.
             WriteRequest::StashSave { .. }
