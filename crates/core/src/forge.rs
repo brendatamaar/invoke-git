@@ -101,6 +101,8 @@ pub enum OriginProblem {
 pub struct Origin {
     text: String,
     host: String,
+    /// The port requests go to: the written one, or 80 / 443 by scheme.
+    port: u16,
 }
 
 impl Origin {
@@ -145,6 +147,7 @@ impl Origin {
             return Err(OriginProblem::Insecure);
         }
         let default = if scheme == "https" { 443 } else { 80 };
+        let effective = port.unwrap_or(default);
         let port = port.filter(|port| *port != default);
         let shown = if host.contains(':') {
             format!("[{host}]")
@@ -155,7 +158,11 @@ impl Origin {
             Some(port) => format!("{scheme}://{shown}:{port}"),
             None => format!("{scheme}://{shown}"),
         };
-        Ok(Origin { text, host })
+        Ok(Origin {
+            text,
+            host,
+            port: effective,
+        })
     }
 
     /// `https://gitlab.example.com:8443`, no trailing slash.
@@ -166,6 +173,11 @@ impl Origin {
     /// The host name alone (no port): what a remote's host is compared to.
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// The port requests go to (443 for a bare `https://host`).
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     pub fn is_secure(&self) -> bool {
@@ -273,17 +285,26 @@ impl ForgeAccount {
     }
 }
 
-/// The host of a remote address, lower case and without port or user, or
-/// `None` for a local path. Understands `https://u@host:port/x`,
-/// `ssh://git@host/x` and scp-style `git@host:x`.
-pub fn host_of_remote(url: &str) -> Option<String> {
+/// Where a remote address points: the host, and for web addresses
+/// (`http`/`https`) the port the request goes to. An `ssh://` or scp-style
+/// address has no web port: its port is the SSH server's, not the forge's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteTarget {
+    pub host: String,
+    pub web_port: Option<u16>,
+}
+
+/// The host (and web port) of a remote address, or `None` for a local path.
+/// Understands `https://u@host:port/x`, `ssh://git@host/x` and scp-style
+/// `git@host:x`.
+pub fn remote_target(url: &str) -> Option<RemoteTarget> {
     let url = url.trim();
     if url.is_empty() {
         return None;
     }
-    let authority = if let Some((_, rest)) = url.split_once("://") {
+    let (scheme, authority) = if let Some((scheme, rest)) = url.split_once("://") {
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        &rest[..end]
+        (Some(scheme.to_ascii_lowercase()), &rest[..end])
     } else {
         // scp-style: `[user@]host:path`. A local path, or a drive letter
         // (`C:\work`, `c:/work`), has no host.
@@ -294,23 +315,47 @@ pub fn host_of_remote(url: &str) -> Option<String> {
         if head.len() == 1 || head.contains(['/', '\\']) {
             return None;
         }
-        head
+        (None, head)
     };
     let authority = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split_once(']')?.0
-    } else if url.contains("://") {
-        authority.split(':').next()?
+    let (host, port_text) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        (host, after.strip_prefix(':'))
+    } else if scheme.is_some() {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
     } else {
-        authority
+        (authority, None)
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if !host.is_ascii() {
+    if !host.is_ascii() || host.is_empty() {
         return None;
     }
-    (!host.is_empty()).then_some(host)
+    let web_port = match scheme.as_deref() {
+        Some(scheme @ ("http" | "https")) => Some(match port_text {
+            None | Some("") => {
+                if scheme == "https" {
+                    443
+                } else {
+                    80
+                }
+            }
+            // An unreadable port matches no account.
+            Some(text) => text.parse::<u16>().unwrap_or(0),
+        }),
+        _ => None,
+    };
+    Some(RemoteTarget { host, web_port })
+}
+
+/// The host of a remote address, lower case and without port or user, or
+/// `None` for a local path.
+pub fn host_of_remote(url: &str) -> Option<String> {
+    remote_target(url).map(|target| target.host)
 }
 
 /// Hosts that serve the same forge as `host` over another door.
@@ -335,7 +380,7 @@ pub enum Resolution {
         host: String,
     },
     Use(ForgeAccount),
-    /// Several accounts serve this host and none is preferred: ask.
+    /// Several accounts serve this address and none is preferred: ask.
     Choose(Vec<ForgeAccount>),
 }
 
@@ -383,8 +428,8 @@ impl AccountBook {
         let Some(account) = self.get(key) else {
             return false;
         };
-        let host = account.host().to_owned();
-        self.preferred.insert(host, key.to_owned());
+        let origin = account.origin.as_str().to_owned();
+        self.preferred.insert(origin, key.to_owned());
         true
     }
 
@@ -395,25 +440,26 @@ impl AccountBook {
 
     /// The account that serves `remote_url`.
     pub fn resolve(&self, remote_url: &str) -> Resolution {
-        let Some(host) = host_of_remote(remote_url) else {
+        let Some(RemoteTarget { host, web_port }) = remote_target(remote_url) else {
             return Resolution::LocalPath;
         };
         let matching: Vec<&ForgeAccount> = self
             .accounts
             .iter()
-            .filter(|account| same_forge(account.host(), &host))
+            .filter(|account| {
+                same_forge(account.host(), &host)
+                    && web_port.is_none_or(|port| port == account.origin.port())
+            })
             .collect();
         match matching.as_slice() {
             [] => Resolution::NoAccount { host },
             [only] => Resolution::Use((*only).clone()),
             many => {
-                let preferred = self
-                    .preferred
-                    .get(&host)
-                    .or_else(|| self.preferred.get(many[0].host()))
-                    .and_then(|key| many.iter().find(|a| &a.key() == key));
+                let preferred = many.iter().find(|account| {
+                    self.preferred.get(account.origin.as_str()) == Some(&account.key())
+                });
                 match preferred {
-                    Some(account) => Resolution::Use((*account).clone()),
+                    Some(account) => Resolution::Use((**account).clone()),
                     None => Resolution::Choose(many.iter().map(|a| (*a).clone()).collect()),
                 }
             }
@@ -822,6 +868,55 @@ mod tests {
         assert!(matches!(
             book.resolve("https://notgithub.com/o/r"),
             Resolution::NoAccount { .. }
+        ));
+    }
+
+    #[test]
+    fn a_web_remote_must_name_the_port_of_the_account() {
+        let mut book = AccountBook::default();
+        book.add(account(ForgeKind::GitLab, "https://git.corp:8443", "ana"));
+        // The port is part of where the account's token is valid.
+        for url in [
+            "https://git.corp:8443/team/tool.git",
+            "https://user@git.corp:8443/team/tool.git",
+            // SSH and scp-style remotes carry the SSH server's port, not
+            // the web port, so only the host counts.
+            "ssh://git@git.corp:22/team/tool.git",
+            "git@git.corp:team/tool.git",
+        ] {
+            assert!(matches!(book.resolve(url), Resolution::Use(_)), "{url}");
+        }
+        for url in [
+            "https://git.corp/team/tool.git",
+            "https://git.corp:9000/team/tool.git",
+            "https://git.corp:/team/tool.git",
+            "https://git.corp:notaport/team/tool.git",
+            "http://git.corp:80/team/tool.git",
+        ] {
+            assert!(
+                matches!(book.resolve(url), Resolution::NoAccount { .. }),
+                "{url}"
+            );
+        }
+        // The default port may be written or left out.
+        let mut plain = AccountBook::default();
+        plain.add(account(ForgeKind::GitHub, "github.com", "ana"));
+        for url in ["https://github.com/o/r", "https://github.com:443/o/r"] {
+            assert!(matches!(plain.resolve(url), Resolution::Use(_)), "{url}");
+        }
+        assert!(matches!(
+            plain.resolve("https://github.com:8443/o/r"),
+            Resolution::NoAccount { .. }
+        ));
+        // Two ports on one host are two accounts, each with its own choice.
+        book.add(account(ForgeKind::GitLab, "https://git.corp", "ana"));
+        assert!(matches!(
+            book.resolve("https://git.corp/x.git"),
+            Resolution::Use(a) if a.origin.as_str() == "https://git.corp"
+        ));
+        assert!(matches!(
+            book.resolve("git@git.corp:x.git"),
+            Resolution::Choose(list) if list.len() == 2
         ));
     }
 
