@@ -151,8 +151,9 @@ impl LfsSnapshot {
 ///
 /// Accepts LF or CRLF line endings (Windows checkouts), rejects files larger
 /// than [`MAX_LFS_POINTER_BYTES`], rejects non-UTF-8 or NUL bytes, and
-/// validates the `version`, `oid sha256:<64 lowercase hex>`, and `size <u64>`
-/// fields per the Git LFS pointer specification.
+/// validates the `version`, `oid sha256:<64 lowercase hex>`, `size <u64>`,
+/// key ordering, and `ext-<priority>-<name> <method>:<hex>` grammar per the
+/// Git LFS pointer specification.
 pub fn parse_lfs_pointer(bytes: &[u8]) -> Option<LfsPointer> {
     if bytes.is_empty() || bytes.len() > MAX_LFS_POINTER_BYTES {
         return None;
@@ -176,34 +177,47 @@ pub fn parse_lfs_pointer(bytes: &[u8]) -> Option<LfsPointer> {
     }
     let mut oid_sha256: Option<String> = None;
     let mut size: Option<u64> = None;
+    let mut prev_key: Option<&str> = None;
     for &line in &raw_lines[1..] {
         if line.is_empty() {
             return None;
         }
         let (key, value) = line.split_once(' ')?;
-        if key.is_empty() || value.is_empty() || value.contains(' ') {
+        if !is_valid_lfs_key(key)
+            || value.is_empty()
+            || value
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        {
             return None;
         }
+        // Git LFS spec: all keys after `version` must be unique and sorted
+        // in ascending lexicographical order.
+        if let Some(prev) = prev_key
+            && key <= prev
+        {
+            return None;
+        }
+        prev_key = Some(key);
         match key {
-            "version" => return None, // duplicate version line
+            "version" => return None,
             "oid" => {
-                if oid_sha256.is_some() {
-                    return None;
-                }
                 let hex = value.strip_prefix("sha256:")?;
-                if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                if !is_sha256_hex(hex) {
                     return None;
                 }
                 oid_sha256 = Some(hex.to_owned());
             }
             "size" => {
-                if size.is_some() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                if !is_canonical_u64(value) {
                     return None;
                 }
                 size = Some(value.parse::<u64>().ok()?);
             }
             ext if ext.starts_with("ext-") => {
-                // Valid Git LFS pointer extension key.
+                if !is_valid_lfs_ext_entry(ext, value) {
+                    return None;
+                }
             }
             _ => return None,
         }
@@ -212,6 +226,60 @@ pub fn parse_lfs_pointer(bytes: &[u8]) -> Option<LfsPointer> {
         oid_sha256: oid_sha256?,
         size: size?,
     })
+}
+
+fn is_valid_lfs_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-'))
+}
+
+fn is_sha256_hex(hex: &str) -> bool {
+    hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_canonical_u64(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text.len() == 1 || !text.starts_with('0'))
+}
+
+/// Validates a Git LFS extension line: `ext-<priority>-<name> <method>:<hex>`.
+fn is_valid_lfs_ext_entry(key: &str, value: &str) -> bool {
+    let Some(rest) = key.strip_prefix("ext-") else {
+        return false;
+    };
+    let Some((priority, name)) = rest.split_once('-') else {
+        return false;
+    };
+    if !is_canonical_u64(priority) || priority.parse::<u32>().is_err() || !is_valid_lfs_key(name) {
+        return false;
+    }
+    let Some((method, hex)) = value.split_once(':') else {
+        return false;
+    };
+    if method.is_empty() || !method.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9')) {
+        return false;
+    }
+    if method == "sha256" {
+        is_sha256_hex(hex)
+    } else {
+        !hex.is_empty() && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+}
+
+/// Returns true when `path` can be passed literally to `git lfs pull --include=<path>`.
+///
+/// Git LFS splits `--include` on `,` and evaluates each entry as a wildcard
+/// pattern (`*`, `?`, `[`, `]`, `\`). Paths containing any of those characters
+/// cannot be targeted safely as a single-file `--include`.
+pub fn lfs_include_path_is_literal(path: &RepoPath) -> bool {
+    !path.0.is_empty()
+        && !path
+            .0
+            .chars()
+            .any(|c| matches!(c, ',' | '*' | '?' | '[' | ']' | '\\'))
 }
 
 /// Returns true if `.gitattributes` text configures `filter=lfs` on any active rule.
@@ -381,6 +449,9 @@ pub enum SubmoduleRefusal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LfsRefusal {
     NotDetected,
+    /// Path contains comma or wildcard characters that `--include=` cannot
+    /// match literally.
+    UnsafeIncludePath(RepoPath),
 }
 
 /// Validates a user-supplied filesystem path for a worktree operation.
@@ -555,6 +626,11 @@ fn plan_submodule(
 fn plan_lfs_pull(path: Option<&RepoPath>, disk: &DiskState) -> Result<GitArgs, Refusal> {
     if !disk.advanced.lfs.detected {
         return Err(Refusal::Lfs(LfsRefusal::NotDetected));
+    }
+    if let Some(p) = path
+        && !lfs_include_path_is_literal(p)
+    {
+        return Err(Refusal::Lfs(LfsRefusal::UnsafeIncludePath(p.clone())));
     }
     Ok(GitArgs::LfsPull {
         path: path.cloned(),

@@ -12,8 +12,8 @@ use invoke_core::{
     RefsSnapshot, Refusal, RepoId, RepoPath, RepoState, StatusSnapshot, SubmoduleEntry,
     SubmoduleOp, SubmoduleRefusal, SubmoduleState, WorktreeCheckout, WorktreeEntry,
     WorktreeRefusal, WorktreeSpec, classify_submodule_state, format_byte_size,
-    gitattributes_uses_lfs, normalize_worktree_path, open, parse_lfs_pointer, step,
-    validate_worktree_path, worktree_holding_branch,
+    gitattributes_uses_lfs, lfs_include_path_is_literal, normalize_worktree_path, open,
+    parse_lfs_pointer, step, validate_worktree_path, worktree_holding_branch,
 };
 use proptest::prelude::*;
 
@@ -128,6 +128,53 @@ proptest! {
         prop_assume!(hex.len() != 64 || hex.bytes().any(|b| b.is_ascii_uppercase()));
         let text = format!("version {LFS_SPEC_VERSION}\noid sha256:{hex}\nsize {size}\n");
         prop_assert_eq!(parse_lfs_pointer(text.as_bytes()), None);
+    }
+
+    /// Malformed `ext-` keys/values or unsorted keys are rejected per Git LFS pointer grammar.
+    #[test]
+    fn malformed_lfs_extensions_and_unsorted_keys_are_rejected(
+        oid in arb_sha256(),
+        size in 0u64..1_000_000,
+        bad_ext in prop_oneof![
+            Just("ext- foo".to_owned()),
+            Just("ext-foo sha256:0123".to_owned()),
+            Just("ext-0- sha256:0123".to_owned()),
+            Just("ext-00-foo sha256:0123".to_owned()),
+            Just("ext-0-BAD sha256:0123".to_owned()),
+            Just("ext-0-foo notahash".to_owned()),
+            Just("ext-0-foo sha256:short".to_owned()),
+            Just("ext-0-foo sha256:ZZZZ".to_owned()),
+        ],
+    ) {
+        let with_bad_ext = format!(
+            "version {LFS_SPEC_VERSION}\n{bad_ext}\noid sha256:{oid}\nsize {size}\n"
+        );
+        prop_assert_eq!(parse_lfs_pointer(with_bad_ext.as_bytes()), None);
+
+        // Unsorted keys (`size` before `oid`) are rejected.
+        let unsorted = format!("version {LFS_SPEC_VERSION}\nsize {size}\noid sha256:{oid}\n");
+        prop_assert_eq!(parse_lfs_pointer(unsorted.as_bytes()), None);
+    }
+
+    /// Per-file LFS pull rejects paths containing comma or glob characters.
+    #[test]
+    fn lfs_pull_refuses_comma_or_wildcard_paths(
+        prefix in "[a-z0-9_/-]{0,8}",
+        meta in prop_oneof![Just(','), Just('*'), Just('?'), Just('['), Just(']'), Just('\\')],
+        suffix in "[a-z0-9_.-]{0,8}",
+    ) {
+        let path = RepoPath(format!("{prefix}{meta}{suffix}"));
+        prop_assert!(!lfs_include_path_is_literal(&path));
+        let disk = sample_disk(Phase::Clean, LockState::Free);
+        let (state, cmds) = step(opened(disk), Event::LfsPullRequested { path: Some(path.clone()) });
+        prop_assert!(cmds.iter().all(|c| !c.is_write()));
+        prop_assert_eq!(
+            state.notice,
+            Some(Notice::Refused {
+                action: Action::LfsPull,
+                reason: Refusal::Lfs(LfsRefusal::UnsafeIncludePath(path)),
+            })
+        );
     }
 
     /// `.gitattributes` detection honours comments and exact attribute tokens.

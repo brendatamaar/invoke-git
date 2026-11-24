@@ -30,8 +30,9 @@ pub use advanced::{
     AdvancedSnapshot, LFS_SPEC_VERSION, LfsFile, LfsFileState, LfsPointer, LfsRefusal, LfsSnapshot,
     MAX_LFS_POINTER_BYTES, SubmoduleEntry, SubmoduleOp, SubmoduleRefusal, SubmoduleState,
     WorktreeCheckout, WorktreeEntry, WorktreeRefusal, WorktreeSpec, WorktreeTarget,
-    classify_submodule_state, format_byte_size, gitattributes_uses_lfs, normalize_worktree_path,
-    parse_lfs_pointer, same_worktree_path, validate_worktree_path, worktree_holding_branch,
+    classify_submodule_state, format_byte_size, gitattributes_uses_lfs,
+    lfs_include_path_is_literal, normalize_worktree_path, parse_lfs_pointer, same_worktree_path,
+    validate_worktree_path, worktree_holding_branch,
 };
 pub use conflict::{
     ConflictContent, ConflictFile, ConflictKind, ConflictRefusal, ContinueGate, FileState,

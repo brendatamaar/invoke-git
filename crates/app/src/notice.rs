@@ -154,6 +154,10 @@ fn submodule_text(problem: &SubmoduleRefusal) -> String {
 fn lfs_text(problem: &LfsRefusal) -> String {
     match problem {
         LfsRefusal::NotDetected => "No Git LFS files are configured in this repository.".into(),
+        LfsRefusal::UnsafeIncludePath(path) => format!(
+            "Cannot pull {} individually because its path contains comma or wildcard characters. Use LFS Pull (all) instead.",
+            path.0
+        ),
     }
 }
 
