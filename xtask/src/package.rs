@@ -117,7 +117,7 @@ fn shell_dir() -> &'static str {
 /// A tool from `%SystemRoot%System32`. `tar.exe` must be Windows' bsdtar (it
 /// reads zips); Git for Windows puts a GNU tar earlier on PATH that does not.
 fn system32(tool: &str) -> PathBuf {
-    let root = env::var_os("SystemRoot").unwrap_or_else(|| "C:\Windows".into());
+    let root = env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
     PathBuf::from(root).join("System32").join(tool)
 }
 
