@@ -588,7 +588,7 @@ impl AccountsView {
             let key = account.key();
             let (disconnect, prefer) = (cx.entity(), cx.entity());
             let (disconnect_key, prefer_key) = (key.clone(), key.clone());
-            let shares_host = shares_origin(&book, account);
+            let shares_host = shares_origin(book, account);
             let preferred = shares_host && book.is_preferred(&key);
             let mut actions = div().flex().items_center().gap(px(SPACE_2));
             if preferred {

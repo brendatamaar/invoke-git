@@ -123,7 +123,7 @@ enum Gate {
     Open,
     Cancelled,
     /// The flow stored its account; kept so cancel can undo only this write.
-    Committed(Commit),
+    Committed(Box<Commit>),
 }
 
 struct Commit {
@@ -422,12 +422,12 @@ impl ForgeService {
                 error
             });
         }
-        *gate = Gate::Committed(Commit {
+        *gate = Gate::Committed(Box::new(Commit {
             account: account.clone(),
             written: credential,
             previous_account,
             previous_credential,
-        });
+        }));
         Ok(account)
     }
 
