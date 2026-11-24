@@ -1,5 +1,5 @@
 # P4b - Interactive Rebase Editor UI
-Status: review
+Status: done
 Depends on: P4a
 Parallel-safe with: P3, P5, P6, P7, P8, P9, P10, P11
 
@@ -28,10 +28,12 @@ Menyediakan layar Interactive Rebase Editor di GPUI dengan drag-to-reorder commi
 - `crates/ui/src/summary.rs` diperluas agar `Phase::Rebasing` saat `RebasePause::Edit` menampilkan `Rebasing n/m: paused for edit`.
 
 ### Checklist Windows (verifikasi manual)
-- [ ] Bangun app + helper rebase bersama: `cargo build -p app -p shell --bin invoke-rebase-editor` (memastikan `invoke-rebase-editor.exe` berada di direktori yang sama dengan `invoke-git.exe`).
-- [ ] Buka repo fixture dengan ≥ 4 commit linear di branch lokal, buka tab **History**, klik kanan commit ancestor (atau pilih di detail commit) lalu klik **Interactive rebase onto…**.
-- [ ] Uji **drag-to-reorder** menggunakan handle `⋮⋮` dan tombol `↑`/`↓`; verifikasi indikator garis aksen muncul di target drop dan urutan commit berubah benar.
-- [ ] Uji **validasi squash/fixup**: ubah commit pertama menjadi `squash` atau `fixup` (atau drop commit pertama lalu squash commit kedua) — pastikan banner peringatan & badge baris muncul dan tombol **Start rebase** nonaktif; ubah kembali ke `pick` atau geser commit `pick` ke atas dan pastikan validasi bersih.
-- [ ] Uji **squash / fixup / drop / reorder** end-to-end: klik **Start rebase**, verifikasi History otomatis kembali dan menampilkan urutan & pesan commit baru, serta tombol **Undo** mengembalikan branch asal.
-- [ ] Uji **pause on `edit`**: pilih aksi `edit` pada salah satu commit dan jalankan rebase; verifikasi layar beralih ke `Rebase` dengan banner `Rebasing <branch>: paused for edit (step n of m)`, klik **Open Changes**, ubah file lalu commit `--amend`, lalu klik **Continue rebase** dari banner Changes dan pastikan rebase selesai bersih.
-- [ ] Uji **conflict continue / skip / abort**: buat rencana yang memicu konflik; verifikasi layar otomatis pindah ke **Conflicts** dengan banner `Rebasing <branch>: step n of m`, uji resolve + **Continue rebase**, uji **Skip this commit**, dan uji **Abort rebase** (dengan konfirmasi) untuk memastikan branch kembali utuh.
+- [x] Bangun app + helper rebase bersama: `cargo build -p app -p shell --bin invoke-rebase-editor` (memastikan `invoke-rebase-editor.exe` berada di direktori yang sama dengan `invoke-git.exe`).
+- [x] Buka repo fixture dengan ≥ 4 commit linear di branch lokal, buka tab **History**, klik kanan commit ancestor (atau pilih di detail commit) lalu klik **Interactive rebase onto…**.
+- [x] Uji **drag-to-reorder** menggunakan handle `⋮⋮` dan tombol `↑`/`↓`; verifikasi indikator garis aksen muncul di target drop dan urutan commit berubah benar.
+- [x] Uji **validasi squash/fixup**: ubah commit pertama menjadi `squash` atau `fixup` (atau drop commit pertama lalu squash commit kedua) — pastikan banner peringatan & badge baris muncul dan tombol **Start rebase** nonaktif; ubah kembali ke `pick` atau geser commit `pick` ke atas dan pastikan validasi bersih.
+- [x] Uji **squash / fixup / drop / reorder** end-to-end: klik **Start rebase**, verifikasi History otomatis kembali dan menampilkan urutan & pesan commit baru, serta tombol **Undo** mengembalikan branch asal.
+- [x] Uji **pause on `edit`**: pilih aksi `edit` pada salah satu commit dan jalankan rebase; verifikasi layar beralih ke `Rebase` dengan banner `Rebasing <branch>: paused for edit (step n of m)`, klik **Open Changes**, ubah file lalu commit `--amend`, lalu klik **Continue rebase** dari banner Changes dan pastikan rebase selesai bersih.
+- [x] Uji **conflict continue / skip / abort**: buat rencana yang memicu konflik; verifikasi layar otomatis pindah ke **Conflicts** dengan banner `Rebasing <branch>: step n of m`, uji resolve + **Continue rebase**, uji **Skip this commit**, dan uji **Abort rebase** (dengan konfirmasi) untuk memastikan branch kembali utuh.
+
+- Verifikasi manual Windows (semua 7 item checklist di atas) lulus pada repo fixture `invoke-git-manual-fixture` branch `p4b-rebase-demo`, dan `cargo xtask check` penuh lulus di Windows.
