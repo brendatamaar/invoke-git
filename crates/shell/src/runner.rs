@@ -186,6 +186,28 @@ impl Job {
         self.control.is_cancelled()
     }
 
+    /// Runs `git lfs version` through the cancellable child runner (`run_child`).
+    /// Returns `None` when `git-lfs` is available, or an early `OpOutcome`
+    /// (`Cancelled` or `Failed(Environment)`).
+    fn probe_git_lfs(&self) -> Option<OpOutcome> {
+        let mut command = self.git.command(&self.paths.workdir);
+        command
+            .args(["lfs", "version"])
+            .envs(self.env.iter().map(|(key, value)| (key, value)));
+        match run_child(command, None, None, &self.control) {
+            Ok(done) if done.killed && !done.success => Some(OpOutcome::Cancelled),
+            Ok(done) if done.success && done.output.trim_start().starts_with("git-lfs/") => None,
+            Ok(_) => Some(failed(
+                ErrorClass::Environment,
+                "Git LFS is not installed (`git-lfs` was not found on PATH). Install Git LFS to pull LFS objects.".into(),
+            )),
+            Err(error) => Some(failed(
+                ErrorClass::Environment,
+                format!("start git: {error}"),
+            )),
+        }
+    }
+
     /// Before a non-forced `git worktree remove`, checks the target worktree for
     /// ignored, untracked, or modified files (`git worktree remove` alone ignores
     /// gitignored files like `.env` and deletes them silently).
@@ -327,15 +349,30 @@ impl Job {
         {
             return OpOutcome::Failed(failure);
         }
-        // P10: fail fast with a clear Environment error when `git-lfs` is not
-        // installed rather than reporting an unexpected git failure.
-        if matches!(self.args, GitArgs::LfsPull { .. })
-            && crate::advanced::git_lfs_version(&self.git, &self.paths.workdir, &self.env).is_none()
-        {
-            return failed(
-                ErrorClass::Environment,
-                "Git LFS is not installed (`git-lfs` was not found on PATH). Install Git LFS to pull LFS objects.".into(),
-            );
+        // P10: run the `git lfs version` probe through the cancellable runner,
+        // then re-check the final guard (`index.lock`, HEAD, index) right
+        // before launching `git lfs pull`.
+        if let GitArgs::LfsPull { path } = &self.args {
+            if let Some(p) = path
+                && !invoke_core::lfs_include_path_is_literal(p)
+            {
+                return failed(
+                    ErrorClass::Expected,
+                    format!(
+                        "Cannot pull '{}' individually because its path contains comma or wildcard characters. Use LFS Pull (all) instead.",
+                        p.0
+                    ),
+                );
+            }
+            if let Some(early) = self.probe_git_lfs() {
+                return early;
+            }
+            if self.cancelled() {
+                return OpOutcome::Cancelled;
+            }
+            if let Err(failure) = precondition::check(&self.paths, &self.expect) {
+                return OpOutcome::Failed(failure);
+            }
         }
         // Task 23: a request is one git run, except taking a side whole,
         // which is two; it stops at the first one that fails.

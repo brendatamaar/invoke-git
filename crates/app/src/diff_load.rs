@@ -92,7 +92,11 @@ pub fn load(paths: &RepoPaths, path: &RepoPath, section: Section) -> Loaded {
         }
         Err(message) => {
             if let Some(lfs) = lfs {
-                Loaded::Message(format!("{}. There is no text diff to show.", lfs.summary))
+                if message.contains("Git LFS clean filter") {
+                    Loaded::Message(format!("{}. {message}", lfs.summary))
+                } else {
+                    Loaded::Message(format!("{}. There is no text diff to show.", lfs.summary))
+                }
             } else {
                 Loaded::Message(message)
             }

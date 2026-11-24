@@ -1018,53 +1018,42 @@ fn lfs_pull_reports_environment_error_when_git_lfs_is_missing_and_respects_lock_
 
     let found = discover(&repo).unwrap();
 
-    // 1. Simulate a machine where `git-lfs` is NOT installed by pointing PATH
-    // to an empty temp directory (while invoking git itself via its full path).
-    let empty_bin = sb.root.join("empty-bin");
-    fs::create_dir_all(&empty_bin).unwrap();
-    let mut no_lfs_env = sb.env.clone();
-    no_lfs_env.push((OsString::from("PATH"), empty_bin.into_os_string()));
-    // Also override GIT_EXEC_PATH so Git for Windows doesn't find bundled git-lfs.
-    no_lfs_env.push((
-        OsString::from("GIT_EXEC_PATH"),
-        sb.root.clone().into_os_string(),
-    ));
+    // 1. Deterministically simulate a machine where `git-lfs` is NOT installed
+    // using a wrapper around real `git` that rejects `git lfs ...` unconditionally.
+    let git_missing_lfs = write_fake_git_script(&sb.root, "git-no-lfs", FakeGitMode::NoLfs);
+    let git_abs = Git::detect(&git_missing_lfs).expect("fake git wrapper must report real git version");
 
-    let git = Git::detect("git").unwrap();
-    // Resolve absolute git executable path so empty PATH still finds `git` itself.
-    let git_exe = which_git();
-    let git_abs = Git::detect(git_exe).unwrap_or(git);
-
-    // Verify helper detects absence when PATH/GIT_EXEC_PATH hide git-lfs.
-    let lfs_absent = git_lfs_version(&git_abs, &found.paths.workdir, &no_lfs_env).is_none();
-    if lfs_absent {
-        let mut driver = Driver {
-            paths: found.paths.clone(),
-            state: {
-                let (s, cmds) = open(RepoId {
-                    root_commit: None,
-                    remote_url: None,
-                });
-                let CoreCommand::ReadState { read, .. } = cmds[0] else {
-                    panic!()
-                };
-                let (s, _) = step(s, read_event(&found.paths, read));
-                s
-            },
-            runner: GitRunner::new(git_abs.clone(), found.paths.clone()).with_env(no_lfs_env),
-        };
-        driver.deliver(Event::LfsPullRequested { path: None });
-        match driver.outcome() {
-            Some(OpOutcome::Failed(f)) => {
-                assert_eq!(f.class, ErrorClass::Environment);
-                assert!(
-                    f.details.contains("Git LFS is not installed"),
-                    "{}",
-                    f.details
-                );
-            }
-            other => panic!("expected Environment error when git-lfs missing, got {other:?}"),
+    // Unconditional assertion: probe detects absence and LfsPull reports Environment error.
+    assert_eq!(
+        git_lfs_version(&git_abs, &found.paths.workdir, &sb.env),
+        None
+    );
+    let mut driver = Driver {
+        paths: found.paths.clone(),
+        state: {
+            let (s, cmds) = open(RepoId {
+                root_commit: None,
+                remote_url: None,
+            });
+            let CoreCommand::ReadState { read, .. } = cmds[0] else {
+                panic!()
+            };
+            let (s, _) = step(s, read_event(&found.paths, read));
+            s
+        },
+        runner: GitRunner::new(git_abs, found.paths.clone()).with_env(sb.env.clone()),
+    };
+    driver.deliver(Event::LfsPullRequested { path: None });
+    match driver.outcome() {
+        Some(OpOutcome::Failed(f)) => {
+            assert_eq!(f.class, ErrorClass::Environment);
+            assert!(
+                f.details.contains("Git LFS is not installed"),
+                "{}",
+                f.details
+            );
         }
+        other => panic!("expected Environment error when git-lfs missing, got {other:?}"),
     }
 
     // 2. Lock guard (Law 12): holding `index.lock` refuses LfsPull before running.
@@ -1075,6 +1064,200 @@ fn lfs_pull_reports_environment_error_when_git_lfs_is_missing_and_respects_lock_
     match driver.outcome() {
         Some(OpOutcome::Failed(f)) => assert_eq!(f.class, ErrorClass::PreconditionChanged),
         other => panic!("expected PreconditionChanged with index.lock held, got {other:?}"),
+    }
+}
+
+#[test]
+fn lfs_staging_refuses_raw_text_when_clean_filter_is_unavailable() {
+    let sb = Sandbox::new();
+    let repo = sb.init_repo("lfs-stage-refuse");
+    sb.commit(
+        &repo,
+        ".gitattributes",
+        b"*.dat filter=lfs diff=lfs merge=lfs -text\n",
+        "track dat with lfs",
+    );
+    sb.commit(
+        &repo,
+        "data.dat",
+        SAMPLE_LFS_POINTER.as_bytes(),
+        "add initial pointer",
+    );
+    let paths = RepoPaths {
+        workdir: repo.clone(),
+        git_dir: repo.join(".git"),
+    };
+    let path = RepoPath("data.dat".into());
+
+    // Replace pointer in worktree with plain UTF-8 text (no NUL bytes).
+    fs::write(repo.join("data.dat"), b"plain text that must not be staged raw\n").unwrap();
+
+    // Case A: no `[filter "lfs"]` configured at all (git-lfs never installed).
+    match load_inputs(&paths, &path, Source::IndexToWorktree) {
+        Err(InputsError::NotText(msg)) => {
+            assert!(
+                msg.contains("Git LFS clean filter"),
+                "expected clear LFS filter refusal, got: {msg}"
+            );
+        }
+        other => panic!("expected NotText refusal without LFS filter config, got {other:?}"),
+    }
+
+    // Case B: broken `filter.lfs.clean` configured (`git-lfs` missing from PATH).
+    sb.git(
+        &repo,
+        &[
+            "config",
+            "filter.lfs.clean",
+            "nonexistent-git-lfs clean -- %f",
+        ],
+    );
+    sb.git(&repo, &["config", "filter.lfs.required", "true"]);
+    match load_inputs(&paths, &path, Source::IndexToWorktree) {
+        Err(InputsError::NotText(msg)) => {
+            assert!(
+                msg.contains("Git LFS clean filter"),
+                "expected clear LFS filter refusal, got: {msg}"
+            );
+        }
+        other => panic!("expected NotText refusal with failing LFS clean filter, got {other:?}"),
+    }
+}
+
+#[test]
+fn lfs_pull_probe_is_cancellable_and_rechecks_lock_before_pull() {
+    let sb = Sandbox::new();
+    let repo = sb.init_repo("lfs-probe-guard");
+    sb.commit(
+        &repo,
+        ".gitattributes",
+        b"*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        "track lfs",
+    );
+    sb.commit(
+        &repo,
+        "asset.bin",
+        SAMPLE_LFS_POINTER.as_bytes(),
+        "add pointer",
+    );
+    let found = discover(&repo).unwrap();
+    let expect = shell::precondition::current(&found.paths).unwrap();
+
+    // Part A: cancelling during a slow `git lfs version` probe returns Cancelled promptly.
+    let slow_git = write_fake_git_script(&sb.root, "git-slow-lfs", FakeGitMode::SlowLfsVersion);
+    let runner_slow = GitRunner::new(Git::detect(&slow_git).unwrap(), found.paths.clone())
+        .with_env(sb.env.clone());
+    let (tx, rx) = mpsc::channel();
+    runner_slow.run(
+        OpId(1),
+        invoke_core::GitArgs::LfsPull { path: None },
+        expect.clone(),
+        tx,
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    runner_slow.cancel(OpId(1));
+    let event = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("cancelling slow lfs version probe must finish promptly");
+    assert_eq!(event, Event::OpFinished(OpId(1), OpOutcome::Cancelled));
+
+    // Part B: if `index.lock` appears during `git lfs version`, the guard is
+    // re-checked before `git lfs pull` runs and `lfs pull` is never invoked.
+    let lock_path = found.paths.git_dir.join("index.lock");
+    let pull_sentinel = sb.root.join("lfs-pull-ran.txt");
+    let race_git = write_fake_git_script(
+        &sb.root,
+        "git-race-lfs",
+        FakeGitMode::LockDuringProbe {
+            lock_path: lock_path.clone(),
+            pull_sentinel: pull_sentinel.clone(),
+        },
+    );
+    let runner_race = GitRunner::new(Git::detect(&race_git).unwrap(), found.paths.clone())
+        .with_env(sb.env.clone());
+    let (tx2, rx2) = mpsc::channel();
+    runner_race.run(
+        OpId(2),
+        invoke_core::GitArgs::LfsPull { path: None },
+        expect,
+        tx2,
+    );
+    let event2 = rx2
+        .recv_timeout(Duration::from_secs(10))
+        .expect("race lfs test must finish");
+    let _ = fs::remove_file(&lock_path);
+    match event2 {
+        Event::OpFinished(OpId(2), OpOutcome::Failed(f)) => {
+            assert_eq!(f.class, ErrorClass::PreconditionChanged);
+        }
+        other => panic!("expected PreconditionChanged after lock appeared during probe, got {other:?}"),
+    }
+    assert!(
+        !pull_sentinel.exists(),
+        "git lfs pull must not run after index.lock appeared during probe"
+    );
+}
+
+enum FakeGitMode {
+    NoLfs,
+    SlowLfsVersion,
+    LockDuringProbe {
+        lock_path: PathBuf,
+        pull_sentinel: PathBuf,
+    },
+}
+
+fn write_fake_git_script(dir: &Path, name: &str, mode: FakeGitMode) -> PathBuf {
+    let real_git = which_git();
+    #[cfg(windows)]
+    {
+        let script = dir.join(format!("{name}.cmd"));
+        let real = real_git.to_string_lossy();
+        let body = match mode {
+            FakeGitMode::NoLfs => format!(
+                "@echo off\r\nif \"%~1\"==\"lfs\" (\r\n  echo git: 'lfs' is not a git command. 1>&2\r\n  exit /b 1\r\n)\r\n\"{real}\" %*\r\n"
+            ),
+            FakeGitMode::SlowLfsVersion => format!(
+                "@echo off\r\nif \"%~1\"==\"lfs\" (\r\n  ping -n 20 127.0.0.1 >nul\r\n  echo git-lfs/3.7.1\r\n  exit /b 0\r\n)\r\n\"{real}\" %*\r\n"
+            ),
+            FakeGitMode::LockDuringProbe {
+                lock_path,
+                pull_sentinel,
+            } => format!(
+                "@echo off\r\nif \"%~1\"==\"lfs\" (\r\n  echo lock>\"{}\"\r\n  echo git-lfs/3.7.1\r\n  exit /b 0\r\n)\r\nfor %%A in (%*) do (\r\n  if \"%%~A\"==\"pull\" (\r\n    echo ran>\"{}\"\r\n    exit /b 0\r\n  )\r\n)\r\n\"{real}\" %*\r\n",
+                lock_path.display(),
+                pull_sentinel.display(),
+            ),
+        };
+        fs::write(&script, body).unwrap();
+        script
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join(name);
+        let real = real_git.to_string_lossy();
+        let body = match mode {
+            FakeGitMode::NoLfs => format!(
+                "#!/bin/sh\nif [ \"$1\" = \"lfs\" ]; then\n  echo \"git: 'lfs' is not a git command.\" >&2\n  exit 1\nfi\nexec \"{real}\" \"$@\"\n"
+            ),
+            FakeGitMode::SlowLfsVersion => format!(
+                "#!/bin/sh\nif [ \"$1\" = \"lfs\" ]; then\n  sleep 20\n  echo \"git-lfs/3.7.1\"\n  exit 0\nfi\nexec \"{real}\" \"$@\"\n"
+            ),
+            FakeGitMode::LockDuringProbe {
+                lock_path,
+                pull_sentinel,
+            } => format!(
+                "#!/bin/sh\nif [ \"$1\" = \"lfs\" ]; then\n  printf lock > \"{}\"\n  echo \"git-lfs/3.7.1\"\n  exit 0\nfi\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"pull\" ]; then\n    printf ran > \"{}\"\n    exit 0\n  fi\ndone\nexec \"{real}\" \"$@\"\n",
+                lock_path.display(),
+                pull_sentinel.display(),
+            ),
+        };
+        fs::write(&script, body).unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+        script
     }
 }
 

@@ -310,26 +310,38 @@ fn read_worktree_side(
     let blob = blob_id(repo.object_hash(), &raw).map_err(InputsError::Read)?;
     // P10: an un-smudged Git LFS pointer file is already in clean wire form;
     // avoid failing if `filter.lfs.clean` is configured when `git-lfs` is not
-    // installed. Likewise, if filtering fails on a binary LFS file, report it
-    // cleanly as `NotText` rather than a fatal read error.
+    // installed.
     if invoke_core::parse_lfs_pointer(&raw).is_some() {
         return text_of(path, raw, is_executable(&metadata), blob).map(Some);
     }
+    let lfs_tracked = repo
+        .index_or_empty()
+        .ok()
+        .is_some_and(|idx| crate::advanced::is_path_lfs_tracked(repo, &idx, path));
     let bytes = match filter_to_git(repo, path, raw.clone()) {
-        Ok(converted) => converted,
+        Ok(converted) => {
+            // If `.gitattributes` marks this path `filter=lfs` but no LFS clean
+            // filter transformed it into a pointer, refuse rather than letting
+            // patch staging write raw bytes into the index as a normal blob.
+            if lfs_tracked && invoke_core::parse_lfs_pointer(&converted).is_none() {
+                return Err(InputsError::NotText(format!(
+                    "{} is tracked by Git LFS, but the Git LFS clean filter is unavailable (is `git-lfs` installed?). Cannot stage raw content as a normal Git blob",
+                    path.0
+                )));
+            }
+            converted
+        }
         Err(error) => {
+            if lfs_tracked {
+                return Err(InputsError::NotText(format!(
+                    "{} is tracked by Git LFS, but the Git LFS clean filter failed (is `git-lfs` installed?). Cannot stage raw content as a normal Git blob",
+                    path.0
+                )));
+            }
             if raw.iter().take(8000).any(|b| *b == 0) {
                 return Err(InputsError::NotText(format!("{} is binary", path.0)));
             }
-            let lfs_tracked = repo
-                .index_or_empty()
-                .ok()
-                .is_some_and(|idx| crate::advanced::is_path_lfs_tracked(repo, &idx, path));
-            if lfs_tracked {
-                raw
-            } else {
-                return Err(error);
-            }
+            return Err(error);
         }
     };
     text_of(path, bytes, is_executable(&metadata), blob).map(Some)
