@@ -263,7 +263,6 @@ pub(crate) struct WorktreeRemoveTarget {
     pub workdir: PathBuf,
     pub dir_exists: bool,
     pub has_git_link: bool,
-    pub locked_on_disk: bool,
 }
 
 /// P10: guards the target linked worktree itself before removal (Law 12):
@@ -348,7 +347,6 @@ pub(crate) fn check_worktree_remove_target(
         dir_exists: wt_root.exists(),
         has_git_link: gitfile_path.exists(),
         workdir: wt_root,
-        locked_on_disk,
     })
 }
 

@@ -226,7 +226,10 @@ impl Job {
                 "--untracked-files=all",
                 "-z",
             ])
-            .envs(self.env.iter().map(|(key, value)| (key, value)));
+            .envs(self.env.iter().map(|(key, value)| (key, value)))
+            // Never refresh the target worktree's index during the read-only
+            // cleanliness probe, or the post-probe index guard would see drift.
+            .env("GIT_OPTIONAL_LOCKS", "0");
         match run_child(command, None, None, &self.control) {
             Ok(done) if done.killed && !done.success => Some(OpOutcome::Cancelled),
             Ok(done) if !done.success => Some(failed(
@@ -307,12 +310,10 @@ impl Job {
                 Err(failure) => return OpOutcome::Failed(failure),
             };
             // Re-checked on disk at run time: if the checkout folder is truly
-            // missing and unlocked, clean up its admin entry with `worktree prune`
-            // rather than ever injecting `--force` from a stale snapshot.
-            if !target.dir_exists && !target.locked_on_disk {
-                return self.run_one(crate::git::worktree_prune_invocation());
-            }
-            if !*force {
+            // missing, fall through to `git worktree remove -- <path>` (without
+            // `--force`), which removes only this target's admin entry without
+            // pruning unrelated missing worktrees.
+            if target.dir_exists && !*force {
                 if !target.has_git_link {
                     return failed(
                         ErrorClass::Expected,

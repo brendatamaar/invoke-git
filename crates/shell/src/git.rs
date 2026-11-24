@@ -466,14 +466,6 @@ pub fn invocation(args: &GitArgs) -> Invocation {
     }
 }
 
-/// `git worktree prune` for a linked worktree whose checkout directory is
-/// verified missing on disk at run time (never adds `--force`).
-pub(crate) fn worktree_prune_invocation() -> Invocation {
-    let mut argv: Vec<OsString> = GLOBAL_ARGS.iter().map(OsString::from).collect();
-    argv.extend(["worktree", "prune"].map(OsString::from));
-    plain(argv)
-}
-
 /// Task 23: every git run of one request, in order; the request stops at the
 /// first one that fails. Almost every request is one run. Taking a side
 /// whole is two: write the side's file, then stage it.
@@ -1192,11 +1184,6 @@ mod tests {
                 "--",
                 "/wt/locked"
             ]
-        );
-
-        assert_eq!(
-            after_globals(&worktree_prune_invocation()),
-            ["worktree", "prune"]
         );
 
         let sub_update = invocation(&GitArgs::Submodule {

@@ -774,6 +774,95 @@ fn worktree_remove_refuses_ignored_files_unless_forced() {
 }
 
 #[test]
+fn worktree_remove_does_not_refresh_stat_dirty_target_index() {
+    let sb = Sandbox::new();
+    let main = sb.init_repo("wt-stat-dirty");
+    sb.commit(&main, "a.txt", b"hello\n", "c1");
+    let wt_linked = sb.root.join("wt-stat");
+    sb.git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "stat-br",
+            wt_linked.to_str().unwrap(),
+        ],
+    );
+
+    // Make `a.txt` stat-dirty (different mtime, identical content) so `git status`
+    // WITHOUT `GIT_OPTIONAL_LOCKS=0` would rewrite the target worktree's index
+    // and trigger a false "target worktree index changed" refusal.
+    let file_path = wt_linked.join("a.txt");
+    let shifted = SystemTime::now() - Duration::from_secs(120);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .unwrap()
+        .set_modified(shifted)
+        .unwrap();
+
+    let found_main = discover(&main).unwrap();
+    let mut driver = Driver::open(found_main.paths.clone(), sb.env.clone());
+    driver.deliver(Event::WorktreeRemoveRequested {
+        path: wt_linked.to_str().unwrap().to_owned(),
+        force: false,
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+    assert!(!wt_linked.exists());
+}
+
+#[test]
+fn worktree_remove_missing_dir_only_removes_selected_worktree() {
+    let sb = Sandbox::new();
+    let main = sb.init_repo("wt-two-missing");
+    sb.commit(&main, "a.txt", b"one\n", "c1");
+    let wt_a = sb.root.join("wt-gone-a");
+    let wt_b = sb.root.join("wt-gone-b");
+    sb.git(
+        &main,
+        &["worktree", "add", "-q", "-b", "br-a", wt_a.to_str().unwrap()],
+    );
+    sb.git(
+        &main,
+        &["worktree", "add", "-q", "-b", "br-b", wt_b.to_str().unwrap()],
+    );
+    // Both checkout folders are missing on disk (e.g. unmounted drives).
+    fs::remove_dir_all(&wt_a).unwrap();
+    fs::remove_dir_all(&wt_b).unwrap();
+
+    let found_main = discover(&main).unwrap();
+    let mut driver = Driver::open(found_main.paths.clone(), sb.env.clone());
+    assert_eq!(
+        driver.state.fresh_disk().unwrap().advanced.worktrees.len(),
+        3
+    );
+
+    // Removing only `wt-gone-a` must NOT prune `wt-gone-b`.
+    driver.deliver(Event::WorktreeRemoveRequested {
+        path: wt_a.to_str().unwrap().to_owned(),
+        force: false,
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+
+    let remaining = &driver.state.fresh_disk().unwrap().advanced.worktrees;
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        !remaining
+            .iter()
+            .any(|w| same_worktree_path(&w.path, wt_a.to_str().unwrap())),
+        "selected missing worktree must be removed"
+    );
+    assert!(
+        remaining
+            .iter()
+            .any(|w| same_worktree_path(&w.path, wt_b.to_str().unwrap())),
+        "unrelated missing worktree must NOT be pruned"
+    );
+}
+
+#[test]
 fn submodule_update_init_recursive_and_sync_work_end_to_end() {
     let sb = Sandbox::new();
     let child = sb.init_repo("sub-child");
