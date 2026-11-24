@@ -388,6 +388,11 @@ impl AccountBook {
         true
     }
 
+    /// Whether `key` is the account its host was told to use.
+    pub fn is_preferred(&self, key: &str) -> bool {
+        self.preferred.values().any(|preferred| preferred == key)
+    }
+
     /// The account that serves `remote_url`.
     pub fn resolve(&self, remote_url: &str) -> Resolution {
         let Some(host) = host_of_remote(remote_url) else {
