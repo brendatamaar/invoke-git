@@ -1603,3 +1603,83 @@ fn a_file_whose_disk_name_differs_in_case_is_refused() {
         Some(&b"tracked\n"[..])
     );
 }
+
+/// Re-check: the private checkout must not put a scratch folder in the
+/// working tree, where a concurrent status read would list it as untracked.
+/// A smudge filter, run during that checkout, records what it sees.
+#[test]
+fn whole_file_discard_keeps_its_scratch_out_of_the_worktree() {
+    let repo = TempRepo::new();
+    repo.git(&[
+        "config",
+        "filter.spy.smudge",
+        "for f in .invoke-*; do if [ -e \"$f\" ]; then echo \"$f\"; fi; done > .git/spy-listing; cat",
+    ]);
+    repo.write(".gitattributes", "tracked filter=spy\n");
+    repo.write("tracked", "base\n");
+    repo.commit_all("base");
+    repo.write("tracked", "changed\n");
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "tracked"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert_eq!(
+        repo.worktree_bytes("tracked").as_deref(),
+        Some(&b"base\n"[..])
+    );
+    let listing = fs::read_to_string(repo.paths.git_dir.join("spy-listing"))
+        .expect("the smudge filter ran during the checkout");
+    assert_eq!(listing.trim(), "", "scratch seen in the worktree");
+    driver.undo();
+    assert_eq!(
+        repo.worktree_bytes("tracked").as_deref(),
+        Some(&b"changed\n"[..])
+    );
+    let left: Vec<_> = fs::read_dir(&repo.paths.workdir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".invoke-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// Re-check: the read-only fallback moves the old file aside. A tracked file
+/// named like that backup must still be discarded and undone, not have its
+/// prepared checkout replaced by the old copy.
+#[test]
+#[cfg(windows)]
+fn a_read_only_file_named_like_the_backup_is_discarded_and_undone() {
+    let repo = TempRepo::new();
+    let read_only = |on: bool| {
+        let full = repo.paths.workdir.join("previous");
+        let mut permissions = fs::metadata(&full).unwrap().permissions();
+        permissions.set_readonly(on);
+        fs::set_permissions(&full, permissions).unwrap();
+    };
+    repo.write_bytes("previous", b"old\0");
+    repo.commit_all("base");
+    repo.write_bytes("previous", b"changed\0");
+    read_only(true);
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "previous"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert_eq!(
+        repo.worktree_bytes("previous").as_deref(),
+        Some(&b"old\0"[..])
+    );
+    read_only(true);
+    driver.undo();
+    assert_eq!(
+        repo.worktree_bytes("previous").as_deref(),
+        Some(&b"changed\0"[..])
+    );
+}

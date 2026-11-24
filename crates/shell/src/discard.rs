@@ -136,7 +136,7 @@ impl DiscardRunner {
         // Prepare checkout using Git's smudge / EOL conversion. Record the
         // resulting bytes and mode for undo before replacing the real file.
         let scratch = tracked
-            .then(|| scratch_for(&self.paths.workdir))
+            .then(|| scratch_for(&self.paths))
             .transpose()
             .map_err(environment)?;
         let staged = if let Some(scratch) = &scratch {
@@ -145,9 +145,10 @@ impl DiscardRunner {
             prefix.push("/");
             let mut run = invocation(args);
             run.args.insert(GLOBAL_ARGS.len() + 1, prefix);
-            // The scratch copy sits one short folder deeper than the file
-            // itself; Git for Windows must not refuse it at `MAX_PATH` when
-            // the real path fits. Only this private checkout uses it.
+            // The scratch copy sits a few short folders deeper than the file
+            // itself (`.git/.invoke-*/`); Git for Windows must not refuse it
+            // at `MAX_PATH` when the real path fits. Only this private
+            // checkout uses it.
             run.args
                 .splice(0..0, ["-c", "core.longpaths=true"].map(OsString::from));
             let mut command = self.git.command(&self.paths.workdir);
@@ -736,7 +737,7 @@ impl UndoRunner {
                     Ok(object) => object,
                     Err(details) => return failed(ErrorClass::Bug, details),
                 };
-                let scratch = match scratch_for(&self.paths.workdir) {
+                let scratch = match scratch_for(&self.paths) {
                     Ok(scratch) => scratch,
                     Err(error) => return environment(error),
                 };
@@ -761,11 +762,60 @@ impl UndoRunner {
     }
 }
 
-/// Scratch space at the top of the working tree: on the same filesystem as
-/// every file under it (`worktree_path` refuses links and junctions on the
-/// way, so no mount point is crossed), and only one short folder deeper.
-fn scratch_for(workdir: &Path) -> io::Result<precondition::ScratchDir> {
-    precondition::ScratchDir::create(workdir)
+/// Scratch space for a file that will replace one in the worktree.
+///
+/// Under the git dir, which status and the watcher never list, when that is
+/// on the worktree's volume, so the final rename stays atomic. Every file
+/// under the worktree is on that volume: `worktree_path` refuses links and
+/// junctions on the way, so no mount point is crossed. A git dir elsewhere
+/// (`--separate-git-dir`, a linked worktree on another drive) falls back to
+/// the worktree root, where the folder can briefly show as untracked.
+fn scratch_for(paths: &RepoPaths) -> io::Result<precondition::ScratchDir> {
+    let base = if same_volume(&paths.git_dir, &paths.workdir)? {
+        &paths.git_dir
+    } else {
+        &paths.workdir
+    };
+    precondition::ScratchDir::create(base)
+}
+
+#[cfg(unix)]
+fn same_volume(a: &Path, b: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata(a)?.dev() == fs::metadata(b)?.dev())
+}
+
+/// Both paths resolve to the same volume mount point. `GetVolumePathNameW`
+/// only reads path components, so nothing is opened.
+#[cfg(windows)]
+fn same_volume(a: &Path, b: &Path) -> io::Result<bool> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+    let volume = |path: &Path| -> io::Result<Vec<u16>> {
+        let wide = verbatim_path(path)?;
+        let mut buffer = vec![0u16; wide.len() + 1];
+        // SAFETY: `wide` is NUL-terminated and `buffer` holds as many units
+        // as the path itself plus one, which bounds the mount point's length.
+        let done =
+            unsafe { GetVolumePathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+        if done == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let end = buffer
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(buffer.len());
+        buffer.truncate(end);
+        Ok(String::from_utf16_lossy(&buffer)
+            .to_lowercase()
+            .encode_utf16()
+            .collect())
+    };
+    Ok(volume(a)? == volume(b)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_volume(_: &Path, _: &Path) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Git for Windows picks a symlink's kind (file or directory) from what its
