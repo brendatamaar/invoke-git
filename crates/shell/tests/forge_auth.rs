@@ -396,7 +396,12 @@ fn device_mock(outcome: &'static str) -> Mock {
                     ),
                 }
             }
-            "/user" if request.header("authorization") == Some("Bearer ghp_ANA") => {
+            "/user"
+                if matches!(
+                    request.header("authorization"),
+                    Some("Bearer ghp_ANA" | "Bearer ghp_ANA_SECOND")
+                ) =>
+            {
                 Reply::json(r#"{"login":"Ana"}"#)
             }
             _ => Reply::status(404, "{}"),
@@ -1541,11 +1546,13 @@ fn cancelling_while_the_token_is_saved_leaves_nothing_connected() {
     let runner = Arc::new(SignInRunner::new(service.clone()));
     let fired = Arc::new(AtomicBool::new(false));
     {
-        // The user presses Cancel at the moment the keychain write lands.
+        // The user presses Cancel (another thread) at the moment the keychain
+        // write lands. It waits for the commit, then undoes it.
         let (runner, fired) = (runner.clone(), fired.clone());
         let (sender, _unused) = mpsc::channel();
         *store.after_save.lock().unwrap() = Some(Box::new(move || {
-            runner.execute(SignInCommand::Abort, sender.clone());
+            let (runner, sender) = (runner.clone(), sender.clone());
+            thread::spawn(move || runner.execute(SignInCommand::Abort, sender));
             fired.store(true, Ordering::SeqCst);
         }));
     }
@@ -1902,4 +1909,220 @@ fn a_stalled_connection_cannot_hold_the_flow_past_its_deadline() {
         "the deadline waited for a silent connection: {:?}",
         started.elapsed()
     );
+}
+
+// -- cancel and commit exclude each other ----------------------------------------
+
+/// Runs a device flow until its account is stored, without reading the
+/// `Granted` event that follows: the user has not been told yet, so a Cancel
+/// now still reads "cancelled" on screen.
+fn run_until_committed(runner: &SignInRunner, service: &ForgeService) {
+    let (events, inbox) = mpsc::channel();
+    let (mut phase, commands) = step_sign_in(
+        SignInPhase::Idle,
+        SignInEvent::Begin(SignInMethod::GitHubDevice),
+    );
+    for command in commands {
+        runner.execute(command, events.clone());
+    }
+    let started = Instant::now();
+    while service.accounts().is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(15), "never stored");
+        if let Ok(event) = inbox.recv_timeout(Duration::from_millis(5)) {
+            let (next, commands) = step_sign_in(phase, event);
+            phase = next;
+            for command in commands {
+                runner.execute(command, events.clone());
+            }
+        }
+    }
+}
+
+fn abort(runner: &SignInRunner) {
+    let (sender, _unused) = mpsc::channel();
+    runner.execute(SignInCommand::Abort, sender);
+}
+
+#[test]
+fn a_cancel_after_the_commit_undoes_that_commit() {
+    let mock = device_mock("granted");
+    let data = TempDir::new("late-cancel");
+    let store = memory();
+    let service = service(&mock, store.clone(), Some(data.book()));
+    let runner = SignInRunner::new(service.clone());
+    run_until_committed(&runner, &service);
+    abort(&runner);
+    // Cancel returned: what is stored already agrees with "cancelled".
+    assert!(service.accounts().is_empty());
+    assert!(store.is_empty());
+    let text = std::fs::read_to_string(data.book()).unwrap();
+    assert!(AccountBook::decode(&text).is_empty());
+}
+
+#[test]
+fn a_late_cancel_does_not_undo_a_newer_sign_in() {
+    let mock = device_mock("granted");
+    let store = memory();
+    let service = service(&mock, store.clone(), None);
+    let runner = SignInRunner::new(service.clone());
+    run_until_committed(&runner, &service);
+    // Meanwhile the user signs in with a token for the same account.
+    let newer = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA_SECOND")
+        .unwrap();
+    abort(&runner);
+    assert_eq!(service.accounts(), vec![newer.clone()]);
+    let kept = loaded(&store, &newer).unwrap();
+    assert_eq!(kept.access.expose(), "ghp_ANA_SECOND");
+    assert_eq!(newer.method, AuthMethod::Pat);
+}
+
+#[test]
+fn a_late_cancel_does_not_bring_back_a_disconnected_account() {
+    let mock = device_mock("granted");
+    let store = memory();
+    let service = service(&mock, store.clone(), None);
+    let runner = SignInRunner::new(service.clone());
+    run_until_committed(&runner, &service);
+    let key = service.accounts()[0].key();
+    service.disconnect(&key).unwrap();
+    abort(&runner);
+    assert!(service.accounts().is_empty());
+    assert!(store.is_empty());
+}
+
+#[test]
+fn cancel_before_the_commit_stores_nothing_even_for_a_second_sign_in() {
+    // A cancelled flow followed at once by a token sign-in: the token
+    // sign-in is untouched by the dead flow.
+    let mock = device_mock("granted");
+    let store = memory();
+    let service = service(&mock, store.clone(), None);
+    let runner = SignInRunner::new(service.clone());
+    let (events, _inbox) = mpsc::channel();
+    runner.execute(SignInCommand::Request(SignInMethod::GitHubDevice), events);
+    abort(&runner);
+    let account = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA_SECOND")
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(service.accounts(), vec![account.clone()]);
+    assert_eq!(
+        loaded(&store, &account).unwrap().access.expose(),
+        "ghp_ANA_SECOND"
+    );
+}
+
+#[test]
+fn a_disconnect_cannot_interleave_with_a_registration() {
+    let mock = Mock::start(github_handler);
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), None);
+    let result: Arc<Mutex<Option<Result<(), ForgeError>>>> = Arc::default();
+    {
+        // Right after the token is written (the account is not listed yet) a
+        // disconnect for the same account is attempted from another thread.
+        let (service, result) = (service.clone(), result.clone());
+        *store.after_save.lock().unwrap() = Some(Box::new(move || {
+            let (service, result) = (service.clone(), result.clone());
+            thread::spawn(move || {
+                let outcome = service.disconnect("github|https://github.com|ana");
+                *result.lock().unwrap() = Some(outcome);
+            });
+            // Give the other thread time to run before the write goes on.
+            thread::sleep(Duration::from_millis(150));
+        }));
+    }
+    service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    eventually("the disconnect never finished", || {
+        result.lock().unwrap().is_some()
+    });
+    // It waited for the registration, then removed what it had stored: no
+    // account without a token, no token without an account.
+    assert_eq!(result.lock().unwrap().clone(), Some(Ok(())));
+    assert!(service.accounts().is_empty());
+    assert!(store.inner.is_empty());
+}
+
+#[test]
+fn a_user_name_holding_the_refresh_token_is_refused_whatever_its_case() {
+    // The server reports a name made of the refresh token, in other case.
+    let mock = Mock::start(|_| {
+        Box::new(|request| match request.path() {
+            "/oauth/token" => Reply::json(
+                r#"{"access_token":"glpat-OAUTH1","refresh_token":"glrt-REFRESH1","expires_in":7200}"#,
+            ),
+            "/api/v4/user" => Reply::json(r#"{"username":"x.GLRT-refresh1.x"}"#),
+            _ => Reply::status(404, "{}"),
+        })
+    });
+    let store = memory();
+    let service = service(&mock, store.clone(), None);
+    let runner = SignInRunner::new(service.clone());
+    let phase = sign_in(&runner, SignInMethod::GitLabBrowser, |prompt| {
+        let UserPrompt::Browser { url } = prompt else {
+            panic!()
+        };
+        let query = parse_query(url.split_once('?').unwrap().1);
+        let get = |k: &str| query.iter().find(|(key, _)| key == k).unwrap().1.clone();
+        let redirect = get("redirect_uri");
+        let local = redirect
+            .strip_prefix("http://")
+            .unwrap()
+            .strip_suffix("/callback")
+            .unwrap();
+        browser_get(local, &format!("/callback?code=c&state={}", get("state")));
+    });
+    match phase {
+        SignInPhase::Failed(SignInFailure::Error(message)) => {
+            assert!(message.contains("unusable user name"), "{message}");
+            assert!(!message.contains("REFRESH1") && !message.contains("refresh1"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(store.is_empty());
+    assert!(service.accounts().is_empty());
+}
+
+#[test]
+fn a_cancel_between_the_user_lookup_and_the_commit_stores_nothing() {
+    // Cancel lands after the flow's "cancelled?" check and before it
+    // commits: the commit itself must still refuse.
+    let slot: Arc<Mutex<Option<Arc<SignInRunner>>>> = Arc::default();
+    let hook = slot.clone();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = Mock::start(move |port| {
+        Box::new(move |request| match request.path() {
+            "/login/device/code" => Reply::json(&format!(
+                r#"{{"device_code":"d","user_code":"AAAA-BBBB",
+                    "verification_uri":"http://127.0.0.1:{port}/device","expires_in":900,"interval":5}}"#
+            )),
+            "/login/oauth/access_token" => {
+                polls.fetch_add(1, Ordering::SeqCst);
+                Reply::json(r#"{"access_token":"ghp_ANA","token_type":"bearer"}"#)
+            }
+            "/user" => {
+                if let Some(runner) = hook.lock().unwrap().as_ref() {
+                    abort(runner);
+                }
+                Reply::json(r#"{"login":"ana"}"#)
+            }
+            _ => Reply::status(404, "{}"),
+        })
+    });
+    let store = memory();
+    let service = service(&mock, store.clone(), None);
+    let runner = Arc::new(SignInRunner::new(service.clone()));
+    *slot.lock().unwrap() = Some(runner.clone());
+    sign_in_until(
+        &runner,
+        SignInMethod::GitHubDevice,
+        |_| {},
+        || !mock.requests_to("/user").is_empty(),
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert!(store.is_empty());
+    assert!(service.accounts().is_empty());
 }

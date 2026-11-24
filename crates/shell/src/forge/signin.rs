@@ -9,7 +9,6 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,7 +21,7 @@ use super::codec::{Pkce, base64url, parse_query};
 use super::error::ForgeError;
 use super::random;
 use super::secrets::Secret;
-use super::service::ForgeService;
+use super::service::{FlowControl, ForgeService};
 
 /// The device code of the flow in progress, kept for the polls.
 struct DeviceSession {
@@ -34,7 +33,7 @@ struct DeviceSession {
 pub struct SignInRunner {
     service: ForgeService,
     /// Cancel switch of the newest flow; older flows stay cancelled.
-    cancel: Mutex<Arc<AtomicBool>>,
+    cancel: Mutex<Arc<FlowControl>>,
     device: Arc<Mutex<Option<DeviceSession>>>,
 }
 
@@ -42,7 +41,7 @@ impl SignInRunner {
     pub fn new(service: ForgeService) -> Self {
         Self {
             service,
-            cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
+            cancel: Mutex::new(Arc::new(FlowControl::default())),
             device: Arc::default(),
         }
     }
@@ -80,7 +79,9 @@ impl SignInRunner {
                 });
             }
             SignInCommand::Abort => {
-                self.current_cancel().store(true, Ordering::SeqCst);
+                // Waits for a commit in progress, then undoes it if there was
+                // one: what is stored always matches the "cancelled" shown.
+                self.service.cancel_flow(&self.current_cancel());
                 if let Ok(mut device) = self.device.lock() {
                     *device = None;
                 }
@@ -88,15 +89,16 @@ impl SignInRunner {
         }
     }
 
-    /// Cancels whatever ran before and returns the switch for a new flow.
-    fn fresh_cancel(&self) -> Arc<AtomicBool> {
+    /// Retires whatever ran before (what it committed stays) and returns the
+    /// control for a new flow.
+    fn fresh_cancel(&self) -> Arc<FlowControl> {
         let mut current = self.cancel.lock().unwrap_or_else(|p| p.into_inner());
-        current.store(true, Ordering::SeqCst);
-        *current = Arc::new(AtomicBool::new(false));
+        current.retire();
+        *current = Arc::new(FlowControl::default());
         current.clone()
     }
 
-    fn current_cancel(&self) -> Arc<AtomicBool> {
+    fn current_cancel(&self) -> Arc<FlowControl> {
         self.cancel
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -105,23 +107,23 @@ impl SignInRunner {
 }
 
 /// Sends an event unless the flow was cancelled meanwhile.
-fn send(cancel: &AtomicBool, events: &Sender<SignInEvent>, event: SignInEvent) {
-    if !cancel.load(Ordering::SeqCst) {
+fn send(cancel: &FlowControl, events: &Sender<SignInEvent>, event: SignInEvent) {
+    if !cancel.is_cancelled() {
         let _ = events.send(event);
     }
 }
 
 /// Sleeps in short slices; true if the flow was cancelled during the wait.
-fn sleep_unless_cancelled(wait: Duration, cancel: &AtomicBool) -> bool {
+fn sleep_unless_cancelled(wait: Duration, cancel: &FlowControl) -> bool {
     let slice = Duration::from_millis(10).min(wait.max(Duration::from_millis(1)));
     let end = Instant::now() + wait;
     while Instant::now() < end {
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.is_cancelled() {
             return true;
         }
         thread::sleep(slice.min(end.saturating_duration_since(Instant::now())));
     }
-    cancel.load(Ordering::SeqCst)
+    cancel.is_cancelled()
 }
 
 fn client_id(service: &ForgeService, kind: ForgeKind) -> Result<String, ForgeError> {
@@ -138,7 +140,7 @@ fn client_id(service: &ForgeService, kind: ForgeKind) -> Result<String, ForgeErr
 fn request_device_code(
     service: &ForgeService,
     device: &Mutex<Option<DeviceSession>>,
-    cancel: &AtomicBool,
+    cancel: &FlowControl,
     events: &Sender<SignInEvent>,
 ) -> Result<(), ForgeError> {
     let client_id = client_id(service, ForgeKind::GitHub)?;
@@ -169,7 +171,7 @@ fn request_device_code(
 fn poll_once(
     service: &ForgeService,
     device: &Mutex<Option<DeviceSession>>,
-    cancel: &AtomicBool,
+    cancel: &FlowControl,
 ) -> SignInEvent {
     let (code, client_id, deadline) = {
         let guard = device.lock().unwrap_or_else(|p| p.into_inner());
@@ -202,9 +204,7 @@ fn poll_once(
                 Ok(origin) => origin,
                 Err(error) => return SignInEvent::Errored(error.user_message()),
             };
-            match service.finish_oauth(ForgeKind::GitHub, origin, credential, &|| {
-                cancel.load(Ordering::SeqCst)
-            }) {
+            match service.finish_oauth(ForgeKind::GitHub, origin, credential, cancel) {
                 Ok(account) => SignInEvent::Granted(account),
                 Err(error) => SignInEvent::Errored(error.user_message()),
             }
@@ -282,7 +282,7 @@ fn page(message: &str) -> String {
 /// and the flow's deadline are checked between them. A client that connects
 /// and says nothing therefore cannot keep the port past Cancel or the
 /// deadline.
-fn request_line(stream: &mut TcpStream, cancel: &AtomicBool, flow_end: Instant) -> Option<String> {
+fn request_line(stream: &mut TcpStream, cancel: &FlowControl, flow_end: Instant) -> Option<String> {
     stream.set_nonblocking(true).ok()?;
     let end = (Instant::now() + CONNECTION_LIMIT).min(flow_end);
     let mut buffer = [0u8; 4096];
@@ -298,7 +298,7 @@ fn request_line(stream: &mut TcpStream, cancel: &AtomicBool, flow_end: Instant) 
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if cancel.load(Ordering::SeqCst) || Instant::now() >= end {
+                if cancel.is_cancelled() || Instant::now() >= end {
                     return None;
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -312,7 +312,7 @@ fn request_line(stream: &mut TcpStream, cancel: &AtomicBool, flow_end: Instant) 
 
 fn browser_flow(
     service: &ForgeService,
-    cancel: &AtomicBool,
+    cancel: &FlowControl,
     events: &Sender<SignInEvent>,
 ) -> Result<(), ForgeError> {
     let client_id = client_id(service, ForgeKind::GitLab)?;
@@ -353,7 +353,7 @@ fn browser_flow(
 
     let end = Instant::now() + service.config().browser_timeout;
     let code = loop {
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.is_cancelled() {
             return Ok(());
         }
         if Instant::now() >= end {
@@ -398,7 +398,7 @@ fn browser_flow(
     };
     // The port is released as soon as the redirect is in.
     drop(listener);
-    if cancel.load(Ordering::SeqCst) {
+    if cancel.is_cancelled() {
         return Ok(());
     }
 
@@ -411,9 +411,7 @@ fn browser_flow(
         pkce.verifier(),
         service.now(),
     )?;
-    let account = service.finish_oauth(ForgeKind::GitLab, origin, credential, &|| {
-        cancel.load(Ordering::SeqCst)
-    })?;
+    let account = service.finish_oauth(ForgeKind::GitLab, origin, credential, cancel)?;
     send(cancel, events, SignInEvent::Granted(account));
     Ok(())
 }

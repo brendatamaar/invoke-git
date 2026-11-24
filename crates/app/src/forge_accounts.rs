@@ -376,6 +376,17 @@ impl AccountsView {
     }
 }
 
+/// Whether another account is connected to the same server. A preference is
+/// kept per origin (scheme, host and port), so the same host on another port
+/// is another server and does not compete.
+pub fn shares_origin(book: &AccountBook, account: &ForgeAccount) -> bool {
+    book.accounts()
+        .iter()
+        .filter(|other| other.origin == account.origin)
+        .count()
+        > 1
+}
+
 fn host_of(account: &ForgeAccount) -> String {
     account
         .origin
@@ -577,21 +588,16 @@ impl AccountsView {
             let key = account.key();
             let (disconnect, prefer) = (cx.entity(), cx.entity());
             let (disconnect_key, prefer_key) = (key.clone(), key.clone());
-            let shares_host = book
-                .accounts()
-                .iter()
-                .filter(|other| other.host() == account.host())
-                .count()
-                > 1;
+            let shares_host = shares_origin(&book, account);
             let preferred = shares_host && book.is_preferred(&key);
             let mut actions = div().flex().items_center().gap(px(SPACE_2));
             if preferred {
-                actions = actions.child(Pill::new(format!("Used for {}", account.host())));
+                actions = actions.child(Pill::new(format!("Used for {}", host_of(account))));
             } else if shares_host {
                 actions = actions.child(
                     Button::new(
                         ("forge-prefer", index),
-                        format!("Use for {}", account.host()),
+                        format!("Use for {}", host_of(account)),
                     )
                     .ghost()
                     .on_click(move |_, _, cx| {
@@ -809,6 +815,30 @@ mod tests {
             TokenTarget::new(ForgeKind::GitHub, ""),
             TokenTarget::new(ForgeKind::GitHub, "https://anything.example")
         );
+    }
+
+    #[test]
+    fn accounts_compete_only_on_the_same_server() {
+        let on = |host: &str, user: &str| {
+            ForgeAccount::new(
+                ForgeKind::GitLab,
+                Origin::parse(host).unwrap(),
+                user,
+                AuthMethod::Pat,
+            )
+            .unwrap()
+        };
+        let (a, b) = (on("git.corp", "ana"), on("git.corp", "bo"));
+        let (other_port, elsewhere) = (on("git.corp:8443", "ana"), on("other.corp", "ana"));
+        let mut book = AccountBook::default();
+        for account in [&a, &b, &other_port, &elsewhere] {
+            book.add(account.clone());
+        }
+        assert!(shares_origin(&book, &a) && shares_origin(&book, &b));
+        // Same host, other port: its own server, no "Use for" choice.
+        assert!(!shares_origin(&book, &other_port));
+        assert!(!shares_origin(&book, &elsewhere));
+        assert_eq!(host_of(&other_port), "git.corp:8443");
     }
 
     #[test]

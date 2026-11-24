@@ -9,6 +9,7 @@
 //!   push work exactly as before.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -100,6 +101,56 @@ pub struct Listing {
     pub repos: Vec<RemoteRepo>,
     /// `Some` when the page limit stopped the listing early.
     pub more: Option<String>,
+}
+
+/// One sign-in's say over whether it may still commit, shared by the threads
+/// of the flow and the runner's cancel.
+///
+/// Cancel and commit exclude each other: a commit happens entirely under the
+/// gate, and cancel takes the same gate. So either the flow was cancelled
+/// first and stores nothing, or it committed first and cancel undoes exactly
+/// that commit. The result on screen (cancelled) and the stored state agree.
+#[derive(Default)]
+pub(super) struct FlowControl {
+    /// A fast flag for loops and for suppressing late events.
+    cancelled: AtomicBool,
+    gate: Mutex<Gate>,
+}
+
+#[derive(Default)]
+enum Gate {
+    #[default]
+    Open,
+    Cancelled,
+    /// The flow stored its account; kept so cancel can undo only this write.
+    Committed(Commit),
+}
+
+struct Commit {
+    account: ForgeAccount,
+    written: Credential,
+    previous_account: Option<ForgeAccount>,
+    previous_credential: Option<Credential>,
+}
+
+impl FlowControl {
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn gate(&self) -> MutexGuard<'_, Gate> {
+        self.gate.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The flow is over or replaced: it may not commit any more, but what it
+    /// already committed stays (it was shown to the user).
+    pub(super) fn retire(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let mut gate = self.gate();
+        if matches!(*gate, Gate::Open) {
+            *gate = Gate::Cancelled;
+        }
+    }
 }
 
 struct Inner {
@@ -230,39 +281,70 @@ impl ForgeService {
     ) -> Result<ForgeAccount, ForgeError> {
         let secret = Secret::new(token).ok_or(ForgeError::InvalidToken)?;
         let origin = self.origin_for_new(kind, instance)?;
-        let username = self.user_of(kind, &origin, &secret)?;
+        let credential = Credential::token(secret);
+        let username = self.user_of(kind, &origin, &credential)?;
         self.register(
             kind,
             origin,
             &username,
             AuthMethod::Pat,
-            Credential::token(secret),
-            &|| false,
+            credential,
+            &FlowControl::default(),
         )
     }
 
-    /// Records an account whose OAuth tokens were just obtained. `cancelled`
-    /// is asked before anything is stored and again after each write: a flow
-    /// the user cancelled leaves no account and no token behind.
+    /// Records an account whose OAuth tokens were just obtained. The flow's
+    /// gate decides: if the user cancelled first nothing is stored, and if
+    /// this commits first a later cancel undoes exactly this write.
     pub(super) fn finish_oauth(
         &self,
         kind: ForgeKind,
         origin: Origin,
         credential: Credential,
-        cancelled: &dyn Fn() -> bool,
+        flow: &FlowControl,
     ) -> Result<ForgeAccount, ForgeError> {
-        if cancelled() {
+        if flow.is_cancelled() {
             return Err(ForgeError::Cancelled);
         }
-        let username = self.user_of(kind, &origin, &credential.access)?;
-        self.register(
-            kind,
-            origin,
-            &username,
-            AuthMethod::OAuth,
-            credential,
-            cancelled,
-        )
+        let username = self.user_of(kind, &origin, &credential)?;
+        self.register(kind, origin, &username, AuthMethod::OAuth, credential, flow)
+    }
+
+    /// Cancels a flow. If it already committed (and the user was not yet
+    /// told), that commit is undone, so what is stored matches the
+    /// "cancelled" the user sees. Undoing is compare-and-restore: it only
+    /// touches the account and token this flow wrote, and only if they are
+    /// still as it left them (a later sign-in or disconnect wins).
+    pub(super) fn cancel_flow(&self, flow: &FlowControl) {
+        flow.cancelled.store(true, Ordering::SeqCst);
+        let mut gate = flow.gate();
+        if let Gate::Committed(commit) = std::mem::replace(&mut *gate, Gate::Cancelled) {
+            self.undo_commit(&commit);
+        }
+    }
+
+    fn undo_commit(&self, commit: &Commit) {
+        let key = commit.account.key();
+        let mut book = self.book_lock();
+        let still_ours = book.get(&key) == Some(&commit.account)
+            && matches!(self.inner.store.load(&key), Ok(Some(current)) if current == commit.written);
+        if !still_ours {
+            return;
+        }
+        match &commit.previous_account {
+            Some(previous) => book.add(previous.clone()),
+            None => {
+                book.remove(&key);
+            }
+        }
+        // Best effort, list first like a disconnect: there is nobody left to
+        // report to, and a leftover is at worst an account the user can
+        // disconnect.
+        let _ = self.save_book(&book);
+        let _ = match &commit.previous_credential {
+            Some(previous) => self.inner.store.save(&key, previous),
+            None => self.inner.store.delete(&key),
+        };
     }
 
     pub(super) fn origin_for_new(
@@ -282,15 +364,16 @@ impl ForgeService {
         &self,
         kind: ForgeKind,
         origin: &Origin,
-        token: &Secret,
+        credential: &Credential,
     ) -> Result<String, ForgeError> {
+        let token = &credential.access;
         let username = match kind {
             ForgeKind::GitHub => {
                 api::github::current_user(&self.inner.http, &self.inner.config.github.api, token)?
             }
             ForgeKind::GitLab => api::gitlab::current_user(&self.inner.http, origin, token)?,
         };
-        if acceptable_username(&username, token) {
+        if acceptable_username(&username, credential) {
             Ok(username)
         } else {
             Err(ForgeError::BadResponse("unusable user name"))
@@ -298,9 +381,12 @@ impl ForgeService {
     }
 
     /// Keychain first, then the list: an account never appears without its
-    /// token. Whatever stops the registration (the list cannot be written, or
-    /// the user cancelled) puts both back as they were, and if even that
-    /// fails the error says so, because a token may then be left behind.
+    /// token. The whole sequence (look at what is there, write the token,
+    /// write the list, record the commit) runs under the flow's gate and the
+    /// list lock, so a cancel, a disconnect or another sign-in cannot
+    /// interleave with it. If the list cannot be written the token is put
+    /// back as it was, and if even that fails the error says so, because a
+    /// token may then be left behind.
     fn register(
         &self,
         kind: ForgeKind,
@@ -308,41 +394,41 @@ impl ForgeService {
         username: &str,
         method: AuthMethod,
         credential: Credential,
-        cancelled: &dyn Fn() -> bool,
+        flow: &FlowControl,
     ) -> Result<ForgeAccount, ForgeError> {
         let account = ForgeAccount::new(kind, origin, username, method)
             .ok_or(ForgeError::BadResponse("unusable user name"))?;
         let key = account.key();
-        if cancelled() {
+        // Lock order everywhere: gate, then list.
+        let mut gate = flow.gate();
+        if matches!(*gate, Gate::Cancelled) {
             return Err(ForgeError::Cancelled);
         }
-        let previous = self.inner.store.load(&key)?;
-        self.inner.store.save(&key, &credential)?;
         let mut book = self.book_lock();
+        let previous_account = book.get(&key).cloned();
+        let previous_credential = self.inner.store.load(&key)?;
+        self.inner.store.save(&key, &credential)?;
         let before = book.clone();
         book.add(account.clone());
-        let (failure, list_written) = match self.save_book(&book) {
-            Err(error) => (Some(error), false),
-            Ok(()) if cancelled() => (Some(ForgeError::Cancelled), true),
-            Ok(()) => (None, true),
-        };
-        let Some(failure) = failure else {
-            return Ok(account);
-        };
-        *book = before;
-        let list_back = if list_written {
-            self.save_book(&book)
-        } else {
-            Ok(())
-        };
-        let token_back = match previous {
-            Some(previous) => self.inner.store.save(&key, &previous),
-            None => self.inner.store.delete(&key),
-        };
-        if list_back.is_err() || token_back.is_err() {
-            return Err(ForgeError::RollbackFailed);
+        if let Err(error) = self.save_book(&book) {
+            *book = before;
+            let token_back = match &previous_credential {
+                Some(previous) => self.inner.store.save(&key, previous),
+                None => self.inner.store.delete(&key),
+            };
+            return Err(if token_back.is_err() {
+                ForgeError::RollbackFailed
+            } else {
+                error
+            });
         }
-        Err(failure)
+        *gate = Gate::Committed(Commit {
+            account: account.clone(),
+            written: credential,
+            previous_account,
+            previous_credential,
+        });
+        Ok(account)
     }
 
     /// Forgets an account. The list changes first, so a restart cannot bring
@@ -511,14 +597,55 @@ fn save_book(path: &Path, book: &AccountBook) -> Result<(), ForgeError> {
 }
 
 /// A user name a forge may report: ASCII letters, digits, `-`, `_` and `.`,
-/// at most 100 of them, and never the token itself (or anything that holds
-/// it): the name is shown and written to the account list, so a hostile
+/// at most 100 of them, and never the access or refresh token (compared
+/// without regard to case, or anything that holds either): the name is shown and written to the account list, so a hostile
 /// server must not be able to echo a token there.
-pub(crate) fn acceptable_username(name: &str, token: &Secret) -> bool {
+pub(crate) fn acceptable_username(name: &str, credential: &Credential) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let holds = |secret: &Secret| lower.contains(&secret.expose().to_ascii_lowercase());
     !name.is_empty()
         && name.len() <= 100
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        && !name.contains(token.expose())
+        && !holds(&credential.access)
+        && !credential.refresh.as_ref().is_some_and(holds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credential(access: &str, refresh: Option<&str>) -> Credential {
+        Credential {
+            access: Secret::new(access).unwrap(),
+            refresh: refresh.and_then(Secret::new),
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn a_user_name_never_holds_either_token_in_any_case() {
+        let both = credential("glpat-Access1", Some("glrt-Refresh1"));
+        for fine in ["ana", "ana.gl", "Ana_Corp-2", "glpat", "refresh"] {
+            assert!(acceptable_username(fine, &both), "{fine}");
+        }
+        for bad in [
+            "glpat-Access1",
+            "GLPAT-ACCESS1",
+            "x-glpat-access1-x",
+            "glrt-Refresh1",
+            "GLRT-REFRESH1",
+            "a.glrt-refresh1",
+            "",
+            "has space",
+            "a/b",
+        ] {
+            assert!(!acceptable_username(bad, &both), "{bad}");
+        }
+        // Without a refresh token only the access token counts.
+        let plain = credential("tok", None);
+        assert!(acceptable_username("glrt-Refresh1", &plain));
+        assert!(!acceptable_username("myTOKen", &plain));
+    }
 }
