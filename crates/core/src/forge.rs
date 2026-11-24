@@ -193,6 +193,8 @@ impl Origin {
 fn split_host_port(authority: &str) -> Option<(&str, Option<&str>)> {
     if let Some(rest) = authority.strip_prefix('[') {
         let (host, after) = rest.split_once(']')?;
+        // Brackets hold an IPv6 literal, nothing else (not a name).
+        host.parse::<std::net::Ipv6Addr>().ok()?;
         return match after {
             "" => Some((host, None)),
             _ => Some((host, Some(after.strip_prefix(':')?))),
@@ -214,10 +216,8 @@ fn valid_host(host: &str) -> bool {
         return false;
     }
     if host.contains(':') {
-        // An IPv6 literal: hex digits, colons and dots only.
-        return host
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+        // An IPv6 literal: it must parse as one.
+        return host.parse::<std::net::Ipv6Addr>().is_ok();
     }
     host.split('.').all(|label| {
         !label.is_empty()
@@ -339,6 +339,8 @@ pub fn remote_target(url: &str) -> Option<RemoteTarget> {
         .map_or(authority, |(_, host)| host);
     let (host, port_text) = if let Some(rest) = authority.strip_prefix('[') {
         let (host, after) = rest.split_once(']')?;
+        // The brackets hold an IPv6 literal, nothing else.
+        host.parse::<std::net::Ipv6Addr>().ok()?;
         // Only `]` or `]:port` may follow; anything else is malformed.
         match after {
             "" => (host, None),
@@ -477,10 +479,16 @@ impl AccountBook {
             .accounts
             .iter()
             .filter(|account| {
-                same_forge(account.host(), &host)
-                    && web.is_none_or(|web| {
-                        web.https == account.origin.is_https() && web.port == account.origin.port()
-                    })
+                match web {
+                    // A web address names the server itself: no aliases.
+                    Some(web) => {
+                        account.host() == host
+                            && web.https == account.origin.is_https()
+                            && web.port == account.origin.port()
+                    }
+                    // The SSH-over-443 hosts are doors to the same forge.
+                    None => same_forge(account.host(), &host),
+                }
             })
             .collect();
         match matching.as_slice() {
@@ -588,6 +596,9 @@ pub enum SignInFailure {
     Cancelled,
     /// Anything else, as a sentence that holds no secret.
     Error(String),
+    /// Cancelled, but undoing what the flow had already stored failed: a
+    /// token or an account may be left behind. The sentence says where.
+    CancelledWithLeftover(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -633,6 +644,8 @@ pub enum SignInEvent {
     Denied,
     Expired,
     Errored(String),
+    /// After a cancel: the undo of an already stored account failed.
+    CleanupFailed(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -726,6 +739,10 @@ pub fn step_sign_in(phase: SignInPhase, event: SignInEvent) -> (SignInPhase, Vec
         (phase, E::Cancel) if phase.is_active() => {
             (P::Failed(SignInFailure::Cancelled), vec![C::Abort])
         }
+        (P::Failed(SignInFailure::Cancelled), E::CleanupFailed(message)) => (
+            P::Failed(SignInFailure::CancelledWithLeftover(message)),
+            vec![],
+        ),
         // Anything else is late or stray (a poll answer after cancel, a
         // second Begin): nothing changes.
         (phase, _) => (phase, vec![]),
@@ -1014,6 +1031,91 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_undo_after_cancel_is_told_and_nothing_else_changes_a_finished_flow() {
+        let (phase, _) = step_sign_in(
+            SignInPhase::Idle,
+            SignInEvent::Begin(SignInMethod::GitHubDevice),
+        );
+        let (phase, _) = step_sign_in(phase, SignInEvent::Cancel);
+        let (phase, commands) =
+            step_sign_in(phase, SignInEvent::CleanupFailed("remove the entry".into()));
+        assert_eq!(
+            phase,
+            SignInPhase::Failed(SignInFailure::CancelledWithLeftover(
+                "remove the entry".into()
+            ))
+        );
+        assert!(commands.is_empty());
+        // It is told once, and only for a cancel.
+        let (again, _) = step_sign_in(phase.clone(), SignInEvent::CleanupFailed("x".into()));
+        assert_eq!(again, phase);
+        for other in [
+            SignInPhase::Idle,
+            SignInPhase::Authorized(github_account()),
+            SignInPhase::Failed(SignInFailure::Denied),
+            SignInPhase::Requesting(SignInMethod::GitHubDevice),
+        ] {
+            let (after, _) = step_sign_in(other.clone(), SignInEvent::CleanupFailed("x".into()));
+            assert_eq!(after, other);
+        }
+    }
+
+    #[test]
+    fn ssh_aliases_never_stand_in_for_a_web_address() {
+        let mut book = AccountBook::default();
+        book.add(account(ForgeKind::GitHub, "github.com", "ana"));
+        book.add(account(ForgeKind::GitLab, "gitlab.com", "ana"));
+        for url in [
+            "ssh://git@ssh.github.com:443/o/r.git",
+            "git@ssh.github.com:o/r.git",
+            "ssh://git@altssh.gitlab.com:443/o/r.git",
+        ] {
+            assert!(matches!(book.resolve(url), Resolution::Use(_)), "{url}");
+        }
+        // The same names over https are other servers, not the forge.
+        for url in [
+            "https://ssh.github.com/o/r.git",
+            "https://ssh.github.com:443/o/r.git",
+            "https://altssh.gitlab.com/o/r.git",
+        ] {
+            assert!(
+                matches!(book.resolve(url), Resolution::NoAccount { .. }),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bracketed_host_must_be_an_ipv6_literal() {
+        let mut book = AccountBook::default();
+        book.add(account(ForgeKind::GitLab, "https://[::1]:8443", "ana"));
+        assert!(matches!(
+            book.resolve("https://[::1]:8443/o/r"),
+            Resolution::Use(_)
+        ));
+        for url in [
+            "https://[git.corp]:8443/o/r",
+            "https://[abc]/o/r",
+            "https://[::1::1]:8443/o/r",
+            "https://[:::]/o/r",
+            "https://[]/o/r",
+            "https://[zz::1]/o/r",
+            "ssh://git@[git.corp]/o/r",
+        ] {
+            assert_eq!(book.resolve(url), Resolution::LocalPath, "{url}");
+        }
+        for text in [
+            "https://[git.corp]",
+            "https://[::1::1]",
+            "https://[abc]",
+            "https://[]",
+        ] {
+            assert_eq!(Origin::parse(text), Err(OriginProblem::Host), "{text}");
+        }
+        assert!(Origin::parse("https://[2001:db8::1]:8443").is_ok());
+    }
+
+    #[test]
     fn two_accounts_on_one_host_ask_until_one_is_preferred() {
         let mut book = AccountBook::default();
         let personal = account(ForgeKind::GitHub, "github.com", "ana");
@@ -1219,6 +1321,7 @@ mod tests {
             Just(SignInEvent::Denied),
             Just(SignInEvent::Expired),
             Just(SignInEvent::Errored("x".into())),
+            Just(SignInEvent::CleanupFailed("x".into())),
         ]
     }
 
@@ -1231,9 +1334,16 @@ mod tests {
             let mut phase = SignInPhase::Idle;
             for event in events {
                 let begins = matches!(event, SignInEvent::Begin(_));
+                // The one thing a finished flow still accepts: news that the undo
+                // after a cancel failed.
+                let leftover = matches!(event, SignInEvent::CleanupFailed(_))
+                    && phase == SignInPhase::Failed(SignInFailure::Cancelled);
                 let before = phase.clone();
                 let (next, commands) = step_sign_in(phase, event);
-                if matches!(before, SignInPhase::Authorized(_) | SignInPhase::Failed(_)) && !begins {
+                if matches!(before, SignInPhase::Authorized(_) | SignInPhase::Failed(_))
+                    && !begins
+                    && !leftover
+                {
                     prop_assert_eq!(&next, &before);
                     prop_assert!(commands.is_empty());
                 }
