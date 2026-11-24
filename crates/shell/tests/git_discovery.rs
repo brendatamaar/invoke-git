@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use proptest::prelude::*;
 use shell::git::{Git, GitVersion, MIN_VERSION, SetupError};
-use shell::git_discovery::{GitSource, bundled_path, resolve};
+use shell::git_discovery::{GitSource, PROGRAM_NAME, bundled_path, resolve, system_candidates};
 
 const V: fn(u32, u32, u32) -> GitVersion = |major, minor, patch| GitVersion {
     major,
@@ -36,7 +36,7 @@ fn run(
     let probed = RefCell::new(Vec::new());
     let (sys, bun) = (system(), bundled());
     let result = resolve(
-        &sys,
+        std::slice::from_ref(&sys),
         Some(&bun),
         &|program: &Path| {
             probed.borrow_mut().push(program.to_path_buf());
@@ -111,6 +111,69 @@ fn a_bundled_git_that_does_not_work_reports_both_problems() {
             bundled: Box::new(SetupError::Missing("broken".into())),
         }
     );
+}
+
+fn path_var(dirs: &[&Path]) -> std::ffi::OsString {
+    std::env::join_paths(dirs).unwrap()
+}
+
+#[test]
+fn an_old_git_first_on_path_does_not_hide_a_new_one_later() {
+    let (old, new) = (PathBuf::from("old/git"), PathBuf::from("new/git"));
+    let resolved = resolve(
+        &[old.clone(), new.clone()],
+        Some(&bundled()),
+        &|program: &Path| {
+            if program == old {
+                Err(SetupError::TooOld(V(2, 39, 3)))
+            } else if program == new {
+                Ok(V(2, 45, 0))
+            } else {
+                panic!("bundled git probed while a system git works")
+            }
+        },
+        &|_| true,
+    )
+    .unwrap();
+    assert_eq!(resolved.source, GitSource::System);
+    assert_eq!(resolved.program, new);
+}
+
+#[test]
+fn no_git_on_path_and_no_bundled_one_is_missing() {
+    let error = resolve(&[], None, &|_| panic!("nothing to probe"), &|_| false).unwrap_err();
+    assert!(matches!(error, SetupError::Missing(_)), "{error:?}");
+}
+
+#[test]
+fn the_apps_own_mingit_on_path_is_not_a_system_git() {
+    let app = Path::new("C:/Apps/Invoke Git");
+    let mingit_cmd = app.join("mingit").join("cmd");
+    let system = Path::new("C:/Program Files/Git/cmd");
+    let var = path_var(&[&mingit_cmd, system]);
+    let found = system_candidates(&var, Some(app), false, &|_| true);
+    assert_eq!(found, vec![system.join(PROGRAM_NAME)]);
+}
+
+#[test]
+fn app_folder_match_ignores_case_when_asked() {
+    let app = Path::new("C:/Apps/Invoke Git");
+    let upper = Path::new("C:/APPS/INVOKE GIT/mingit/cmd");
+    let var = path_var(&[upper]);
+    assert!(system_candidates(&var, Some(app), true, &|_| true).is_empty());
+    assert_eq!(
+        system_candidates(&var, Some(app), false, &|_| true).len(),
+        1
+    );
+}
+
+#[test]
+fn candidates_keep_path_order_skip_missing_and_duplicates() {
+    let (a, b, c) = (Path::new("a"), Path::new("b"), Path::new("c"));
+    let var = path_var(&[a, b, a, c]);
+    let missing = b.join(PROGRAM_NAME);
+    let found = system_candidates(&var, None, false, &|p| p != missing);
+    assert_eq!(found, vec![a.join(PROGRAM_NAME), c.join(PROGRAM_NAME)]);
 }
 
 #[test]

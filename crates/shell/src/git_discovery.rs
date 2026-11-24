@@ -5,6 +5,7 @@
 //! so every case is testable without a real git. The thin IO wrappers live
 //! in [`Git::detect_with_fallback`](crate::git::Git::detect_with_fallback).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::git::{GitVersion, SetupError};
@@ -42,28 +43,82 @@ pub fn bundled_path(exe: &Path) -> PathBuf {
     path
 }
 
-/// System git first. Only when it is absent, unusable or older than the
-/// minimum does the bundled git (if `bundled` is given and exists) get a
-/// turn. When neither works the error says so for both.
+/// Name of the git executable searched for on PATH.
+pub const PROGRAM_NAME: &str = if cfg!(windows) { "git.exe" } else { "git" };
+
+/// Every `git` on `path_var` (a PATH value), in PATH order, without
+/// duplicates and without any inside `app_dir` (the install folder that
+/// holds the bundled MinGit): a MinGit someone put on PATH is still the
+/// fallback, never the system git. `case_insensitive` is true on Windows.
+pub fn system_candidates(
+    path_var: &OsStr,
+    app_dir: Option<&Path>,
+    case_insensitive: bool,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let key = |path: &Path| -> Vec<String> {
+        path.components()
+            .map(|part| {
+                let text = part.as_os_str().to_string_lossy().into_owned();
+                if case_insensitive {
+                    text.to_lowercase()
+                } else {
+                    text
+                }
+            })
+            .collect()
+    };
+    let app_key = app_dir.map(key);
+    let mut seen: Vec<Vec<String>> = Vec::new();
+    let mut found = Vec::new();
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let dir_key = key(&dir);
+        if app_key.as_ref().is_some_and(|app| dir_key.starts_with(app)) {
+            continue;
+        }
+        let program = dir.join(PROGRAM_NAME);
+        if seen.contains(&dir_key) || !exists(&program) {
+            continue;
+        }
+        seen.push(dir_key);
+        found.push(program);
+    }
+    found
+}
+
+/// System git first: each candidate in order, and the first one that is new
+/// enough wins. Only when none is usable does the bundled git (if `bundled`
+/// is given and exists) get a turn. When neither works the error says so for
+/// both; the system part is the first candidate's reason.
 ///
 /// `probe` runs `<program> --version` and checks the minimum version;
 /// `exists` says whether a file is there.
 pub fn resolve(
-    system: &Path,
+    system: &[PathBuf],
     bundled: Option<&Path>,
     probe: &dyn Fn(&Path) -> Result<GitVersion, SetupError>,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Result<Resolved, SetupError> {
-    let system_error = match probe(system) {
-        Ok(version) => {
-            return Ok(Resolved {
-                program: system.to_path_buf(),
-                version,
-                source: GitSource::System,
-            });
+    let mut first_error = None;
+    for program in system {
+        match probe(program) {
+            Ok(version) => {
+                return Ok(Resolved {
+                    program: program.clone(),
+                    version,
+                    source: GitSource::System,
+                });
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
-        Err(error) => error,
-    };
+    }
+    let system_error = first_error
+        .unwrap_or_else(|| SetupError::Missing(format!("no {PROGRAM_NAME} found on PATH")));
     let Some(bundled) = bundled.filter(|path| exists(path)) else {
         // No fallback installed: the system git's own reason is the message.
         return Err(system_error);

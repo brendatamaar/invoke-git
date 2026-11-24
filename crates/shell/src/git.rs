@@ -94,13 +94,17 @@ impl Git {
         })
     }
 
-    /// System `git` from PATH when it is new enough; otherwise the MinGit
-    /// bundled next to the app executable, if one is installed (P11).
+    /// The first system `git` on PATH that is new enough; otherwise the
+    /// MinGit bundled next to the app executable, if one is installed (P11).
+    /// A `git` inside the app's own folder never counts as system git.
     pub fn detect_with_fallback() -> Result<Self, SetupError> {
-        let bundled = std::env::current_exe()
-            .ok()
-            .map(|exe| git_discovery::bundled_path(&exe));
-        Self::detect_with_fallback_at(Path::new("git"), bundled.as_deref())
+        let exe = std::env::current_exe().ok();
+        let app_dir = exe.as_deref().and_then(Path::parent);
+        let bundled = exe.as_deref().map(git_discovery::bundled_path);
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        let system =
+            git_discovery::system_candidates(&path_var, app_dir, cfg!(windows), &|p| p.is_file());
+        Self::resolve_with(&system, bundled.as_deref())
     }
 
     /// [`detect_with_fallback`](Self::detect_with_fallback) with the system
@@ -109,6 +113,10 @@ impl Git {
         system: &Path,
         bundled: Option<&Path>,
     ) -> Result<Self, SetupError> {
+        Self::resolve_with(&[system.to_path_buf()], bundled)
+    }
+
+    fn resolve_with(system: &[PathBuf], bundled: Option<&Path>) -> Result<Self, SetupError> {
         let resolved = git_discovery::resolve(
             system,
             bundled,

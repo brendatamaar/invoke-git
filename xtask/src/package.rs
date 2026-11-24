@@ -76,8 +76,14 @@ pub fn package_windows() -> Result<(), String> {
     eprintln!("xtask: MinGit {MINGIT_VERSION} SHA-256 verified");
 
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // An explicit target dir: `CARGO_TARGET_DIR` or `build.target-dir` would
+    // otherwise send fresh binaries elsewhere and leave stale ones to copy.
+    let target = root.join("target").join("package");
     let mut build = Command::new(cargo);
-    build.current_dir(&root).args(["build", "--release"]);
+    build
+        .current_dir(&root)
+        .args(["build", "--release", "--target-dir"])
+        .arg(&target);
     for package in ["app", "askpass", "shell"] {
         build.args(["-p", package]);
     }
@@ -89,7 +95,7 @@ pub fn package_windows() -> Result<(), String> {
     let mingit = dist.join(shell_dir());
     fs::create_dir_all(&mingit).map_err(|e| format!("create {} failed: {e}", mingit.display()))?;
     for file in BINARIES {
-        let from = root.join("target").join("release").join(file);
+        let from = target.join("release").join(file);
         fs::copy(&from, dist.join(file))
             .map_err(|e| format!("copy {} failed: {e}", from.display()))?;
     }
@@ -122,10 +128,13 @@ fn system32(tool: &str) -> PathBuf {
 }
 
 fn sha256_of(path: &Path) -> Result<String, String> {
+    // `-Command` joins every later argument into the script text, so the
+    // path cannot follow as `$args[0]`. An environment variable carries it
+    // as data: no quoting, and no path text is ever parsed as PowerShell.
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command"])
-        .arg("(Get-FileHash -Algorithm SHA256 -LiteralPath $args[0]).Hash")
-        .arg(path)
+        .arg("(Get-FileHash -Algorithm SHA256 -LiteralPath $env:INVOKE_HASH_PATH -ErrorAction Stop).Hash")
+        .env("INVOKE_HASH_PATH", path)
         .output()
         .map_err(|e| format!("Get-FileHash failed to start: {e}"))?;
     if !output.status.success() {
