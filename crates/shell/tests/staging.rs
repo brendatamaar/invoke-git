@@ -635,6 +635,48 @@ fn whole_file_stage_unstage_and_undo_keep_worktree_and_intent_to_add() {
     }
 }
 
+#[test]
+fn whole_file_unstage_mode_only_and_undo_restore_exact_index() {
+    use invoke_core::{FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("script", "script\n");
+    repo.commit_all("base");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            repo.paths.workdir.join("script"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    #[cfg(not(unix))]
+    repo.git(&["update-index", "--chmod=+x", "script"]);
+    let mut driver = Driver::open(&repo);
+    let request = |action| {
+        Event::FileRequested(FileRequest {
+            path: RepoPath("script".into()),
+            action,
+            based_on: shell::precondition::current(&repo.paths).unwrap().index,
+        })
+    };
+    #[cfg(unix)]
+    {
+        driver.deliver(request(FileAction::Stage));
+        assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    }
+    assert!(repo.index_entries().starts_with("100755 "));
+    let before = fs::read(repo.paths.git_dir.join("index")).unwrap();
+    driver.deliver(request(FileAction::Unstage));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert!(repo.index_entries().starts_with("100644 "));
+    driver.deliver(Event::UndoRequested);
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(fs::read(repo.paths.git_dir.join("index")).unwrap(), before);
+    assert_eq!(repo.worktree_bytes("script"), b"script\n");
+}
+
 // ---- the status read ----------------------------------------------------
 
 #[test]

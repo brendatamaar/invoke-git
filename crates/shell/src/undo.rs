@@ -205,6 +205,10 @@ impl UndoRunner {
         // Task 13: a discard's undo writes one file back and touches no ref
         // and not the index.
         if let Some(restore) = &replay.discard {
+            let _lock = match precondition::IndexLock::acquire(&self.paths, &replay.expect) {
+                Ok(lock) => lock,
+                Err(failure) => return OpOutcome::Failed(failure),
+            };
             return self.restore_discard(restore);
         }
         if replay.index_effect == IndexEffect::RestoreBytes {

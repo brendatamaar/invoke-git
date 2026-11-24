@@ -11,9 +11,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
-use invoke_core::{ErrorClass, Event, Failure, IndexId, Oid, OpId, OpOutcome, Patch, RepoPath};
+use invoke_core::{
+    ErrorClass, Event, Expect, Failure, GitArgs, Head, IndexId, Oid, OpId, OpOutcome, Patch,
+    RepoPath,
+};
 
-use crate::git::{GLOBAL_ARGS, Git};
+use crate::git::{GLOBAL_ARGS, Git, invocation};
 use crate::precondition::{self, RepoPaths};
 use crate::runner::{Control, run_child};
 
@@ -43,6 +46,93 @@ impl StagingRunner {
     /// The worktree is never touched: `--cached` only writes the index.
     pub fn apply(&self, op: OpId, patch: &Patch, expect_index: &IndexId) -> Event {
         Event::OpFinished(op, self.apply_outcome(patch, expect_index))
+    }
+
+    /// Run whole-file Git staging against a private index. The real index
+    /// stays locked until the successful result can be installed atomically.
+    pub(crate) fn apply_path(&self, args: &GitArgs, path: &RepoPath, expect: &Expect) -> OpOutcome {
+        match self.write_path(args, path, expect) {
+            Ok(()) => OpOutcome::Succeeded,
+            Err(failure) => OpOutcome::Failed(failure),
+        }
+    }
+
+    fn write_path(&self, args: &GitArgs, path: &RepoPath, expect: &Expect) -> Result<(), Failure> {
+        let invalid = |details| Failure {
+            class: ErrorClass::PreconditionChanged,
+            details,
+        };
+        let environment = |error: std::io::Error| Failure {
+            class: ErrorClass::Environment,
+            details: format!("stage {}: {error}", path.0),
+        };
+        let lock = precondition::IndexLock::acquire(&self.paths, expect)?;
+        let full = crate::discard::worktree_path(&self.paths.workdir, path).map_err(invalid)?;
+        if matches!(args, GitArgs::AddPath(_)) {
+            crate::discard::check_leaf(&full, path).map_err(invalid)?;
+        }
+        let repo = precondition::open_with_worktree(&self.paths).map_err(invalid)?;
+        crate::discard::index_entry(&repo, path).map_err(invalid)?;
+        let source = match &expect.head {
+            Head::Branch { oid, .. } | Head::Detached(oid)
+                if matches!(args, GitArgs::RestoreStagedPath(_)) =>
+            {
+                Some(oid)
+            }
+            _ => None,
+        };
+        if let Some(source) = source {
+            let id = gix::ObjectId::from_hex(source.as_hex().as_bytes())
+                .map_err(|e| invalid(e.to_string()))?;
+            let commit = repo.find_commit(id).map_err(|e| invalid(e.to_string()))?;
+            let tree = commit.tree().map_err(|e| invalid(e.to_string()))?;
+            let entry = tree
+                .lookup_entry_by_path(path.0.as_str())
+                .map_err(|e| invalid(e.to_string()))?;
+            if entry.is_some_and(|entry| {
+                matches!(
+                    entry.mode().kind(),
+                    gix::object::tree::EntryKind::Tree | gix::object::tree::EntryKind::Commit
+                )
+            }) {
+                return Err(invalid(format!(
+                    "{} is a directory or submodule in HEAD",
+                    path.0
+                )));
+            }
+        }
+        let scratch = precondition::ScratchDir::create(&self.paths.git_dir).map_err(environment)?;
+        let copy = scratch.0.join("index");
+        if expect.index != IndexId::Absent {
+            fs::copy(self.paths.git_dir.join("index"), &copy).map_err(environment)?;
+        }
+        let mut command = self.git.command(&self.paths.workdir);
+        if matches!(args, GitArgs::RestoreStagedPath(_)) && matches!(expect.head, Head::Unborn(_)) {
+            command
+                .args(GLOBAL_ARGS)
+                .args(["update-index", "--force-remove", "--", &path.0]);
+        } else {
+            let mut run = invocation(args);
+            if let Some(source) = source {
+                run.args
+                    .insert(run.args.len() - 2, format!("--source={source}").into());
+            }
+            command.args(run.args);
+        }
+        command
+            .envs(self.env.iter().cloned())
+            .env("GIT_INDEX_FILE", &copy);
+        let done = run_child(command, None, None, &Control::default()).map_err(environment)?;
+        if !done.success {
+            return Err(Failure {
+                class: ErrorClass::PreconditionChanged,
+                details: done.output,
+            });
+        }
+        let bytes = fs::read(&copy).map_err(environment)?;
+        lock.verify(&self.paths, expect)?;
+        lock.replace(&self.paths.git_dir, &bytes)
+            .map_err(environment)
     }
 
     fn apply_outcome(&self, patch: &Patch, expect_index: &IndexId) -> OpOutcome {

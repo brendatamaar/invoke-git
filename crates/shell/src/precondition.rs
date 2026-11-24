@@ -4,7 +4,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use invoke_core::{BranchName, ErrorClass, Expect, Failure, Head, IndexId, Oid, RefValue};
@@ -194,6 +194,10 @@ impl IndexLock {
         Ok(lock)
     }
 
+    pub(crate) fn verify(&self, paths: &RepoPaths, expect: &Expect) -> Result<(), Failure> {
+        check_values(paths, expect)
+    }
+
     /// Install an index using Git's lock-and-rename protocol. An empty
     /// snapshot denotes an absent index.
     pub(crate) fn replace(mut self, git_dir: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -220,6 +224,30 @@ impl Drop for IndexLock {
         if let Some(path) = &self.path {
             let _ = fs::remove_file(path);
         }
+    }
+}
+
+/// Private scratch space on the same filesystem as a planned rename.
+pub(crate) struct ScratchDir(pub PathBuf);
+
+impl ScratchDir {
+    pub(crate) fn create(parent: &Path) -> io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".invoke-{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

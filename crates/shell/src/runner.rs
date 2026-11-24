@@ -193,6 +193,19 @@ impl Job {
         if let Err(failure) = precondition::check(&self.paths, &self.expect) {
             return OpOutcome::Failed(failure);
         }
+        match &self.args {
+            GitArgs::AddPath(path) | GitArgs::RestoreStagedPath(path) => {
+                return crate::staging::StagingRunner::new(self.git, self.paths)
+                    .with_env(self.env)
+                    .apply_path(&self.args, path, &self.expect);
+            }
+            GitArgs::DiscardPath { path, file } => {
+                return crate::discard::DiscardRunner::new(self.git, self.paths)
+                    .with_env(self.env)
+                    .discard_path(self.op, &self.args, path, &self.expect, file.as_ref());
+            }
+            _ => {}
+        }
         // Rule 5 for refs: the branches the run names must still be where
         // the core saw them (task 15).
         if let Err(failure) = precondition::check_refs(&self.paths, &self.args.expected_refs()) {

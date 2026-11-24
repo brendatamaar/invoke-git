@@ -9,7 +9,7 @@ Memungkinkan user melakukan stage, unstage, dan discard (yang tetap undoable & t
 ## Tasks
 - [x] Tulis unit/property test di `crates/core/tests/stage_props.rs` dan `crates/core/tests/discard_props.rs` serta integration test di `crates/shell/tests/staging.rs` dan `crates/shell/tests/discard.rs` untuk file binary, non-UTF-8, mode-only, dan untracked/tracked discard + undo (termasuk kasus `core.autocrlf=true` untuk discard).
 - [x] Tambah varian perintah git non-patch (`Add`, `RestoreStaged`, `RestoreWorktree`, `CleanPath` atau setara) di `crates/core/src/ops.rs`, `crates/core/src/step.rs`, dan `crates/shell/src/git.rs` dengan expected-index guard & undo snapshot.
-- [ ] Implementasikan eksekusi stage/unstage/discard non-text di `crates/shell/src/staging.rs` dan `crates/shell/src/discard.rs`.
+- [x] Implementasikan eksekusi stage/unstage/discard non-text di `crates/shell/src/staging.rs` dan `crates/shell/src/discard.rs`.
 - [ ] Hubungkan tombol checkbox/discard di `crates/app/src/staging.rs`, `crates/app/src/discard.rs`, dan `crates/app/src/repo_view.rs` agar file non-text memakai jalur non-patch (tidak lagi menampilkan notice penolakan), serta siapkan Windows checklist di Handoff notes.
 
 ## Definition of Done
@@ -22,6 +22,8 @@ Memungkinkan user melakukan stage, unstage, dan discard (yang tetap undoable & t
 - Combined single undo point untuk multi-file `Stage all` / `Discard all` (opsional nanti).
 
 ## Handoff notes
+- Shell menjalankan add/restore staged pada salinan index sambil memegang `index.lock`. Discard menyiapkan checkout dengan filter Git, mencatat hasilnya untuk undo sebelum mengganti file, dan menjaga index persis. Snapshot file menyimpan mode Git, termasuk symlink. Tes fokus binary/non-UTF-8, intent-to-add, dan CRLF lulus di Windows.
+- Spec gap: atribut filesystem di luar mode Git (misalnya ACL atau bit izin selain executable) tidak dicakup model undo. Usulan: pertahankan cakupan byte, tipe, target symlink, dan mode Git yang didefinisikan spesifikasi.
 - Core menjadwalkan aksi file melalui antrean tulis. Stage/unstage menyimpan byte index sebagai blob agar flag intent-to-add dan index yang semula absen dapat dipulihkan. Kedua property test baru gagal saat guard expected-index sengaja dibalik, lalu perubahan tersebut dikembalikan.
 - Tes lebih dulu mendefinisikan kontrak perintah per file, pemulihan byte index (termasuk intent-to-add), dan pemulihan worktree. Tes baru bergantung pada tipe dan runner dari task berikutnya.
 - Spec gap: apa arti discard untuk intent-to-add? Usulan: hapus file worktree seperti file untracked, pertahankan flag intent-to-add di index, dan pulihkan byte asli lewat undo.

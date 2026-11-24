@@ -19,8 +19,8 @@ use diff::{
     DiffOptions, Direction, LineKind, Mode, PatchSpec, Pick, TextDiff, build_patch, diff_text,
 };
 use invoke_core::{
-    Action, ChangeSet, Command as Cmd, DiscardRequest, ErrorClass, Event, IndexId, Notice, OpId,
-    OpOutcome, Patch, Refusal, RepoId, RepoPath, RepoState, Selection, open, step,
+    Action, ChangeSet, Command as Cmd, DiscardRequest, ErrorClass, Event, Failure, IndexId, Notice,
+    OpId, OpOutcome, Patch, Refusal, RepoId, RepoPath, RepoState, Selection, open, step,
 };
 use proptest::prelude::*;
 use shell::precondition::RepoPaths;
@@ -363,6 +363,47 @@ fn whole_file_discard_and_undo_preserve_exact_bytes_and_index() {
         assert_eq!(repo.worktree_bytes(name).as_deref(), Some(edited));
         assert_eq!(repo.index_file_bytes(), index);
     }
+}
+
+#[test]
+fn whole_file_discard_refuses_a_changed_file_or_held_index_lock() {
+    let repo = TempRepo::new();
+    repo.write_bytes("target", b"base\0");
+    repo.commit_all("base");
+    repo.write_bytes("target", b"first\0");
+    let mut driver = Driver::open(&repo);
+    let request = whole_file_request(&repo, "target");
+    repo.write_bytes("target", b"later\0");
+    driver.deliver(request);
+    assert!(matches!(
+        driver.last_outcome(),
+        Some(OpOutcome::Failed(Failure {
+            class: ErrorClass::PreconditionChanged,
+            ..
+        }))
+    ));
+    assert_eq!(
+        repo.worktree_bytes("target").as_deref(),
+        Some(&b"later\0"[..])
+    );
+    assert!(driver.state.undo.entries.is_empty());
+
+    let request = whole_file_request(&repo, "target");
+    let path = repo.paths.git_dir.join("index.lock");
+    fs::write(&path, b"external lock").unwrap();
+    driver.deliver(request);
+    assert!(matches!(
+        driver.last_outcome(),
+        Some(OpOutcome::Failed(Failure {
+            class: ErrorClass::PreconditionChanged,
+            ..
+        }))
+    ));
+    assert_eq!(fs::read(path).unwrap(), b"external lock");
+    assert_eq!(
+        repo.worktree_bytes("target").as_deref(),
+        Some(&b"later\0"[..])
+    );
 }
 
 #[test]
