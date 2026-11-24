@@ -74,6 +74,12 @@ pub struct Http {
 /// The origin part of `url` (`scheme://authority`), parsed with the same
 /// rules as an instance address.
 pub fn origin_of_url(url: &str) -> Option<Origin> {
+    // No whitespace or control characters anywhere: `Origin::parse` trims, and
+    // a padded address must not pass a check that the sender then reads
+    // differently.
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
     let (scheme, rest) = url.split_once("://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     Origin::parse(&format!("{scheme}://{}", &rest[..end])).ok()
@@ -99,7 +105,12 @@ impl Http {
             secure = secure.proxy(reqwest::Proxy::all(proxy).map_err(|_| ForgeError::Network)?);
         }
         let secure = secure.build().map_err(|_| ForgeError::Network)?;
-        let local = base().no_proxy().build().map_err(|_| ForgeError::Network)?;
+        let mut local = base();
+        if let Some(proxy) = proxy {
+            // Only a test sets this: it proves `no_proxy` below wins.
+            local = local.proxy(reqwest::Proxy::all(proxy).map_err(|_| ForgeError::Network)?);
+        }
+        let local = local.no_proxy().build().map_err(|_| ForgeError::Network)?;
         Ok(Http {
             client: secure,
             local,
@@ -108,10 +119,10 @@ impl Http {
 
     /// The client for this address: http (this machine) bypasses proxies.
     fn client_for(&self, url: &str) -> &reqwest::blocking::Client {
-        if url.len() >= 5 && url[..5].eq_ignore_ascii_case("http:") {
-            &self.local
-        } else {
-            &self.client
+        match origin_of_url(url) {
+            Some(origin) if origin.is_https() => &self.client,
+            // http (this machine) and anything unreadable: never a proxy.
+            _ => &self.local,
         }
     }
 
@@ -342,6 +353,39 @@ mod tests {
         }
         assert!(shown.contains("200"));
     }
+    #[test]
+    fn the_client_follows_the_parsed_address_not_its_spelling() {
+        let http = Http::build(None).unwrap();
+        let local = &http.local as *const _;
+        let secure = &http.client as *const _;
+        // Anything that is not plainly https goes to the client that never
+        // uses a proxy, however the address is padded or capitalised.
+        for url in [
+            "http://127.0.0.1:9/x",
+            "HTTP://127.0.0.1:9/x",
+            " http://127.0.0.1:9/x",
+            "http://127.0.0.1:9/x ",
+            "\thttp://127.0.0.1:9/x",
+            "http://127.0.0.1:9/x\n",
+            "",
+            "not a url",
+        ] {
+            assert!(std::ptr::eq(http.client_for(url), local), "{url:?}");
+        }
+        for url in ["https://api.github.com/user", "HTTPS://api.github.com/user"] {
+            assert!(std::ptr::eq(http.client_for(url), secure), "{url:?}");
+        }
+        // And a padded address is not sent at all.
+        for url in [
+            " http://127.0.0.1:9/x",
+            "http://127.0.0.1:9/x ",
+            " https://api.github.com/user",
+            "https://api.github.com/user\n",
+        ] {
+            assert_eq!(check_url(url), Err(ForgeError::InsecureUrl), "{url:?}");
+        }
+    }
+
     #[test]
     fn only_secure_or_local_urls_are_sent() {
         for ok in [

@@ -188,7 +188,7 @@ pub fn next_link(header: &str) -> Option<String> {
     while let Some(open) = rest.find('<') {
         let after = &rest[open + 1..];
         let close = after.find('>')?;
-        let url = &after[..close];
+        let url = after[..close].trim();
         let tail = &after[close + 1..];
         // The parameters run to the next `<` (the next link).
         let params = &tail[..tail.find('<').unwrap_or(tail.len())];
@@ -299,6 +299,18 @@ mod tests {
                 ("flag".into(), String::new()),
                 ("x".into(), String::new()),
             ]
+        );
+    }
+
+    #[test]
+    fn a_padded_link_is_trimmed_to_the_address_it_names() {
+        assert_eq!(
+            next_link("< https://x/y?p=2 >; rel=next").as_deref(),
+            Some("https://x/y?p=2")
+        );
+        assert_eq!(
+            next_link("<\thttp://127.0.0.1:9/n\n>; rel=\"next\"").as_deref(),
+            Some("http://127.0.0.1:9/n")
         );
     }
 
