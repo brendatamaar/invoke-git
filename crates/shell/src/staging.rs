@@ -67,9 +67,14 @@ impl StagingRunner {
             details: format!("stage {}: {error}", path.0),
         };
         let lock = precondition::IndexLock::acquire(&self.paths, expect)?;
-        let full = crate::discard::worktree_path(&self.paths.workdir, path).map_err(invalid)?;
+        // `git add` reads the worktree, so the way there must be plain
+        // folders; an unstage only writes the index, and a worktree folder
+        // that became a file must not stop it.
         if matches!(args, GitArgs::AddPath(_)) {
+            let full = crate::discard::worktree_path(&self.paths.workdir, path).map_err(invalid)?;
             crate::discard::check_leaf(&full, path).map_err(invalid)?;
+        } else {
+            crate::discard::check_repo_path(path).map_err(invalid)?;
         }
         let repo = precondition::open_with_worktree(&self.paths).map_err(invalid)?;
         crate::discard::index_entry(&repo, path).map_err(invalid)?;

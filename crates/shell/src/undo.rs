@@ -168,8 +168,7 @@ impl UndoRunner {
         // Task 13: a discard's undo needs the file as it is right now, and
         // the snapshot is the last moment before the patch runs.
         if let Reversal::Discard { path } = &point.reverse {
-            self.save_file(&discard_ref(op), path)
-                .map_err(|details| fail(ErrorClass::Bug, details))?;
+            self.save_file(&discard_ref(op), path)?;
         }
         Ok(tree)
     }

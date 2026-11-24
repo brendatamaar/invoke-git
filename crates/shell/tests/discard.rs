@@ -1411,3 +1411,195 @@ fn a_discard_under_autocrlf_keeps_the_crlf_worktree() {
     assert!(driver.discard("w.txt", &Choice::File));
     assert_eq!(repo.worktree_bytes("w.txt").unwrap(), base.as_bytes());
 }
+
+/// Cross review: a snapshot that finds a directory where the file was is a
+/// changed precondition, not a bug in the app.
+#[test]
+fn a_snapshot_of_a_file_replaced_by_a_directory_is_a_changed_precondition() {
+    let repo = TempRepo::new();
+    repo.write("f.txt", "a\n");
+    repo.commit_all("base");
+    fs::remove_file(repo.paths.workdir.join("f.txt")).unwrap();
+    repo.write("f.txt/inner", "now a folder\n");
+    let undo =
+        UndoRunner::new(Git::detect("git").unwrap(), repo.paths.clone()).with_env(repo.env.clone());
+    match undo.snapshot(&point_for(&repo, 5, "f.txt")) {
+        Snapshotted::Failed(Event::OpFinished(_, OpOutcome::Failed(failure))) => {
+            assert_eq!(
+                failure.class,
+                ErrorClass::PreconditionChanged,
+                "{failure:?}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Cross review: the scratch checkout must not double the path length, or a
+/// file Git can check out in place fails under Windows' `MAX_PATH`.
+#[test]
+fn whole_file_discard_and_undo_work_near_the_path_length_limit() {
+    let repo = TempRepo::new();
+    let base = repo.paths.workdir.to_string_lossy().len();
+    let mut name = String::new();
+    while base + name.len() + 12 < 235 {
+        name.push_str("segment789/");
+    }
+    name.push_str("leaf.bin");
+    repo.write_bytes(&name, b"old\0");
+    repo.commit_all("base");
+    repo.write_bytes(&name, b"changed\0");
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, &name));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert_eq!(repo.worktree_bytes(&name).as_deref(), Some(&b"old\0"[..]));
+    driver.undo();
+    assert_eq!(
+        repo.worktree_bytes(&name).as_deref(),
+        Some(&b"changed\0"[..])
+    );
+}
+
+/// Cross review: a read-only worktree file is replaced by discard and by
+/// its undo (Git itself checks out over one).
+#[test]
+#[cfg(windows)]
+fn whole_file_discard_and_undo_replace_a_read_only_file() {
+    let repo = TempRepo::new();
+    let full = repo.paths.workdir.join("locked.bin");
+    let read_only = |on: bool| {
+        let mut permissions = fs::metadata(&full).unwrap().permissions();
+        permissions.set_readonly(on);
+        fs::set_permissions(&full, permissions).unwrap();
+    };
+    repo.write_bytes("locked.bin", b"old\0");
+    repo.commit_all("base");
+    repo.write_bytes("locked.bin", b"changed\0");
+    read_only(true);
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "locked.bin"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert_eq!(
+        repo.worktree_bytes("locked.bin").as_deref(),
+        Some(&b"old\0"[..])
+    );
+    read_only(true);
+    driver.undo();
+    assert_eq!(
+        repo.worktree_bytes("locked.bin").as_deref(),
+        Some(&b"changed\0"[..])
+    );
+}
+
+/// Cross review: a directory link (here a junction, which needs no
+/// privilege) where a tracked file belongs is replaced by the file.
+#[test]
+#[cfg(windows)]
+fn whole_file_discard_replaces_a_directory_link() {
+    let repo = TempRepo::new();
+    repo.write("dir/inside", "kept\n");
+    repo.write("entry", "file\n");
+    repo.commit_all("base");
+    let entry = repo.paths.workdir.join("entry");
+    fs::remove_file(&entry).unwrap();
+    let made = Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(&entry)
+        .arg(repo.paths.workdir.join("dir"))
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "entry"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert!(fs::symlink_metadata(&entry).unwrap().is_file());
+    assert_eq!(
+        repo.worktree_bytes("entry").as_deref(),
+        Some(&b"file\n"[..])
+    );
+    assert_eq!(
+        repo.worktree_bytes("dir/inside").as_deref(),
+        Some(&b"kept\n"[..])
+    );
+}
+
+/// Cross review: Git for Windows decides a symlink's kind from its target
+/// in the worktree, so the scratch checkout must not turn a directory link
+/// into a file link.
+#[test]
+#[cfg(windows)]
+fn whole_file_discard_restores_a_directory_symlink_as_one() {
+    use std::os::windows::fs::{FileTypeExt, symlink_dir};
+
+    let repo = TempRepo::new();
+    repo.git(&["config", "core.symlinks", "true"]);
+    repo.write("dir/inside", "kept\n");
+    let link = repo.paths.workdir.join("link");
+    let created = symlink_dir("dir", &link);
+    if created
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(1314))
+    {
+        eprintln!("Native symlinks require Windows developer mode or a symlink privilege");
+        return;
+    }
+    created.unwrap();
+    repo.commit_all("base");
+    fs::remove_dir(&link).unwrap();
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "link"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    let metadata = fs::symlink_metadata(&link).unwrap();
+    assert!(metadata.file_type().is_symlink_dir(), "{metadata:?}");
+    assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("dir"));
+    driver.undo();
+    assert!(fs::symlink_metadata(&link).is_err());
+}
+
+/// Cross review: on a case-insensitive filesystem `foo.txt` finds
+/// `Foo.txt`. A file whose on-disk name differs only in case is refused,
+/// not hashed or overwritten in place of the one Git names.
+#[test]
+#[cfg(windows)]
+fn a_file_whose_disk_name_differs_in_case_is_refused() {
+    let repo = TempRepo::new();
+    repo.write("foo.txt", "tracked\n");
+    repo.commit_all("base");
+    fs::rename(
+        repo.paths.workdir.join("foo.txt"),
+        repo.paths.workdir.join("Foo.txt"),
+    )
+    .unwrap();
+    let error = shell::discard::file_inputs(&repo.paths, &RepoPath("foo.txt".into()))
+        .err()
+        .expect("a case-only match must be refused");
+    assert!(error.contains("Foo.txt"), "{error}");
+    let untracked = shell::discard::file_inputs(&repo.paths, &RepoPath("Foo.txt".into())).unwrap();
+    assert!(untracked.file.is_some());
+    assert_eq!(
+        repo.worktree_bytes("Foo.txt").as_deref(),
+        Some(&b"tracked\n"[..])
+    );
+}

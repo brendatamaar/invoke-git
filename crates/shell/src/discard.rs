@@ -136,7 +136,7 @@ impl DiscardRunner {
         // Prepare checkout using Git's smudge / EOL conversion. Record the
         // resulting bytes and mode for undo before replacing the real file.
         let scratch = tracked
-            .then(|| scratch_for(&full))
+            .then(|| scratch_for(&self.paths.workdir))
             .transpose()
             .map_err(environment)?;
         let staged = if let Some(scratch) = &scratch {
@@ -145,6 +145,11 @@ impl DiscardRunner {
             prefix.push("/");
             let mut run = invocation(args);
             run.args.insert(GLOBAL_ARGS.len() + 1, prefix);
+            // The scratch copy sits one short folder deeper than the file
+            // itself; Git for Windows must not refuse it at `MAX_PATH` when
+            // the real path fits. Only this private checkout uses it.
+            run.args
+                .splice(0..0, ["-c", "core.longpaths=true"].map(OsString::from));
             let mut command = self.git.command(&self.paths.workdir);
             command
                 .args(run.args)
@@ -157,7 +162,9 @@ impl DiscardRunner {
                     details: done.output,
                 });
             }
-            Some(scratch.0.join(&path.0))
+            let staged = scratch.0.join(&path.0);
+            fix_link_kind(&staged, &full).map_err(environment)?;
+            Some(staged)
         } else {
             None
         };
@@ -274,7 +281,7 @@ impl DiscardRunner {
         }
         // The file is changed now. Record what it holds, so an undo can tell
         // later whether it is still the discard's result.
-        if let Err(details) = self.undo.save_file(&discard_after_ref(op), path) {
+        if let Err(Failure { details, .. }) = self.undo.save_file(&discard_after_ref(op), path) {
             return failed(
                 ErrorClass::Bug,
                 format!(
@@ -364,11 +371,30 @@ fn checkout_entry(repo: &gix::Repository, path: &RepoPath) -> Result<bool, Strin
 /// `path` under `workdir`, refusing anything that could leave the repo or
 /// reach `.git`: a discard (and its undo) writes and deletes files.
 pub(crate) fn worktree_path(workdir: &Path, path: &RepoPath) -> Result<PathBuf, String> {
-    let invalid = || format!("{:?} is not a path inside the working tree", path.0);
+    check_repo_path(path)?;
     let mut full = workdir.to_path_buf();
     let mut parts = path.0.split('/').peekable();
     while let Some(part) = parts.next() {
-        if part.is_empty()
+        full.push(part);
+        if parts.peek().is_some() {
+            // `is_dir` is false for symlinks and junctions (name-surrogate
+            // reparse points); a OneDrive placeholder folder is a folder.
+            match fs::symlink_metadata(&full) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => return Err(outside(path)),
+            }
+        }
+    }
+    Ok(full)
+}
+
+/// `path` as text: normalized, relative, and not naming `.git` (or what
+/// Windows would read as it). Nothing on disk is looked at, so it is all an
+/// index-only write (unstage) needs.
+pub(crate) fn check_repo_path(path: &RepoPath) -> Result<(), String> {
+    let bad = |part: &str| {
+        part.is_empty()
             || part == "."
             || part == ".."
             || part.eq_ignore_ascii_case(".git")
@@ -377,41 +403,132 @@ pub(crate) fn worktree_path(workdir: &Path, path: &RepoPath) -> Result<PathBuf, 
                 && (part.contains(['\\', ':'])
                     || part.ends_with(['.', ' '])
                     || part.eq_ignore_ascii_case("git~1"))
-        {
-            return Err(invalid());
-        }
-        full.push(part);
-        if parts.peek().is_some() {
-            match fs::symlink_metadata(&full) {
-                Ok(metadata) if metadata.is_dir() && !is_link(&metadata) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                _ => return Err(invalid()),
-            }
-        }
+    };
+    if path.0.split('/').any(bad) {
+        return Err(outside(path));
     }
-    Ok(full)
+    Ok(())
+}
+
+fn outside(path: &RepoPath) -> String {
+    format!("{:?} is not a path inside the working tree", path.0)
 }
 
 /// A leaf may be a file, a symlink or absent. Directory pathspecs would
 /// affect multiple paths and cannot use a single-file undo.
 pub(crate) fn check_leaf(full: &Path, path: &RepoPath) -> Result<Option<fs::Metadata>, String> {
+    leaf(full, path).map_err(|failure| failure.details)
+}
+
+/// [`check_leaf`], with what kind of failure it is: something on disk that
+/// is not what it was (`PreconditionChanged`) or a read that failed
+/// (`Environment`).
+fn leaf(full: &Path, path: &RepoPath) -> Result<Option<fs::Metadata>, Failure> {
+    let fail = |class, details| Failure { class, details };
+    // Symlinks and junctions (name-surrogate reparse points on Windows) are
+    // links; a cloud placeholder or dedup stub is the file it stands for.
     match fs::symlink_metadata(full) {
-        Ok(metadata)
-            if metadata.file_type().is_symlink() || metadata.is_file() && !is_link(&metadata) =>
-        {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            same_name_on_disk(full, path)?;
             Ok(Some(metadata))
         }
-        Ok(_) => Err(format!("{} is not a file or symlink", path.0)),
+        Ok(_) => Err(fail(
+            ErrorClass::PreconditionChanged,
+            format!("{} is not a file or symlink", path.0),
+        )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("{}: {error}", path.0)),
+        Err(error) => Err(fail(
+            ErrorClass::Environment,
+            format!("{}: {error}", path.0),
+        )),
     }
 }
 
+/// On a case-insensitive filesystem `foo.txt` also finds `Foo.txt`. Only
+/// the entry Git names is hashed or replaced: a name that differs on disk
+/// is refused.
+#[cfg(windows)]
+fn same_name_on_disk(full: &Path, path: &RepoPath) -> Result<(), Failure> {
+    let found = disk_name(full).map_err(|error| Failure {
+        class: ErrorClass::Environment,
+        details: format!("{}: {error}", path.0),
+    })?;
+    if Some(found.as_os_str()) == full.file_name() {
+        return Ok(());
+    }
+    Err(Failure {
+        class: ErrorClass::PreconditionChanged,
+        details: format!(
+            "{} is named {} on disk. Rename it to match Git first.",
+            path.0,
+            found.to_string_lossy()
+        ),
+    })
+}
+
+#[cfg(not(windows))]
+fn same_name_on_disk(_: &Path, _: &RepoPath) -> Result<(), Failure> {
+    Ok(())
+}
+
+/// The name of the directory entry `full` resolves to, as stored on disk.
+/// `FindFirstFileW` reads the parent's entry and does not open the file, so
+/// a cloud placeholder is not downloaded.
+#[cfg(windows)]
+fn disk_name(full: &Path) -> io::Result<OsString> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+
+    let absolute: Vec<u16> = std::path::absolute(full)?
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    let units = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+    // A verbatim path, so long paths work without the process opting in.
+    let mut wide = if absolute.starts_with(&units(r"\\?\")) {
+        absolute
+    } else if let Some(share) = absolute.strip_prefix(&units(r"\\")[..]) {
+        [units(r"\\?\UNC\"), share.to_vec()].concat()
+    } else {
+        [units(r"\\?\"), absolute].concat()
+    };
+    wide.push(0);
+    // SAFETY: `wide` is NUL-terminated, `data` is a plain struct written by
+    // the call, and the search handle is closed right away.
+    let data = unsafe {
+        let mut data: WIN32_FIND_DATAW = std::mem::zeroed();
+        let handle = FindFirstFileW(wide.as_ptr(), &mut data);
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        FindClose(handle);
+        data
+    };
+    let name = &data.cFileName;
+    let end = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    Ok(OsString::from_wide(&name[..end]))
+}
+
 pub(crate) fn read_file(full: &Path, path: &RepoPath) -> Result<Option<OnDisk>, String> {
-    let Some(metadata) = check_leaf(full, path)? else {
+    read_disk(full, path).map_err(|failure| failure.details)
+}
+
+fn read_disk(full: &Path, path: &RepoPath) -> Result<Option<OnDisk>, Failure> {
+    let Some(metadata) = leaf(full, path)? else {
         return Ok(None);
     };
-    let error = |error: io::Error| format!("{}: {error}", path.0);
+    let error = |error: io::Error| Failure {
+        class: if error.kind() == io::ErrorKind::NotFound {
+            ErrorClass::PreconditionChanged
+        } else {
+            ErrorClass::Environment
+        },
+        details: format!("{}: {error}", path.0),
+    };
     if metadata.file_type().is_symlink() {
         return Ok(Some(OnDisk {
             bytes: read_link(full, &metadata).map_err(error)?,
@@ -454,18 +571,6 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_: &fs::Metadata) -> bool {
     false
-}
-
-#[cfg(unix)]
-fn is_link(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(windows)]
-fn is_link(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(unix)]
@@ -513,10 +618,22 @@ impl UndoRunner {
     /// Saves the worktree file `path` as a tree under `ref_name` (the file
     /// as a blob with its mode; an empty tree when the file does not
     /// exist). The bytes are stored as they are, without any filter.
-    pub(crate) fn save_file(&self, ref_name: &str, path: &RepoPath) -> Result<(), String> {
-        let full = worktree_path(&self.paths.workdir, path)?;
-        let file = read_file(&full, path)?;
+    ///
+    /// A path that no longer leads to a file (a folder in its place, a
+    /// parent that became a file or link) is a changed precondition; a read
+    /// the system refuses is the environment; only failing to record what
+    /// was read is a bug.
+    pub(crate) fn save_file(&self, ref_name: &str, path: &RepoPath) -> Result<(), Failure> {
+        let full = worktree_path(&self.paths.workdir, path).map_err(|details| Failure {
+            class: ErrorClass::PreconditionChanged,
+            details,
+        })?;
+        let file = read_disk(&full, path)?;
         self.save_entry(ref_name, path, file.as_ref())
+            .map_err(|details| Failure {
+                class: ErrorClass::Bug,
+                details,
+            })
     }
 
     fn save_entry(
@@ -633,7 +750,7 @@ impl UndoRunner {
                     Ok(object) => object,
                     Err(details) => return failed(ErrorClass::Bug, details),
                 };
-                let scratch = match scratch_for(&full) {
+                let scratch = match scratch_for(&self.paths.workdir) {
                     Ok(scratch) => scratch,
                     Err(error) => return environment(error),
                 };
@@ -658,14 +775,41 @@ impl UndoRunner {
     }
 }
 
-/// Choose scratch space on the same filesystem as the eventual replacement.
-fn scratch_for(full: &Path) -> io::Result<precondition::ScratchDir> {
+/// Scratch space at the top of the working tree: on the same filesystem as
+/// every file under it (`worktree_path` refuses links and junctions on the
+/// way, so no mount point is crossed), and only one short folder deeper.
+fn scratch_for(workdir: &Path) -> io::Result<precondition::ScratchDir> {
+    precondition::ScratchDir::create(workdir)
+}
+
+/// Git for Windows picks a symlink's kind (file or directory) from what its
+/// target is when it creates the link. In the scratch folder the target is
+/// missing, so a link to a directory came out as a file link: make it again
+/// with the kind the target has from where the link will live.
+#[cfg(windows)]
+fn fix_link_kind(staged: &Path, full: &Path) -> io::Result<()> {
+    use std::os::windows::fs::{FileTypeExt, symlink_dir, symlink_file};
+    let metadata = fs::symlink_metadata(staged)?;
+    if !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let target = fs::read_link(staged)?;
     let parent = full.parent().ok_or(io::ErrorKind::InvalidInput)?;
-    let existing = parent
-        .ancestors()
-        .find(|dir| dir.is_dir())
-        .ok_or(io::ErrorKind::NotFound)?;
-    precondition::ScratchDir::create(existing)
+    let directory = parent.join(&target).is_dir();
+    if metadata.file_type().is_symlink_dir() == directory {
+        return Ok(());
+    }
+    remove_leaf(staged)?;
+    if directory {
+        symlink_dir(&target, staged)
+    } else {
+        symlink_file(&target, staged)
+    }
+}
+
+#[cfg(not(windows))]
+fn fix_link_kind(_: &Path, _: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn write_file(temporary: &Path, bytes: &[u8], mode: WorktreeMode) -> io::Result<()> {
@@ -690,7 +834,20 @@ fn write_file(temporary: &Path, bytes: &[u8], mode: WorktreeMode) -> io::Result<
 fn install_file(source: &Path, target: &Path) -> io::Result<()> {
     let parent = target.parent().ok_or(io::ErrorKind::InvalidInput)?;
     fs::create_dir_all(parent)?;
-    fs::rename(source, target)
+    match fs::rename(source, target) {
+        // Windows will not rename over a read-only file or a directory
+        // link. The caller checked the target and saved it for undo, so it
+        // is removed the way a delete would, then the rename is retried.
+        Err(error)
+            if cfg!(windows)
+                && error.kind() == io::ErrorKind::PermissionDenied
+                && fs::symlink_metadata(target).is_ok() =>
+        {
+            remove_leaf(target)?;
+            fs::rename(source, target)
+        }
+        result => result,
+    }
 }
 
 fn remove_leaf(full: &Path) -> io::Result<()> {
@@ -722,4 +879,111 @@ fn remove_file_and_empty_dirs(full: &Path, workdir: &Path) -> io::Result<()> {
 
 fn failed(class: ErrorClass, details: String) -> OpOutcome {
     OpOutcome::Failed(Failure { class, details })
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::os::windows::ffi::OsStrExt;
+    use std::process::Command;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    use super::*;
+
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+
+    /// Gives `path` a reparse point with a third-party tag that is not a name
+    /// surrogate, like a cloud placeholder (OneDrive) or a dedup stub.
+    fn set_placeholder_tag(path: &Path) -> io::Result<()> {
+        let tag: u32 = 0x0000_7A11;
+        let data = [1u8, 2, 3, 4];
+        let mut buffer = Vec::new();
+        buffer.extend(tag.to_le_bytes());
+        buffer.extend((data.len() as u16).to_le_bytes());
+        buffer.extend(0u16.to_le_bytes());
+        buffer.extend([0x5Au8; 16]);
+        buffer.extend(data);
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a NUL-terminated path, a buffer that outlives the call, and
+        // the handle is closed before returning.
+        unsafe {
+            let handle = CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            );
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            let mut returned = 0;
+            let done = DeviceIoControl(
+                handle,
+                FSCTL_SET_REPARSE_POINT,
+                buffer.as_ptr().cast(),
+                buffer.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            );
+            let error = io::Error::last_os_error();
+            CloseHandle(handle);
+            if done == 0 {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Cross review: only name-surrogate reparse points (symlinks,
+    /// junctions) are links. A placeholder folder or file is used as is.
+    #[test]
+    fn placeholder_reparse_points_are_plain_folders_and_files() {
+        let root = std::env::temp_dir().join(format!(
+            "invoke-git-reparse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(root.join("cloud")).unwrap();
+        fs::create_dir_all(root.join("plain")).unwrap();
+        fs::write(root.join("plain/file"), b"x").unwrap();
+        fs::create_dir_all(root.join("real")).unwrap();
+        // A folder: traversing it needs its filter driver, so only its own
+        // entry is looked at here; the file sits in a plain folder.
+        let tagged = set_placeholder_tag(&root.join("cloud"))
+            .and_then(|()| set_placeholder_tag(&root.join("plain/file")));
+        if let Err(error) = &tagged {
+            let _ = fs::remove_dir_all(&root);
+            panic!("set a placeholder reparse point: {error}");
+        }
+        let junction = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(root.join("junction"))
+            .arg(root.join("real"))
+            .output()
+            .unwrap();
+        let under_folder = worktree_path(&root, &RepoPath("cloud/file".into()));
+        let path = RepoPath("plain/file".into());
+        let leaf =
+            worktree_path(&root, &path).map(|full| check_leaf(&full, &path).map(|m| m.is_some()));
+        let through_junction = worktree_path(&root, &RepoPath("junction/file".into()));
+        let _ = fs::remove_dir_all(&root);
+        assert!(junction.status.success(), "{junction:?}");
+        assert!(under_folder.is_ok(), "{under_folder:?}");
+        assert_eq!(leaf, Ok(Ok(true)));
+        assert!(through_junction.is_err(), "{through_junction:?}");
+    }
 }

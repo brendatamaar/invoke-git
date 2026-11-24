@@ -1006,3 +1006,40 @@ proptest! {
         prop_assert_eq!(repo.worktree_bytes(path), worktree_before, "law 4");
     }
 }
+
+/// Cross review: unstaging only writes the index, so a worktree folder that
+/// became a file must not stop it (the path itself is still checked).
+#[test]
+fn whole_file_unstage_ignores_what_the_worktree_holds_above_the_path() {
+    use invoke_core::{FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("a/b", "base\n");
+    repo.commit_all("base");
+    repo.write("a/b", "staged\n");
+    repo.git(&["add", "--", "a/b"]);
+    fs::remove_dir_all(repo.paths.workdir.join("a")).unwrap();
+    repo.write("a", "now a file\n");
+    let mut driver = Driver::open(&repo);
+    let request = |path: &str| {
+        Event::FileRequested(FileRequest {
+            path: RepoPath(path.into()),
+            action: FileAction::Unstage,
+            based_on: shell::precondition::current(&repo.paths).unwrap().index,
+        })
+    };
+    driver.deliver(request("a/b"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert_eq!(repo.git(&["show", ":a/b"]), "base");
+    assert_eq!(repo.worktree_bytes("a"), b"now a file\n");
+    let before = repo.index_entries();
+    // Whatever the core makes of it, a path out of the repo never reaches git.
+    driver.deliver(request("a/../.git/config"));
+    assert_ne!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(repo.index_entries(), before);
+}
