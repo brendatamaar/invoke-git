@@ -179,13 +179,7 @@ impl UndoRunner {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(format!("read index: {error}")),
         };
-        let hash_blob = |bytes: &[u8]| {
-            self.run(
-                &["hash-object", "-w", "--no-filters", "--stdin"],
-                &[],
-                Some(bytes),
-            )
-        };
+        let hash_blob = |bytes: &[u8]| self.save_blob(bytes);
         let index = hash_blob(&bytes)?;
         let mut entries = format!("100644 blob {}\tindex\n", index.trim());
         if !bytes.is_empty() {
@@ -452,6 +446,18 @@ impl UndoRunner {
         }
     }
 
+    /// Saves `bytes` as a blob, as they are, and returns its id once it is
+    /// known to be the id of exactly these bytes.
+    pub(crate) fn save_blob(&self, bytes: &[u8]) -> Result<String, String> {
+        let hash = precondition::open(&self.paths)?.object_hash();
+        let found = self.run(
+            &["hash-object", "-w", "--no-filters", "--stdin"],
+            &[],
+            Some(bytes),
+        )?;
+        checked_blob(&found, bytes, hash)
+    }
+
     /// Runs git and returns stdout, or stderr (with the command) on failure.
     pub(crate) fn run(
         &self,
@@ -479,17 +485,31 @@ impl UndoRunner {
         // stdout and stderr: git may write a lot (`GIT_TRACE`, a large
         // index's errors) before it reads all of stdin, and a full pipe on
         // each side would block both forever. Dropping the pipe at the end
-        // closes git's stdin.
-        let output = std::thread::scope(|scope| {
-            if let (Some(mut pipe), Some(bytes)) = (child.stdin.take(), stdin) {
-                scope.spawn(move || {
-                    let _ = pipe.write_all(bytes);
-                });
-            }
-            child.wait_with_output()
-        })
-        .map_err(|error| format!("wait for git: {error}"))?;
+        // closes git's stdin. A write that fails means git saw only part of
+        // the input, so the run fails even when git exits 0.
+        let (output, written) = std::thread::scope(|scope| {
+            let writer = match (child.stdin.take(), stdin) {
+                (Some(mut pipe), Some(bytes)) => {
+                    Some(scope.spawn(move || pipe.write_all(bytes).and_then(|()| pipe.flush())))
+                }
+                _ => None,
+            };
+            let output = child.wait_with_output();
+            let written = writer.map_or(Ok(()), |writer| {
+                writer
+                    .join()
+                    .unwrap_or_else(|_| Err(std::io::Error::other("stdin writer panicked")))
+            });
+            (output, written)
+        });
+        let output = output.map_err(|error| format!("wait for git: {error}"))?;
         if output.status.success() {
+            if let Err(error) = written {
+                return Err(format!(
+                    "git {}: did not read all of its input: {error}",
+                    args.join(" ")
+                ));
+            }
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         } else {
             Err(format!(
@@ -498,6 +518,20 @@ impl UndoRunner {
                 String::from_utf8_lossy(&output.stderr).trim()
             ))
         }
+    }
+}
+
+/// The id `hash-object` printed, if it is the id of `bytes`.
+fn checked_blob(found: &str, bytes: &[u8], hash: gix::hash::Kind) -> Result<String, String> {
+    let want = crate::staging::blob_id(hash, bytes)?;
+    if found.trim() == want.as_hex() {
+        Ok(want.to_string())
+    } else {
+        Err(format!(
+            "git saved {:?} for {} bytes whose id is {want}",
+            found.trim(),
+            bytes.len()
+        ))
     }
 }
 
@@ -686,5 +720,56 @@ mod run_tests {
             .expect("the runner and git deadlocked");
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(result.unwrap().trim(), size.to_string());
+    }
+
+    /// Re-check: when git stops reading stdin and still exits 0, what it
+    /// saw is a prefix of the input. That must fail, never pass as saved.
+    #[test]
+    fn stdin_that_git_did_not_take_whole_fails_the_run() {
+        let dir = std::env::temp_dir().join(format!(
+            "invoke-git-undo-stdin-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let global = dir.join("gitconfig");
+        fs::write(&global, "").unwrap();
+        let runner = UndoRunner::new(
+            Git::detect("git").unwrap(),
+            RepoPaths {
+                git_dir: dir.join(".git"),
+                workdir: dir.clone(),
+            },
+        )
+        .with_env([
+            (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+            (OsString::from("GIT_CONFIG_GLOBAL"), global.into_os_string()),
+        ]);
+        let env: [(&str, &std::ffi::OsStr); 3] = [
+            ("GIT_CONFIG_COUNT", "1".as_ref()),
+            ("GIT_CONFIG_KEY_0", "alias.quits".as_ref()),
+            ("GIT_CONFIG_VALUE_0", "!true".as_ref()),
+        ];
+        let result = runner.run(&["quits"], &env, Some(&vec![b'x'; 4 << 20]));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    /// Re-check: the id git reports for a saved blob must be the id of the
+    /// bytes handed to it.
+    #[test]
+    fn a_blob_id_that_is_not_the_inputs_is_refused() {
+        let hash = gix::hash::Kind::Sha1;
+        let id = crate::staging::blob_id(hash, b"whole").unwrap();
+        assert_eq!(
+            checked_blob(&format!("{id}\n"), b"whole", hash),
+            Ok(id.to_string())
+        );
+        let prefix = crate::staging::blob_id(hash, b"who").unwrap();
+        assert!(checked_blob(&format!("{prefix}\n"), b"whole", hash).is_err());
+        assert!(checked_blob("", b"whole", hash).is_err());
     }
 }
