@@ -13,6 +13,9 @@ use crate::reflog::ResetMode;
 use crate::state::{DiskState, Head};
 use crate::undo::{Reversal, UndoEntry, UndoReplay};
 
+// `StateRead` carries `DiskState` directly; boxing it would add indirection
+// on the most common event, matching `Snapshot` in `state.rs`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     // From the UI.

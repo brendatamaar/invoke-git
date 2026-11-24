@@ -410,7 +410,12 @@ impl Sim {
             | GitArgs::InteractiveRebase(_)
             | GitArgs::GuardedRebase { .. }
             // P7.
-            | GitArgs::Reset { .. } => {
+            | GitArgs::Reset { .. }
+            // P10.
+            | GitArgs::WorktreeAdd { .. }
+            | GitArgs::WorktreeRemove { .. }
+            | GitArgs::Submodule { .. }
+            | GitArgs::LfsPull { .. } => {
                 panic!("no commits, stashes or remotes in this simulation")
             }
         }
