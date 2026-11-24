@@ -422,11 +422,10 @@ fn whole_file_actions_keep_symlink_targets_and_undo_restores_the_link() {
     repo.write("second", "untouched second");
     let created = symlink("first", &link);
     #[cfg(windows)]
-    if created
-        .as_ref()
-        .is_err_and(|error| error.raw_os_error() == Some(1314))
-    {
-        eprintln!("Native symlinks require Windows developer mode or a symlink privilege");
+    if symlinks_unavailable(
+        &created,
+        "whole_file_actions_keep_symlink_targets_and_undo_restores_the_link",
+    ) {
         return;
     }
     created.unwrap();
@@ -1540,6 +1539,69 @@ fn whole_file_discard_replaces_a_directory_link() {
     );
 }
 
+/// Native symlinks on Windows need Developer Mode or an elevated shell
+/// (error 1314 otherwise). A skip is written straight to stderr, past the
+/// test harness's capture, so it shows in every run; with
+/// `INVOKE_REQUIRE_SYMLINKS=1` it is a failure instead.
+#[cfg(windows)]
+fn symlinks_unavailable(created: &std::io::Result<()>, test: &str) -> bool {
+    use std::io::Write;
+    if !created
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(1314))
+    {
+        return false;
+    }
+    assert!(
+        std::env::var_os("INVOKE_REQUIRE_SYMLINKS").is_none_or(|value| value != "1"),
+        "{test}: INVOKE_REQUIRE_SYMLINKS=1, but creating a symlink failed with error 1314 \
+         (enable Developer Mode or run elevated)"
+    );
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "SKIPPED {test}: native symlinks need Developer Mode or an elevated shell (error 1314). \
+         Set INVOKE_REQUIRE_SYMLINKS=1 to make this a failure."
+    );
+    true
+}
+
+/// Re-check: a directory symlink where a tracked file belongs is replaced
+/// by the file, like the junction above.
+#[test]
+#[cfg(windows)]
+fn whole_file_discard_replaces_a_directory_symlink() {
+    use std::os::windows::fs::symlink_dir;
+
+    let repo = TempRepo::new();
+    repo.write("dir/inside", "kept\n");
+    repo.write("entry", "file\n");
+    repo.commit_all("base");
+    let entry = repo.paths.workdir.join("entry");
+    fs::remove_file(&entry).unwrap();
+    let created = symlink_dir("dir", &entry);
+    if symlinks_unavailable(&created, "whole_file_discard_replaces_a_directory_symlink") {
+        return;
+    }
+    created.unwrap();
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "entry"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert!(fs::symlink_metadata(&entry).unwrap().is_file());
+    assert_eq!(
+        repo.worktree_bytes("entry").as_deref(),
+        Some(&b"file\n"[..])
+    );
+    assert_eq!(
+        repo.worktree_bytes("dir/inside").as_deref(),
+        Some(&b"kept\n"[..])
+    );
+}
+
 /// Cross review: Git for Windows decides a symlink's kind from its target
 /// in the worktree, so the scratch checkout must not turn a directory link
 /// into a file link.
@@ -1553,11 +1615,10 @@ fn whole_file_discard_restores_a_directory_symlink_as_one() {
     repo.write("dir/inside", "kept\n");
     let link = repo.paths.workdir.join("link");
     let created = symlink_dir("dir", &link);
-    if created
-        .as_ref()
-        .is_err_and(|error| error.raw_os_error() == Some(1314))
-    {
-        eprintln!("Native symlinks require Windows developer mode or a symlink privilege");
+    if symlinks_unavailable(
+        &created,
+        "whole_file_discard_restores_a_directory_symlink_as_one",
+    ) {
         return;
     }
     created.unwrap();
