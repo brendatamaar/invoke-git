@@ -3,7 +3,9 @@
 //! for. Pure: the texts come from the diff as it is shown.
 
 use diff::{LineKind, TextDiff};
-use invoke_core::{Event, RepoPath};
+use invoke_core::{Event, FileAction, FileRequest, RepoPath};
+use shell::discard::FileInputs;
+use shell::precondition::RepoPaths;
 use ui::InputsMeta;
 
 use crate::staging::Part;
@@ -24,8 +26,8 @@ pub enum What {
     /// One request, already built from the diff on screen; the core refuses
     /// it if the index or the file changed meanwhile (rule 5).
     Request(Box<Event>),
-    /// Whole files, each read and requested in turn.
-    Files(Vec<RepoPath>),
+    /// Requests read before confirmation and delivered one at a time.
+    Files(Vec<Box<Event>>),
 }
 
 fn lines(count: usize) -> String {
@@ -33,6 +35,58 @@ fn lines(count: usize) -> String {
 }
 
 const UNDO: &str = "You can undo it.";
+
+fn whole_file(path: RepoPath, inputs: FileInputs) -> Confirm {
+    let (text, button) = match (inputs.tracked, inputs.file.is_some()) {
+        (false, _) => (format!("This deletes {}. {UNDO}", path.0), "Delete file"),
+        (true, false) => (
+            format!("This brings back {}, which you deleted. {UNDO}", path.0),
+            "Restore file",
+        ),
+        (true, true) => (
+            format!("This restores the staged version of {}. {UNDO}", path.0),
+            "Discard file",
+        ),
+    };
+    Confirm {
+        text,
+        button: button.into(),
+        what: What::Request(file_event(path, inputs)),
+    }
+}
+
+fn file_event(path: RepoPath, inputs: FileInputs) -> Box<Event> {
+    Box::new(Event::FileRequested(FileRequest {
+        path,
+        action: FileAction::Discard { file: inputs.file },
+        based_on: inputs.based_on,
+    }))
+}
+
+pub fn prepare(paths: &RepoPaths, files: Vec<RepoPath>) -> Result<Confirm, String> {
+    let mut files = files
+        .into_iter()
+        .map(|path| {
+            let inputs = shell::discard::file_inputs(paths, &path)
+                .map_err(|error| format!("Cannot discard {}. {error}", path.0))?;
+            Ok((path, inputs))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if files.len() == 1 {
+        let (path, inputs) = files.remove(0);
+        return Ok(whole_file(path, inputs));
+    }
+    let (text, button) = describe_files(files.len());
+    let files = files
+        .into_iter()
+        .map(|(path, inputs)| file_event(path, inputs))
+        .collect();
+    Ok(Confirm {
+        text,
+        button,
+        what: What::Files(files),
+    })
+}
 
 /// The words for discarding `part` of `path`.
 pub fn describe(

@@ -10,7 +10,7 @@ Memungkinkan user melakukan stage, unstage, dan discard (yang tetap undoable & t
 - [x] Tulis unit/property test di `crates/core/tests/stage_props.rs` dan `crates/core/tests/discard_props.rs` serta integration test di `crates/shell/tests/staging.rs` dan `crates/shell/tests/discard.rs` untuk file binary, non-UTF-8, mode-only, dan untracked/tracked discard + undo (termasuk kasus `core.autocrlf=true` untuk discard).
 - [x] Tambah varian perintah git non-patch (`Add`, `RestoreStaged`, `RestoreWorktree`, `CleanPath` atau setara) di `crates/core/src/ops.rs`, `crates/core/src/step.rs`, dan `crates/shell/src/git.rs` dengan expected-index guard & undo snapshot.
 - [x] Implementasikan eksekusi stage/unstage/discard non-text di `crates/shell/src/staging.rs` dan `crates/shell/src/discard.rs`.
-- [ ] Hubungkan tombol checkbox/discard di `crates/app/src/staging.rs`, `crates/app/src/discard.rs`, dan `crates/app/src/repo_view.rs` agar file non-text memakai jalur non-patch (tidak lagi menampilkan notice penolakan), serta siapkan Windows checklist di Handoff notes.
+- [x] Hubungkan tombol checkbox/discard di `crates/app/src/staging.rs`, `crates/app/src/discard.rs`, dan `crates/app/src/repo_view.rs` agar file non-text memakai jalur non-patch (tidak lagi menampilkan notice penolakan), serta siapkan Windows checklist di Handoff notes.
 
 ## Definition of Done
 - `cargo xtask check --core` (VPS/CI) atau `cargo xtask check` (Windows) lulus tanpa warning.
@@ -28,3 +28,11 @@ Memungkinkan user melakukan stage, unstage, dan discard (yang tetap undoable & t
 - Tes lebih dulu mendefinisikan kontrak perintah per file, pemulihan byte index (termasuk intent-to-add), dan pemulihan worktree. Tes baru bergantung pada tipe dan runner dari task berikutnya.
 - Spec gap: apa arti discard untuk intent-to-add? Usulan: hapus file worktree seperti file untracked, pertahankan flag intent-to-add di index, dan pulihkan byte asli lewat undo.
 - Konteks awal lihat `tasks/011.DONE.md` (bagian What is unfinished) dan `tasks/013.DONE.md` (bagian What is unfinished): sebelumnya `load_inputs` mengembalikan `NotText` karena tidak ada varian `GitArgs` untuk `git add` / `git restore --staged` / `git checkout` / `git clean`.
+
+### Checklist manual Windows
+
+- Buka repo fixture dengan file binary, file berisi byte non-UTF-8, dan file teks CRLF dengan `core.autocrlf=true`. Ubah ketiganya, lalu centang file dan folder, dan coba Stage all serta Unstage all. Bandingkan isi worktree dan output `git ls-files --stage` sebelum dan setelah Undo.
+- Pilih setiap file unstaged, klik Discard file, lalu Undo. Periksa bahwa checkout mengikuti filter Git, byte yang diedit kembali persis, dan file lain tetap sama. Coba juga file baru (termasuk `git add -N`) dan file tracked yang dihapus.
+- Jalankan Discard all, ubah salah satu file dari editor setelah konfirmasi terbuka, lalu konfirmasi. Pastikan perubahan baru pada file itu selamat. Periksa file lain dan Undo satu per satu.
+- Dengan pembuatan symlink diaktifkan dan `core.symlinks=true`, ulangi stage, unstage, discard, dan undo pada symlink dengan target berbeda. Periksa target dengan `Get-Item` serta pastikan isi file target tetap sama.
+- NTFS tidak memiliki bit executable Git. Buat perubahan staged mode-only dengan `git update-index --chmod=+x -- script`, lalu verifikasi unstage dan Undo mengembalikan mode index.

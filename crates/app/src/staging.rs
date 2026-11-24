@@ -4,7 +4,10 @@
 //! index moved (rule 5).
 
 use diff::{Direction, Mode, PatchSpec, Pick, TextDiff, build_patch};
-use invoke_core::{DiscardRequest, Event, Patch, RepoPath, Selection, StageRequest};
+use invoke_core::{
+    DiscardRequest, Event, FileAction, FileRequest, IndexId, Patch, RepoPath, Selection,
+    StageRequest,
+};
 use ui::{InputsMeta, Section};
 
 /// What to stage or unstage.
@@ -13,6 +16,18 @@ pub enum Part {
     File,
     Hunk(usize),
     Lines { hunk: usize, lines: Vec<usize> },
+}
+
+pub fn file_request(section: Section, path: RepoPath, based_on: IndexId) -> Event {
+    let action = match section {
+        Section::Unstaged => FileAction::Stage,
+        Section::Staged => FileAction::Unstage,
+    };
+    Event::FileRequested(FileRequest {
+        path,
+        action,
+        based_on,
+    })
 }
 
 /// What a selection of a diff turns into: the patch and the selection that
