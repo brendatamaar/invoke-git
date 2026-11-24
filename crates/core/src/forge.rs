@@ -180,6 +180,11 @@ impl Origin {
         self.port
     }
 
+    /// Whether the scheme is https.
+    pub fn is_https(&self) -> bool {
+        self.text.starts_with("https://")
+    }
+
     pub fn is_secure(&self) -> bool {
         self.text.starts_with("https://") || is_loopback(&self.host)
     }
@@ -192,6 +197,11 @@ fn split_host_port(authority: &str) -> Option<(&str, Option<&str>)> {
             "" => Some((host, None)),
             _ => Some((host, Some(after.strip_prefix(':')?))),
         };
+    }
+    // More than one colon without brackets is an IPv6 literal written
+    // without them: ambiguous with a port, so refused.
+    if authority.matches(':').count() > 1 {
+        return None;
     }
     match authority.rsplit_once(':') {
         Some((host, port)) => Some((host, Some(port))),
@@ -291,12 +301,19 @@ impl ForgeAccount {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteTarget {
     pub host: String,
-    pub web_port: Option<u16>,
+    pub web: Option<WebEndpoint>,
 }
 
-/// The host (and web port) of a remote address, or `None` for a local path.
-/// Understands `https://u@host:port/x`, `ssh://git@host/x` and scp-style
-/// `git@host:x`.
+/// The scheme and port a web request to a remote goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WebEndpoint {
+    pub https: bool,
+    pub port: u16,
+}
+
+/// The host (and web endpoint) of a remote address, or `None` for a local path
+/// or an address whose authority is malformed. Understands
+/// `https://u@host:port/x`, `ssh://git@host/x` and scp-style `git@host:x`.
 pub fn remote_target(url: &str) -> Option<RemoteTarget> {
     let url = url.trim();
     if url.is_empty() {
@@ -322,8 +339,17 @@ pub fn remote_target(url: &str) -> Option<RemoteTarget> {
         .map_or(authority, |(_, host)| host);
     let (host, port_text) = if let Some(rest) = authority.strip_prefix('[') {
         let (host, after) = rest.split_once(']')?;
-        (host, after.strip_prefix(':'))
+        // Only `]` or `]:port` may follow; anything else is malformed.
+        match after {
+            "" => (host, None),
+            _ => (host, Some(after.strip_prefix(':')?)),
+        }
     } else if scheme.is_some() {
+        // More than one colon without brackets: an IPv6 literal written
+        // without them. Ambiguous with a port, so refused.
+        if authority.matches(':').count() > 1 {
+            return None;
+        }
         match authority.split_once(':') {
             Some((host, port)) => (host, Some(port)),
             None => (authority, None),
@@ -335,21 +361,25 @@ pub fn remote_target(url: &str) -> Option<RemoteTarget> {
     if !host.is_ascii() || host.is_empty() {
         return None;
     }
-    let web_port = match scheme.as_deref() {
-        Some(scheme @ ("http" | "https")) => Some(match port_text {
-            None | Some("") => {
-                if scheme == "https" {
-                    443
-                } else {
-                    80
+    let web = match scheme.as_deref() {
+        Some(scheme @ ("http" | "https")) => {
+            let https = scheme == "https";
+            let port = match port_text {
+                None | Some("") => {
+                    if https {
+                        443
+                    } else {
+                        80
+                    }
                 }
-            }
-            // An unreadable port matches no account.
-            Some(text) => text.parse::<u16>().unwrap_or(0),
-        }),
+                // An unreadable port matches no account.
+                Some(text) => text.parse::<u16>().unwrap_or(0),
+            };
+            Some(WebEndpoint { https, port })
+        }
         _ => None,
     };
-    Some(RemoteTarget { host, web_port })
+    Some(RemoteTarget { host, web })
 }
 
 /// The host of a remote address, lower case and without port or user, or
@@ -440,7 +470,7 @@ impl AccountBook {
 
     /// The account that serves `remote_url`.
     pub fn resolve(&self, remote_url: &str) -> Resolution {
-        let Some(RemoteTarget { host, web_port }) = remote_target(remote_url) else {
+        let Some(RemoteTarget { host, web }) = remote_target(remote_url) else {
             return Resolution::LocalPath;
         };
         let matching: Vec<&ForgeAccount> = self
@@ -448,7 +478,9 @@ impl AccountBook {
             .iter()
             .filter(|account| {
                 same_forge(account.host(), &host)
-                    && web_port.is_none_or(|port| port == account.origin.port())
+                    && web.is_none_or(|web| {
+                        web.https == account.origin.is_https() && web.port == account.origin.port()
+                    })
             })
             .collect();
         match matching.as_slice() {
@@ -918,6 +950,67 @@ mod tests {
             book.resolve("git@git.corp:x.git"),
             Resolution::Choose(list) if list.len() == 2
         ));
+    }
+
+    #[test]
+    fn a_web_remote_must_also_name_the_scheme_of_the_account() {
+        let mut book = AccountBook::default();
+        book.add(account(ForgeKind::GitLab, "https://git.corp", "ana"));
+        // Port 443 over plain http is another service, not the https account.
+        for url in [
+            "http://git.corp:443/o/r",
+            "http://git.corp/o/r",
+            "http://git.corp:80/o/r",
+        ] {
+            assert!(
+                matches!(book.resolve(url), Resolution::NoAccount { .. }),
+                "{url}"
+            );
+        }
+        assert!(matches!(
+            book.resolve("https://git.corp:443/o/r"),
+            Resolution::Use(_)
+        ));
+        let mut local = AccountBook::default();
+        local.add(account(ForgeKind::GitLab, "http://localhost:8080", "ana"));
+        assert!(matches!(
+            local.resolve("http://localhost:8080/o/r"),
+            Resolution::Use(_)
+        ));
+        assert!(matches!(
+            local.resolve("https://localhost:8080/o/r"),
+            Resolution::NoAccount { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_authorities_never_resolve_to_an_account() {
+        let mut book = AccountBook::default();
+        book.add(account(ForgeKind::GitLab, "https://[::1]:8443", "ana"));
+        book.add(account(ForgeKind::GitLab, "https://git.corp", "ana"));
+        assert!(matches!(
+            book.resolve("https://[::1]:8443/o/r"),
+            Resolution::Use(_)
+        ));
+        for url in [
+            // Junk after the closing bracket.
+            "https://[::1]8443/o/r",
+            "https://[::1]junk:8443/o/r",
+            // IPv6 without brackets is ambiguous with a port.
+            "https://::1/o/r",
+            "https://::1:8443/o/r",
+            "https://a:b:c/o/r",
+        ] {
+            assert_eq!(book.resolve(url), Resolution::LocalPath, "{url}");
+        }
+        for text in ["https://::1", "http://::1:8080", "https://a:b:c"] {
+            assert_eq!(Origin::parse(text), Err(OriginProblem::Host), "{text}");
+        }
+        assert_eq!(
+            Origin::parse("https://[::1]").unwrap().as_str(),
+            "https://[::1]"
+        );
+        assert_eq!(Origin::parse("https://[::1]").unwrap().port(), 443);
     }
 
     #[test]
