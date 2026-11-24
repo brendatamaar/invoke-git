@@ -16,7 +16,7 @@
 |----|------|--------|------------|--------------------|
 | P0 | GPUI Spike | done | - | - |
 | P1 | v0.1 Daily Driver (Tasks 1–25) | done | P0 | - |
-| P1b | Non-Text Staging & Discard | todo | P1 | P3, P5, P6, P7, P8 |
+| P1b | Non-Text Staging & Discard | in-progress | P1 | P3, P5, P6, P7, P8 |
 | P2 | Cherry-Pick & Revert | done | P1 | P3, P5, P6, P7, P8, P11 |
 | P3 | Tags (Create, Push, Delete) | done | P1 | P1b, P2, P4a, P4b, P5, P6, P7, P8, P11 |
 | P4a | Interactive Rebase Core & v0.2 Law Gate | done | P2 | P3, P5, P6, P7, P8, P11 |
@@ -24,10 +24,10 @@
 | P5 | Blame & File History | done | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
 | P6 | Commit Search | done | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
 | P7 | Reflog View | done | P1 | P1b, P2, P3, P4a, P4b, P5, P6, P8, P9, P10, P11 |
-| P8 | Forge Auth & Repo List (GitHub/GitLab) | todo | P1 | P1b, P2, P3, P4a, P4b, P5, P6, P7, P10, P11 |
+| P8 | Forge Auth & Repo List (GitHub/GitLab) | in-progress | P1 | P1b, P2, P3, P4a, P4b, P5, P6, P7, P10, P11 |
 | P9 | Pull Requests & Merge Requests | todo | P8 | P4b, P5, P6, P7, P10, P11 |
-| P10 | Worktrees, Submodules & Git LFS | todo | P1 | P4b, P5, P6, P7, P8, P9, P11 |
-| P11 | Bundled MinGit Fallback (Windows) | todo | P1 | P2, P3, P4a, P4b, P5, P6, P7, P8, P9, P10 |
+| P10 | Worktrees, Submodules & Git LFS | in-progress | P1 | P4b, P5, P6, P7, P8, P9, P11 |
+| P11 | Bundled MinGit Fallback (Windows) | in-progress | P1 | P2, P3, P4a, P4b, P5, P6, P7, P8, P9, P10 |
 | P12 | Pre-Release Dogfood & Public Release Gate | todo | P1b, P3, P4b, P5, P6, P7, P9, P10, P11 | - |
 
 ## Review Windows

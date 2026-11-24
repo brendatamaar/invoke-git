@@ -1,5 +1,5 @@
 # P1b - Non-Text Staging & Discard
-Status: todo
+Status: in-progress
 Depends on: P1
 Parallel-safe with: P3, P5, P6, P7, P8
 

@@ -1,5 +1,5 @@
 # P8 - Forge Auth & Repo List (GitHub/GitLab)
-Status: todo
+Status: in-progress
 Depends on: P1
 Parallel-safe with: P1b, P2, P3, P4a, P4b, P5, P6, P7, P10, P11
 
