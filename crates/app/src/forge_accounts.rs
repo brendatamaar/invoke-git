@@ -794,6 +794,11 @@ mod tests {
             TokenTarget::new(ForgeKind::GitLab, "https://git.cor")
         );
         assert_ne!(gitlab, TokenTarget::new(ForgeKind::GitLab, ""));
+        // The forge alone is enough to differ (GitHub vs gitlab.com).
+        assert_ne!(
+            TokenTarget::new(ForgeKind::GitHub, ""),
+            TokenTarget::new(ForgeKind::GitLab, "")
+        );
         // Spelling the same server differently is not (nothing is lost).
         assert_eq!(
             gitlab,
