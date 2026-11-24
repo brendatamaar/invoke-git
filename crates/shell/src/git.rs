@@ -419,15 +419,15 @@ pub fn invocation(args: &GitArgs) -> Invocation {
             path,
             force,
             locked,
-            prunable,
+            ..
         } => {
             argv.extend(["worktree", "remove"].map(OsString::from));
-            if *force || *prunable {
+            if *force {
                 argv.push("--force".into());
-            }
-            if *force && *locked {
-                // git requires `-f -f` to remove a locked worktree.
-                argv.push("--force".into());
+                if *locked {
+                    // git requires `-f -f` to remove a locked worktree.
+                    argv.push("--force".into());
+                }
             }
             argv.push("--".into());
             argv.push(path.into());
@@ -464,6 +464,14 @@ pub fn invocation(args: &GitArgs) -> Invocation {
             plain(argv)
         }
     }
+}
+
+/// `git worktree prune` for a linked worktree whose checkout directory is
+/// verified missing on disk at run time (never adds `--force`).
+pub(crate) fn worktree_prune_invocation() -> Invocation {
+    let mut argv: Vec<OsString> = GLOBAL_ARGS.iter().map(OsString::from).collect();
+    argv.extend(["worktree", "prune"].map(OsString::from));
+    plain(argv)
 }
 
 /// Task 23: every git run of one request, in order; the request stops at the
@@ -1159,7 +1167,8 @@ mod tests {
             path: "/wt/feat".into(),
             force: false,
             locked: false,
-            prunable: false,
+            expect_head: None,
+            expect_index: None,
         });
         assert_eq!(
             after_globals(&rm_plain),
@@ -1170,7 +1179,8 @@ mod tests {
             path: "/wt/locked".into(),
             force: true,
             locked: true,
-            prunable: false,
+            expect_head: None,
+            expect_index: None,
         });
         assert_eq!(
             after_globals(&rm_locked),
@@ -1182,6 +1192,11 @@ mod tests {
                 "--",
                 "/wt/locked"
             ]
+        );
+
+        assert_eq!(
+            after_globals(&worktree_prune_invocation()),
+            ["worktree", "prune"]
         );
 
         let sub_update = invocation(&GitArgs::Submodule {

@@ -588,6 +588,192 @@ fn worktree_add_and_remove_end_to_end_with_lock_and_ref_guards() {
 }
 
 #[test]
+fn worktree_remove_guards_target_lock_head_and_index() {
+    let sb = Sandbox::new();
+    let main = sb.init_repo("wt-guard");
+    sb.commit(&main, "a.txt", b"one\n", "c1");
+    let wt_linked = sb.root.join("wt-linked");
+    sb.git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            wt_linked.to_str().unwrap(),
+        ],
+    );
+
+    let found_main = discover(&main).unwrap();
+    let found_wt = discover(&wt_linked).unwrap();
+    let mut driver = Driver::open(found_main.paths.clone(), sb.env.clone());
+
+    // 1. Target worktree's own `index.lock` refuses removal with PreconditionChanged.
+    let wt_lock = found_wt.paths.git_dir.join("index.lock");
+    fs::write(&wt_lock, b"lock").unwrap();
+    driver.deliver(Event::WorktreeRemoveRequested {
+        path: wt_linked.to_str().unwrap().to_owned(),
+        force: true,
+    });
+    fs::remove_file(&wt_lock).unwrap();
+    match driver.outcome() {
+        Some(OpOutcome::Failed(f)) => assert_eq!(f.class, ErrorClass::PreconditionChanged),
+        other => panic!("expected PreconditionChanged for target index.lock, got {other:?}"),
+    }
+    assert!(wt_linked.is_dir());
+
+    // 2. Target worktree index changed after snapshot refuses removal.
+    driver.deliver(Event::RefreshRequested);
+    fs::write(wt_linked.join("staged.txt"), b"new\n").unwrap();
+    sb.git(&wt_linked, &["add", "staged.txt"]);
+    driver.deliver(Event::WorktreeRemoveRequested {
+        path: wt_linked.to_str().unwrap().to_owned(),
+        force: true,
+    });
+    match driver.outcome() {
+        Some(OpOutcome::Failed(f)) => {
+            assert_eq!(f.class, ErrorClass::PreconditionChanged);
+            assert!(f.details.contains("index changed"), "{}", f.details);
+        }
+        other => panic!("expected PreconditionChanged for target index drift, got {other:?}"),
+    }
+    assert!(wt_linked.is_dir());
+
+    // 3. Target worktree HEAD moved after snapshot refuses removal.
+    driver.deliver(Event::RefreshRequested);
+    sb.git(&wt_linked, &["commit", "-q", "-m", "target move"]);
+    driver.deliver(Event::WorktreeRemoveRequested {
+        path: wt_linked.to_str().unwrap().to_owned(),
+        force: true,
+    });
+    match driver.outcome() {
+        Some(OpOutcome::Failed(f)) => {
+            assert_eq!(f.class, ErrorClass::PreconditionChanged);
+            assert!(f.details.contains("HEAD moved"), "{}", f.details);
+        }
+        other => panic!("expected PreconditionChanged for target HEAD drift, got {other:?}"),
+    }
+    assert!(wt_linked.is_dir());
+}
+
+#[test]
+fn worktree_remove_never_forces_from_stale_prunable_and_prunes_missing_dir() {
+    let sb = Sandbox::new();
+    let main = sb.init_repo("wt-prunable");
+    sb.commit(&main, "a.txt", b"one\n", "c1");
+    let wt_gone = sb.root.join("wt-gone");
+    let wt_stash_dir = sb.root.join("wt-gone-unmounted");
+    sb.git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "gone-br",
+            wt_gone.to_str().unwrap(),
+        ],
+    );
+    // Simulate a removable drive / moved worktree missing when the snapshot is read.
+    fs::rename(&wt_gone, &wt_stash_dir).unwrap();
+
+    let found_main = discover(&main).unwrap();
+    let mut driver = Driver::open(found_main.paths.clone(), sb.env.clone());
+    assert!(
+        driver
+            .state
+            .fresh_disk()
+            .unwrap()
+            .advanced
+            .worktrees
+            .iter()
+            .find(|w| same_worktree_path(&w.path, wt_gone.to_str().unwrap()))
+            .unwrap()
+            .prunable
+    );
+
+    // Worktree reappears (e.g. drive remounted) with a modified file AFTER snapshot
+    // marked it prunable: non-forced remove MUST refuse and preserve the file
+    // (never inject `--force` from stale `prunable`).
+    fs::rename(&wt_stash_dir, &wt_gone).unwrap();
+    fs::write(wt_gone.join("a.txt"), b"precious\n").unwrap();
+    driver.deliver(Event::WorktreeRemoveRequested {
+        path: wt_gone.to_str().unwrap().to_owned(),
+        force: false,
+    });
+    match driver.outcome() {
+        Some(OpOutcome::Failed(f)) => assert_eq!(f.class, ErrorClass::Expected),
+        other => panic!("expected Expected refusal when dir reappeared, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(wt_gone.join("a.txt")).unwrap(),
+        "precious\n"
+    );
+
+    // When the directory truly is missing on disk, non-forced remove prunes it cleanly.
+    fs::remove_dir_all(&wt_gone).unwrap();
+    driver.deliver(Event::RefreshRequested);
+    driver.deliver(Event::WorktreeRemoveRequested {
+        path: wt_gone.to_str().unwrap().to_owned(),
+        force: false,
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(
+        driver.state.fresh_disk().unwrap().advanced.worktrees.len(),
+        1
+    );
+}
+
+#[test]
+fn worktree_remove_refuses_ignored_files_unless_forced() {
+    let sb = Sandbox::new();
+    let main = sb.init_repo("wt-ignored");
+    sb.commit(&main, ".gitignore", b".env\n", "ignore env");
+    let wt_env = sb.root.join("wt-env");
+    sb.git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "env-br",
+            wt_env.to_str().unwrap(),
+        ],
+    );
+    fs::write(wt_env.join(".env"), b"API_KEY=secret\n").unwrap();
+
+    let found_main = discover(&main).unwrap();
+    let mut driver = Driver::open(found_main.paths.clone(), sb.env.clone());
+
+    // Non-forced remove MUST refuse and list `.env`, preserving it on disk.
+    driver.deliver(Event::WorktreeRemoveRequested {
+        path: wt_env.to_str().unwrap().to_owned(),
+        force: false,
+    });
+    match driver.outcome() {
+        Some(OpOutcome::Failed(f)) => {
+            assert_eq!(f.class, ErrorClass::Expected);
+            assert!(f.details.contains(".env"), "expected .env in {}", f.details);
+        }
+        other => panic!("expected Expected refusal for ignored .env, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(wt_env.join(".env")).unwrap(),
+        "API_KEY=secret\n"
+    );
+
+    // Forced remove succeeds.
+    driver.deliver(Event::WorktreeRemoveRequested {
+        path: wt_env.to_str().unwrap().to_owned(),
+        force: true,
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+    assert!(!wt_env.exists());
+}
+
+#[test]
 fn submodule_update_init_recursive_and_sync_work_end_to_end() {
     let sb = Sandbox::new();
     let child = sb.init_repo("sub-child");

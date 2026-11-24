@@ -373,7 +373,8 @@ pub enum GitArgs {
         path: String,
         force: bool,
         locked: bool,
-        prunable: bool,
+        expect_head: Option<crate::state::Head>,
+        expect_index: Option<IndexId>,
     },
     Submodule {
         op: SubmoduleOp,

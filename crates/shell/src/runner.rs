@@ -186,6 +186,65 @@ impl Job {
         self.control.is_cancelled()
     }
 
+    /// Before a non-forced `git worktree remove`, checks the target worktree for
+    /// ignored, untracked, or modified files (`git worktree remove` alone ignores
+    /// gitignored files like `.env` and deletes them silently).
+    fn check_worktree_ignored_or_dirty(
+        &self,
+        workdir: &std::path::Path,
+        display_path: &str,
+    ) -> Option<OpOutcome> {
+        let mut command = self.git.command(workdir);
+        command
+            .args(crate::git::GLOBAL_ARGS)
+            .args([
+                "status",
+                "--porcelain=v1",
+                "--ignored=matching",
+                "--untracked-files=all",
+                "-z",
+            ])
+            .envs(self.env.iter().map(|(key, value)| (key, value)));
+        match run_child(command, None, None, &self.control) {
+            Ok(done) if done.killed && !done.success => Some(OpOutcome::Cancelled),
+            Ok(done) if !done.success => Some(failed(
+                ErrorClass::Expected,
+                format!(
+                    "Could not verify whether worktree '{display_path}' contains ignored or uncommitted files: {}",
+                    done.output.trim()
+                ),
+            )),
+            Ok(done) => {
+                let paths = crate::advanced::parse_porcelain_z_paths(&done.output);
+                if paths.is_empty() {
+                    return None;
+                }
+                let limit = 10;
+                let shown = paths
+                    .iter()
+                    .take(limit)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let suffix = if paths.len() > limit {
+                    format!(", and {} more", paths.len() - limit)
+                } else {
+                    String::new()
+                };
+                Some(failed(
+                    ErrorClass::Expected,
+                    format!(
+                        "Refused to remove worktree '{display_path}': it contains ignored, untracked, or modified files that would be lost ({shown}{suffix}). Move them or tick Force remove."
+                    ),
+                ))
+            }
+            Err(error) => Some(failed(
+                ErrorClass::Environment,
+                format!("start git: {error}"),
+            )),
+        }
+    }
+
     fn execute(self) -> OpOutcome {
         if self.cancelled() {
             return OpOutcome::Cancelled;
@@ -206,6 +265,59 @@ impl Job {
         }
         if let Err(failure) = crate::rebase::check(&self.paths, &self.args, &self.expect) {
             return OpOutcome::Failed(failure);
+        }
+        if let GitArgs::WorktreeRemove {
+            path,
+            force,
+            expect_head,
+            expect_index,
+            ..
+        } = &self.args
+        {
+            let target = match crate::advanced::check_worktree_remove_target(
+                &self.paths,
+                path,
+                expect_head.as_ref(),
+                expect_index.as_ref(),
+                *force,
+            ) {
+                Ok(t) => t,
+                Err(failure) => return OpOutcome::Failed(failure),
+            };
+            // Re-checked on disk at run time: if the checkout folder is truly
+            // missing and unlocked, clean up its admin entry with `worktree prune`
+            // rather than ever injecting `--force` from a stale snapshot.
+            if !target.dir_exists && !target.locked_on_disk {
+                return self.run_one(crate::git::worktree_prune_invocation());
+            }
+            if !*force {
+                if !target.has_git_link {
+                    return failed(
+                        ErrorClass::Expected,
+                        format!(
+                            "Refused to remove worktree '{path}': directory exists on disk without a valid .git link. Inspect its contents or tick Force remove."
+                        ),
+                    );
+                }
+                if let Some(early) = self.check_worktree_ignored_or_dirty(&target.workdir, path) {
+                    return early;
+                }
+                if self.cancelled() {
+                    return OpOutcome::Cancelled;
+                }
+                if let Err(failure) = precondition::check(&self.paths, &self.expect) {
+                    return OpOutcome::Failed(failure);
+                }
+                if let Err(failure) = crate::advanced::check_worktree_remove_target(
+                    &self.paths,
+                    path,
+                    expect_head.as_ref(),
+                    expect_index.as_ref(),
+                    *force,
+                ) {
+                    return OpOutcome::Failed(failure);
+                }
+            }
         }
         if let GitArgs::Submodule {
             op: invoke_core::SubmoduleOp::UpdateInitRecursive,

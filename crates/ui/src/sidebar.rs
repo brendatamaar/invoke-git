@@ -10,7 +10,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use invoke_core::{AdvancedSnapshot, Head, RefsSnapshot, StashEntry, SubmoduleState, Tracking};
-use tokens::{RADIUS_MD, ROW_LIST, SPACE_1, SPACE_2, TEXT_BODY, TEXT_LABEL, TEXT_SMALL};
+use tokens::{RADIUS_MD, RADIUS_SM, ROW_LIST, SPACE_1, SPACE_2, TEXT_BODY, TEXT_LABEL, TEXT_SMALL};
 
 use crate::convert::hsla;
 use crate::focus;
@@ -236,6 +236,9 @@ impl Sidebar {
 /// The room the hover buttons take, so a name is cut short instead of covered.
 const ROW_ACTIONS_W: f32 = 160.0;
 const REMOTE_ACTIONS_W: f32 = 100.0;
+/// Worktree status dot geometry from design tokens (8 px circle, 4 px radius).
+const WORKTREE_DOT_SIZE: f32 = SPACE_2;
+const WORKTREE_DOT_RADIUS: f32 = RADIUS_SM;
 
 /// The shared look of a sidebar row: focusable, with a hover group so its
 /// actions can appear.
@@ -524,7 +527,11 @@ impl RenderOnce for Sidebar {
                             let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
                             let can_open = !*current && !*prunable;
                             let can_remove = !*main && !*current;
-                            let dot = div().flex_none().size(px(8.)).rounded(px(4.)).bg(hsla(
+                            let dot = div()
+                                .flex_none()
+                                .size(px(WORKTREE_DOT_SIZE))
+                                .rounded(px(WORKTREE_DOT_RADIUS))
+                                .bg(hsla(
                                 if *current {
                                     p.accent
                                 } else if *prunable || *locked {
@@ -828,6 +835,7 @@ mod tests {
                     path: "/r".into(),
                     name: "r".into(),
                     head: Some(head("main")),
+                    index: None,
                     is_main: true,
                     is_current: true,
                     locked: None,
@@ -837,6 +845,7 @@ mod tests {
                     path: "/r-feat".into(),
                     name: "r-feat".into(),
                     head: Some(head("feat")),
+                    index: None,
                     is_main: false,
                     is_current: false,
                     locked: Some("pinned".into()),
@@ -870,5 +879,11 @@ mod tests {
                 "m libs/a [uninit]",
             ]
         );
+    }
+
+    #[test]
+    fn worktree_dot_uses_design_tokens() {
+        assert_eq!(WORKTREE_DOT_SIZE, SPACE_2);
+        assert_eq!(WORKTREE_DOT_RADIUS, RADIUS_SM);
     }
 }

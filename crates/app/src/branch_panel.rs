@@ -12,7 +12,7 @@ use gpui::{
 };
 use invoke_core::{
     BranchName, BranchStart, CommitMessage, Event, NameProblem, Oid, RefName, RepoPath, Snapshot,
-    SubmoduleOp, TagName, WorktreeSpec, same_worktree_path, validate_worktree_path,
+    SubmoduleOp, TagName, WorktreeEntry, WorktreeSpec, same_worktree_path, validate_worktree_path,
 };
 use tokens::{SPACE_2, SPACE_3, TEXT_SMALL};
 use ui::convert::hsla;
@@ -274,13 +274,7 @@ impl BranchPanel {
             Snapshot::NotRead => None,
         };
         if let Some(wt) = entry {
-            let locked = wt.locked.is_some();
-            self.form = Form::RemoveWorktree {
-                path: wt.path,
-                label: wt.name,
-                locked,
-                force: locked || wt.prunable,
-            };
+            self.form = remove_worktree_form(&wt);
             cx.notify();
         }
     }
@@ -1105,9 +1099,45 @@ impl Render for BranchPanel {
     }
 }
 
+fn remove_worktree_form(wt: &WorktreeEntry) -> Form {
+    Form::RemoveWorktree {
+        path: wt.path.clone(),
+        label: wt.name.clone(),
+        locked: wt.locked.is_some(),
+        // Never pre-select destructive Force removal, even for locked or prunable worktrees.
+        force: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_worktree_form_always_defaults_force_to_false() {
+        for (locked, prunable) in [(None, false), (Some("usb".into()), false), (None, true), (Some("usb".into()), true)] {
+            let wt = WorktreeEntry {
+                path: "/repo-wt".into(),
+                name: "repo-wt".into(),
+                head: None,
+                index: None,
+                is_main: false,
+                is_current: false,
+                locked: locked.clone(),
+                prunable,
+            };
+            let form = remove_worktree_form(&wt);
+            assert_eq!(
+                form,
+                Form::RemoveWorktree {
+                    path: "/repo-wt".into(),
+                    label: "repo-wt".into(),
+                    locked: locked.is_some(),
+                    force: false,
+                }
+            );
+        }
+    }
 
     #[test]
     fn the_local_name_drops_the_remote() {

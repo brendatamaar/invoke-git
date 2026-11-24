@@ -4,7 +4,7 @@
 //! The shell reads `.git` and worktree metadata into [`AdvancedSnapshot`] and
 //! executes CLI commands planned here through the system `git` CLI.
 
-use crate::ids::{BranchName, NameProblem, Oid, RepoPath};
+use crate::ids::{BranchName, IndexId, NameProblem, Oid, RepoPath};
 use crate::ops::{BranchStart, GitArgs, WriteRequest};
 use crate::state::{Action, DiskState, Head, Phase, Refusal};
 
@@ -34,6 +34,8 @@ pub struct WorktreeEntry {
     pub name: String,
     /// Checked-out `HEAD` inside this worktree, if readable.
     pub head: Option<Head>,
+    /// Index checksum inside this worktree, if readable (used as expected-state guard).
+    pub index: Option<IndexId>,
     /// True for the primary worktree that owns `.git/`.
     pub is_main: bool,
     /// True for the worktree currently open in this [`crate::RepoState`].
@@ -609,7 +611,8 @@ fn plan_worktree_remove(path: &str, force: bool, disk: &DiskState) -> Result<Git
         path: wt.path.clone(),
         force,
         locked: wt.locked.is_some(),
-        prunable: wt.prunable,
+        expect_head: wt.head.clone(),
+        expect_index: wt.index.clone(),
     })
 }
 

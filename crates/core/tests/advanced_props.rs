@@ -290,6 +290,7 @@ fn worktree_holding_branch_finds_checked_out_branch() {
                 name: BranchName("main".into()),
                 oid: oid.clone(),
             }),
+            index: None,
             is_main: true,
             is_current: true,
             locked: None,
@@ -299,6 +300,7 @@ fn worktree_holding_branch_finds_checked_out_branch() {
             path: "/repo-feat".into(),
             name: "repo-feat".into(),
             head: Some(Head::Detached(oid)),
+            index: None,
             is_main: false,
             is_current: false,
             locked: None,
@@ -338,6 +340,7 @@ fn sample_disk(phase: Phase, lock: LockState) -> DiskState {
                         name: BranchName("main".into()),
                         oid: oid1.clone(),
                     }),
+                    index: Some(IndexId::Checksum(oid1.clone())),
                     is_main: true,
                     is_current: true,
                     locked: None,
@@ -347,6 +350,7 @@ fn sample_disk(phase: Phase, lock: LockState) -> DiskState {
                     path: "/repo-locked".into(),
                     name: "repo-locked".into(),
                     head: Some(Head::Detached(oid2.clone())),
+                    index: Some(IndexId::Checksum(oid2.clone())),
                     is_main: false,
                     is_current: false,
                     locked: Some("pinned".into()),
@@ -674,4 +678,28 @@ fn worktree_submodule_and_lfs_refusals_cover_edge_cases() {
     };
     assert_eq!(args.expected_refs().len(), 1);
     assert_eq!(args.expected_refs()[0].oid, None);
+
+    // WorktreeRemove carries target HEAD and index expectations from the snapshot.
+    let (_, rm_cmds) = step(
+        opened(sample_disk(Phase::Clean, LockState::Free)),
+        Event::WorktreeRemoveRequested {
+            path: "/repo-locked".into(),
+            force: true,
+        },
+    );
+    let oid2 = Oid::from_hex(&"2".repeat(40)).unwrap();
+    let Some(Command::RunGit {
+        args:
+            GitArgs::WorktreeRemove {
+                expect_head,
+                expect_index,
+                ..
+            },
+        ..
+    }) = rm_cmds.first()
+    else {
+        panic!("expected WorktreeRemove RunGit: {rm_cmds:?}");
+    };
+    assert_eq!(*expect_head, Some(Head::Detached(oid2.clone())));
+    assert_eq!(*expect_index, Some(IndexId::Checksum(oid2)));
 }

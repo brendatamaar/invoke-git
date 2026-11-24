@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use gix::bstr::ByteSlice;
 use invoke_core::{
-    AdvancedSnapshot, ErrorClass, Failure, Head, LfsFile, LfsFileState, LfsPointer, LfsSnapshot,
-    MAX_LFS_POINTER_BYTES, RepoPath, StatusSnapshot, SubmoduleEntry, WorktreeEntry,
+    AdvancedSnapshot, ErrorClass, Failure, Head, IndexId, LfsFile, LfsFileState, LfsPointer,
+    LfsSnapshot, MAX_LFS_POINTER_BYTES, RepoPath, StatusSnapshot, SubmoduleEntry, WorktreeEntry,
     classify_submodule_state, gitattributes_uses_lfs, normalize_worktree_path, parse_lfs_pointer,
     same_worktree_path,
 };
@@ -150,6 +150,7 @@ fn read_worktrees(repo: &gix::Repository, paths: &RepoPaths) -> Vec<WorktreeEntr
     let current_wd = clean_absolute(&paths.workdir);
     let current_str = current_wd.to_string_lossy().into_owned();
     let case_insensitive = cfg!(any(windows, target_os = "macos"));
+    let hash_len = repo.object_hash().len_in_bytes();
 
     let mut result = Vec::new();
 
@@ -160,11 +161,13 @@ fn read_worktrees(repo: &gix::Repository, paths: &RepoPaths) -> Vec<WorktreeEntr
         let main_path = clean_absolute(main_wd);
         let main_str = main_path.to_string_lossy().into_owned();
         let head = precondition::read_head(&main_repo).ok();
+        let index = precondition::index_id(&main_repo.git_dir().join("index"), hash_len).ok();
         let is_current = same_worktree_path(&main_str, &current_str);
         result.push(WorktreeEntry {
             name: folder_name(&main_path, "main"),
             path: main_str,
             head,
+            index,
             is_main: true,
             is_current,
             locked: None,
@@ -175,10 +178,12 @@ fn read_worktrees(repo: &gix::Repository, paths: &RepoPaths) -> Vec<WorktreeEntr
         &common_dir.to_string_lossy(),
     ) {
         let head = precondition::read_head(repo).ok();
+        let index = precondition::index_id(&paths.git_dir.join("index"), hash_len).ok();
         result.push(WorktreeEntry {
             name: folder_name(&current_wd, "main"),
             path: current_str.clone(),
             head,
+            index,
             is_main: true,
             is_current: true,
             locked: None,
@@ -196,29 +201,8 @@ fn read_worktrees(repo: &gix::Repository, paths: &RepoPaths) -> Vec<WorktreeEntr
                 continue;
             }
             let admin_id = entry.file_name().to_string_lossy().into_owned();
-            let Ok(gitdir_raw) = fs::read_to_string(wt_git_dir.join("gitdir")) else {
+            let Some((wt_root, gitfile_path)) = resolve_linked_worktree_root(&wt_git_dir) else {
                 continue;
-            };
-            let gitdir_trimmed = gitdir_raw.trim();
-            if gitdir_trimmed.is_empty() {
-                continue;
-            }
-            let gitfile_raw = PathBuf::from(gitdir_trimmed);
-            let gitfile_path = if gitfile_raw.is_relative() {
-                clean_absolute(&wt_git_dir.join(gitfile_raw))
-            } else {
-                clean_absolute(&gitfile_raw)
-            };
-            let wt_root = if gitfile_path
-                .file_name()
-                .is_some_and(|n| n.eq_ignore_ascii_case(".git"))
-            {
-                gitfile_path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| gitfile_path.clone())
-            } else {
-                gitfile_path.clone()
             };
             let wt_str = wt_root.to_string_lossy().into_owned();
             let locked = fs::read_to_string(wt_git_dir.join("locked"))
@@ -228,11 +212,13 @@ fn read_worktrees(repo: &gix::Repository, paths: &RepoPaths) -> Vec<WorktreeEntr
             let head = gix::open_opts(&wt_git_dir, precondition::options())
                 .ok()
                 .and_then(|wt_repo| precondition::read_head(&wt_repo).ok());
+            let index = precondition::index_id(&wt_git_dir.join("index"), hash_len).ok();
             let is_current = same_worktree_path(&wt_str, &current_str);
             linked.push(WorktreeEntry {
                 name: folder_name(&wt_root, &admin_id),
                 path: wt_str,
                 head,
+                index,
                 is_main: false,
                 is_current,
                 locked,
@@ -244,6 +230,149 @@ fn read_worktrees(repo: &gix::Repository, paths: &RepoPaths) -> Vec<WorktreeEntr
     }
 
     result
+}
+
+fn resolve_linked_worktree_root(wt_git_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let gitdir_raw = fs::read_to_string(wt_git_dir.join("gitdir")).ok()?;
+    let gitdir_trimmed = gitdir_raw.trim();
+    if gitdir_trimmed.is_empty() {
+        return None;
+    }
+    let gitfile_raw = PathBuf::from(gitdir_trimmed);
+    let gitfile_path = if gitfile_raw.is_relative() {
+        clean_absolute(&wt_git_dir.join(gitfile_raw))
+    } else {
+        clean_absolute(&gitfile_raw)
+    };
+    let wt_root = if gitfile_path
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case(".git"))
+    {
+        gitfile_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| gitfile_path.clone())
+    } else {
+        gitfile_path.clone()
+    };
+    Some((wt_root, gitfile_path))
+}
+
+/// Fresh on-disk state of a linked worktree about to be removed.
+pub(crate) struct WorktreeRemoveTarget {
+    pub workdir: PathBuf,
+    pub dir_exists: bool,
+    pub has_git_link: bool,
+    pub locked_on_disk: bool,
+}
+
+/// P10: guards the target linked worktree itself before removal (Law 12):
+/// verifies its `index.lock`, its expected `HEAD` and `index` from the snapshot,
+/// its lock state, and checks on disk whether its directory actually exists.
+pub(crate) fn check_worktree_remove_target(
+    paths: &RepoPaths,
+    target_path: &str,
+    expect_head: Option<&Head>,
+    expect_index: Option<&IndexId>,
+    force: bool,
+) -> Result<WorktreeRemoveTarget, Failure> {
+    let refuse = |details: String| Failure {
+        class: ErrorClass::PreconditionChanged,
+        details,
+    };
+    let repo = precondition::open(paths).map_err(|details| Failure {
+        class: ErrorClass::Bug,
+        details,
+    })?;
+    let common_dir = clean_absolute(repo.common_dir());
+    let hash_len = repo.object_hash().len_in_bytes();
+    let worktrees_dir = common_dir.join("worktrees");
+
+    let mut found = None;
+    if let Ok(entries) = fs::read_dir(&worktrees_dir) {
+        for entry in entries.flatten() {
+            let wt_git_dir = entry.path();
+            if !wt_git_dir.is_dir() {
+                continue;
+            }
+            let Some((wt_root, gitfile_path)) = resolve_linked_worktree_root(&wt_git_dir) else {
+                continue;
+            };
+            let wt_str = wt_root.to_string_lossy();
+            if same_worktree_path(&wt_str, target_path) {
+                found = Some((wt_git_dir, wt_root, gitfile_path));
+                break;
+            }
+        }
+    }
+
+    let Some((wt_git_dir, wt_root, gitfile_path)) = found else {
+        return Err(refuse(format!(
+            "target worktree {target_path} is no longer registered"
+        )));
+    };
+
+    let lock = wt_git_dir.join("index.lock");
+    if lock.exists() {
+        return Err(refuse(format!(
+            "{} exists: another git process is running in worktree {}",
+            lock.display(),
+            target_path
+        )));
+    }
+
+    let locked_on_disk = wt_git_dir.join("locked").exists();
+    if locked_on_disk && !force {
+        return Err(refuse(format!(
+            "target worktree {target_path} is locked; tick Force remove to remove it"
+        )));
+    }
+
+    let found_head = gix::open_opts(&wt_git_dir, precondition::options())
+        .ok()
+        .and_then(|wt_repo| precondition::read_head(&wt_repo).ok());
+    if found_head.as_ref() != expect_head {
+        return Err(refuse(format!(
+            "target worktree HEAD moved: expected {expect_head:?}, found {found_head:?}"
+        )));
+    }
+
+    let found_index = precondition::index_id(&wt_git_dir.join("index"), hash_len).ok();
+    if found_index.as_ref() != expect_index {
+        return Err(refuse(format!(
+            "target worktree index changed: expected {expect_index:?}, found {found_index:?}"
+        )));
+    }
+
+    Ok(WorktreeRemoveTarget {
+        dir_exists: wt_root.exists(),
+        has_git_link: gitfile_path.exists(),
+        workdir: wt_root,
+        locked_on_disk,
+    })
+}
+
+/// Parses paths from `git status --porcelain=v1 --ignored=matching --untracked-files=all -z`.
+pub(crate) fn parse_porcelain_z_paths(output: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut iter = output.split('\0');
+    while let Some(entry) = iter.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let bytes = entry.as_bytes();
+        let x = bytes[0];
+        let y = bytes[1];
+        let path = &entry[3..];
+        if !path.is_empty() {
+            paths.push(path.to_owned());
+        }
+        // Renames/copies emit a second NUL-terminated path (the original path).
+        if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
+            let _ = iter.next();
+        }
+    }
+    paths
 }
 
 fn read_submodules(worktree_repo: &gix::Repository, paths: &RepoPaths) -> Vec<SubmoduleEntry> {
