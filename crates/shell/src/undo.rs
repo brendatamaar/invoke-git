@@ -476,13 +476,20 @@ impl UndoRunner {
         let mut child = command
             .spawn()
             .map_err(|error| format!("start git: {error}"))?;
-        if let (Some(mut pipe), Some(bytes)) = (child.stdin.take(), stdin) {
-            // Small scripts only: the pipe buffer takes them whole.
-            let _ = pipe.write_all(bytes);
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("wait for git: {error}"))?;
+        // stdin is written on its own thread while `wait_with_output` drains
+        // stdout and stderr: git may write a lot (`GIT_TRACE`, a large
+        // index's errors) before it reads all of stdin, and a full pipe on
+        // each side would block both forever. Dropping the pipe at the end
+        // closes git's stdin.
+        let output = std::thread::scope(|scope| {
+            if let (Some(mut pipe), Some(bytes)) = (child.stdin.take(), stdin) {
+                scope.spawn(move || {
+                    let _ = pipe.write_all(bytes);
+                });
+            }
+            child.wait_with_output()
+        })
+        .map_err(|error| format!("wait for git: {error}"))?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         } else {
@@ -628,5 +635,57 @@ mod reconcile_tests {
                 prop_assert_eq!(op_of_ref(&name), Some(op));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    /// Cross review: git may write a lot to stderr (`GIT_TRACE`, hooks)
+    /// before it reads stdin. Writing all of stdin first would then block
+    /// both sides forever.
+    #[test]
+    fn big_stdin_and_chatty_stderr_do_not_deadlock() {
+        let dir = std::env::temp_dir().join(format!(
+            "invoke-git-undo-run-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let global = dir.join("gitconfig");
+        fs::write(&global, "").unwrap();
+        let runner = UndoRunner::new(
+            Git::detect("git").unwrap(),
+            RepoPaths {
+                git_dir: dir.join(".git"),
+                workdir: dir.clone(),
+            },
+        )
+        .with_env([
+            (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+            (OsString::from("GIT_CONFIG_GLOBAL"), global.into_os_string()),
+        ]);
+        let size = 4 << 20;
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let alias = "!i=0; while [ $i -lt 4000 ]; do \
+                 echo 0123456789012345678901234567890123456789012345678901234567890 >&2; \
+                 i=$((i+1)); done; wc -c";
+            let env: [(&str, &std::ffi::OsStr); 3] = [
+                ("GIT_CONFIG_COUNT", "1".as_ref()),
+                ("GIT_CONFIG_KEY_0", "alias.noisy".as_ref()),
+                ("GIT_CONFIG_VALUE_0", alias.as_ref()),
+            ];
+            let _ = send.send(runner.run(&["noisy"], &env, Some(&vec![b'x'; size])));
+        });
+        let result = receive
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the runner and git deadlocked");
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(result.unwrap().trim(), size.to_string());
     }
 }
