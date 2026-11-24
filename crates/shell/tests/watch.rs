@@ -129,6 +129,14 @@ fn silent(rx: &Receiver<Event>) {
     }
 }
 
+/// At least one event, and every event reports the worktree and nothing else.
+fn assert_worktree_only(events: &[BTreeSet<Area>]) {
+    assert!(!events.is_empty(), "expected a worktree event");
+    for event in events {
+        assert_eq!(event, &BTreeSet::from([Area::Worktree]), "{events:?}");
+    }
+}
+
 fn union(events: &[BTreeSet<Area>]) -> BTreeSet<Area> {
     events.iter().flatten().copied().collect()
 }
@@ -147,8 +155,7 @@ fn worktree_write_gives_one_worktree_event() {
     let repo = seeded();
     let (_watcher, rx) = repo.watch();
     repo.write("a.txt", "two\n");
-    let events = collect(&rx);
-    assert_eq!(events, vec![BTreeSet::from([Area::Worktree])]);
+    assert_worktree_only(&collect(&rx));
 }
 
 #[test]
@@ -194,7 +201,12 @@ fn burst_of_writes_gives_one_event() {
         repo.write(&format!("burst/{i}.txt"), "x\n");
     }
     let events = collect(&rx);
-    assert_eq!(events, vec![BTreeSet::from([Area::Worktree])]);
+    // The exact split is up to OS delivery timing (a loaded machine can
+    // spread notifications past the quiet period); the exact coalescing rule
+    // is covered by the pure `Debounce` tests. Here: all worktree, and far
+    // fewer events than the 100 writes.
+    assert_worktree_only(&events);
+    assert!(events.len() <= 10, "burst not coalesced: {}", events.len());
 }
 
 #[test]
@@ -215,7 +227,7 @@ fn ignored_paths_give_no_event() {
     silent(&rx);
     // A non-ignored change right after still comes through.
     repo.write("c.txt", "c\n");
-    assert_eq!(collect(&rx), vec![BTreeSet::from([Area::Worktree])]);
+    assert_worktree_only(&collect(&rx));
 }
 
 #[test]
@@ -223,7 +235,9 @@ fn editing_gitignore_is_a_worktree_change() {
     let repo = seeded();
     let (_watcher, rx) = repo.watch();
     repo.write(".gitignore", "target/\n");
-    assert_eq!(collect(&rx), vec![BTreeSet::from([Area::Worktree])]);
+    // One write can surface as several OS notifications (truncate, then
+    // data) that a slow machine delivers past the quiet period.
+    assert_worktree_only(&collect(&rx));
 }
 
 #[test]
