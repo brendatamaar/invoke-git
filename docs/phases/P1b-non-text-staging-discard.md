@@ -1,5 +1,5 @@
 # P1b - Non-Text Staging & Discard
-Status: in-progress
+Status: review
 Depends on: P1
 Parallel-safe with: P3, P5, P6, P7, P8
 
@@ -22,12 +22,16 @@ Memungkinkan user melakukan stage, unstage, dan discard (yang tetap undoable & t
 - Combined single undo point untuk multi-file `Stage all` / `Discard all` (opsional nanti).
 
 ## Handoff notes
-- Review implementasi: snapshot index juga menyimpan tree staged agar blob tetap hidup saat Git prune, serta shared index agar split index dapat dipulihkan. Versi untuk Discard all dicatat sebelum konfirmasi dan harus berasal dari satu index.
+- `cargo xtask check` lulus di Windows, termasuk Clippy dengan `-D warnings`, 256 urutan model-based, dan compile check UI. Kedua suite fase lulus dengan 25 tes core dan 46 tes shell. `cargo build -p app` juga lulus.
+- Gate yang lulus memakai `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`, dan `CARGO_INCREMENTAL=0` untuk menghemat disk setelah MSVC gagal menulis PDB. Cakupan tes dan jumlah urutan model-based tetap default.
+- Fixture Windows untuk emulasi symlink lulus. Fixture symlink native dilewati karena akun Windows ini mengembalikan error 1314. Checklist manual di bawah mencakup verifikasi UI dan symlink native dengan hak pembuatan symlink.
+- Timestamp index dipertahankan saat disalin untuk operasi Git dan saat undo memulihkan index. Tes undo intent-to-add membandingkan byte serta timestamp.
+- Snapshot index juga menyimpan tree staged agar blob tetap hidup saat Git prune, serta shared index agar split index dapat dipulihkan. Versi untuk Discard all dicatat sebelum konfirmasi dan berasal dari satu index.
 - Shell menjalankan add/restore staged pada salinan index sambil memegang `index.lock`. Discard menyiapkan checkout dengan filter Git, mencatat hasilnya untuk undo sebelum mengganti file, dan menjaga index persis. Snapshot file menyimpan mode Git, termasuk symlink. Tes fokus binary/non-UTF-8, intent-to-add, dan CRLF lulus di Windows.
-- Spec gap: atribut filesystem di luar mode Git (misalnya ACL atau bit izin selain executable) tidak dicakup model undo. Usulan: pertahankan cakupan byte, tipe, target symlink, dan mode Git yang didefinisikan spesifikasi.
+- Atribut filesystem seperti ACL atau bit izin selain executable berada di luar cakupan mode Git. Usulan untuk celah spesifikasi ini adalah mempertahankan cakupan byte, tipe, target symlink, dan mode Git.
 - Core menjadwalkan aksi file melalui antrean tulis. Stage/unstage menyimpan byte index sebagai blob agar flag intent-to-add dan index yang semula absen dapat dipulihkan. Kedua property test baru gagal saat guard expected-index sengaja dibalik, lalu perubahan tersebut dikembalikan.
 - Tes lebih dulu mendefinisikan kontrak perintah per file, pemulihan byte index (termasuk intent-to-add), dan pemulihan worktree. Tes baru bergantung pada tipe dan runner dari task berikutnya.
-- Spec gap: apa arti discard untuk intent-to-add? Usulan: hapus file worktree seperti file untracked, pertahankan flag intent-to-add di index, dan pulihkan byte asli lewat undo.
+- Untuk celah spesifikasi discard intent-to-add, file worktree dihapus seperti file untracked. Flag intent-to-add tetap di index dan undo memulihkan byte asli.
 - Konteks awal lihat `tasks/011.DONE.md` (bagian What is unfinished) dan `tasks/013.DONE.md` (bagian What is unfinished): sebelumnya `load_inputs` mengembalikan `NotText` karena tidak ada varian `GitArgs` untuk `git add` / `git restore --staged` / `git checkout` / `git clean`.
 
 ### Checklist manual Windows
