@@ -34,10 +34,10 @@ Memungkinkan user melakukan stage, unstage, dan discard (yang tetap undoable & t
 - Untuk celah spesifikasi discard intent-to-add, file worktree dihapus seperti file untracked. Flag intent-to-add tetap di index dan undo memulihkan byte asli.
 - Cross review fixes (review Gemini, 2026-11-24). Semua temuan diverifikasi dulu. Tes baru gagal di kode lama, kecuali yang dicatat:
   - (1) `is_link` memakai atribut reparse apa pun. Sekarang hanya name surrogate (symlink, junction) via `FileType` std. Tes unit Windows memasang tag pihak ketiga non-surrogate pada folder dan file, sementara junction tetap ditolak.
-  - (2) Rename gagal di atas file read-only (os error 5, terbukti). `install_file` kini menghapus target yang sudah di-snapshot lalu mengulang rename. Tes junction sebagai leaf sudah lulus di kode lama, jadi bagian symlink direktori belum terbukti di mesin ini (error 1314).
-  - (3) Symlink direktori dibuat sebagai symlink file di scratch. `fix_link_kind` membuat ulang link dengan jenis dari target relatif ke worktree asli. Tesnya dilewati di sini karena error 1314, jadi perlu checklist manual.
+  - (2) Rename gagal di atas file read-only (os error 5). Fallback memindahkan file lama ke direktori backup privat. Jika pemasangan gagal, fallback mengembalikan file lama atau menyimpan lokasinya untuk pemulihan, sambil menjaga file lain yang muncul di target. Fixture ACL dan nama `previous` mencakup kegagalan rename serta benturan nama backup.
+  - (3) `fix_link_kind` memilih symlink direktori untuk target relatif yang menunjuk ke folder biasa di worktree. Fixture untuk batas path lulus. Fixture symlink direktori native memerlukan hak pembuatan symlink (error 1314 di mesin ini).
   - (4) Path scratch berlipat ganda dan gagal "Filename too long" (terbukti). Scratch kini di root worktree dan `checkout-index` privat memakai `-c core.longpaths=true`.
-  - (5) `UndoRunner::run` deadlock dengan stdin 4 MB dan stderr besar (terbukti, timeout). Stdin kini ditulis di thread scoped sambil output dikuras.
+  - (5) `UndoRunner::run` deadlock dengan stdin 4 MB dan stderr besar (terbukti, timeout). Stdin ditulis di thread scoped sambil output dikuras. Penyimpanan blob undo juga memeriksa ID hasil untuk mendeteksi input yang dipotong.
   - (6) Unstage menolak saat folder induk di worktree jadi file (terbukti). Unstage kini hanya memeriksa teks path (`check_repo_path`).
   - (7) Beda huruf (`foo.txt` vs `Foo.txt`) di-hash sebagai file yang sama (terbukti). Leaf dicek dengan `FindFirstFileW` dan ditolak sebagai `PreconditionChanged`.
   - (8) Persiapan Discard file/all memakai counter diff yang dinaikkan tiap watcher read. Kini memakai `discard::Preparing`, yang hanya dibatalkan oleh cancel atau konfirmasi yang lebih baru.
