@@ -1,10 +1,11 @@
 //! Reading the two sides of a file and diffing them, off the UI thread.
 
 use diff::{DiffOptions, diff_text};
-use invoke_core::{Event, RepoPath};
+use invoke_core::{Event, LfsFile, LfsFileState, RepoPath, format_byte_size};
+use shell::advanced::inspect_lfs_file;
 use shell::precondition::RepoPaths;
 use shell::{DiffInputs, InputsError, Source, load_inputs};
-use ui::{DiffData, InputsMeta, Section, StageMode, diff_view};
+use ui::{DiffData, InputsMeta, LfsDiffInfo, Section, StageMode, diff_view};
 
 use crate::staging::{self, Part};
 
@@ -50,8 +51,30 @@ fn read(paths: &RepoPaths, path: &RepoPath, section: Section) -> Result<DiffInpu
     Err("The repository kept changing while the file was read. Try again.".into())
 }
 
+/// Formats Git LFS metadata for the diff viewer badge and banner (P10).
+pub fn lfs_diff_info(file: &LfsFile) -> LfsDiffInfo {
+    let state = match file.state {
+        LfsFileState::Pointer => "Git LFS pointer (not downloaded)",
+        LfsFileState::Downloaded => "Git LFS file (downloaded)",
+        LfsFileState::Missing => "Git LFS file (missing from worktree)",
+    };
+    let summary = match &file.pointer {
+        Some(ptr) => format!(
+            "{state} · {} · sha256:{}",
+            format_byte_size(ptr.size),
+            ptr.short_oid()
+        ),
+        None => state.to_owned(),
+    };
+    LfsDiffInfo {
+        summary: summary.into(),
+        is_pointer: file.state == LfsFileState::Pointer,
+    }
+}
+
 /// Reads `path` for `section` and diffs it for the viewer.
 pub fn load(paths: &RepoPaths, path: &RepoPath, section: Section) -> Loaded {
+    let lfs = inspect_lfs_file(paths, path).as_ref().map(lfs_diff_info);
     match read(paths, path, section) {
         Ok(inputs) => {
             let mut data = diff_view::compute(
@@ -64,9 +87,16 @@ pub fn load(paths: &RepoPaths, path: &RepoPath, section: Section) -> Loaded {
                 Section::Staged => StageMode::Unstage,
             };
             data.inputs = Some(meta(&inputs));
+            data.lfs = lfs;
             Loaded::Diff(Box::new(data))
         }
-        Err(message) => Loaded::Message(message),
+        Err(message) => {
+            if let Some(lfs) = lfs {
+                Loaded::Message(format!("{}. There is no text diff to show.", lfs.summary))
+            } else {
+                Loaded::Message(message)
+            }
+        }
     }
 }
 

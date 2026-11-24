@@ -8,8 +8,8 @@ use invoke_core::watch::WatchRoots;
 use invoke_core::{
     Action, AdvancedSnapshot, Area, BranchName, BranchStart, Command, Conflicts, DiskState, Event,
     GitArgs, Head, IndexId, LFS_SPEC_VERSION, LfsFile, LfsFileState, LfsPointer, LfsRefusal,
-    LfsSnapshot, LockState, MAX_LFS_POINTER_BYTES, Notice, Oid, OpOutcome, OpPhase, Phase,
-    RefName, RefsSnapshot, Refusal, RepoId, RepoPath, RepoState, StatusSnapshot, SubmoduleEntry,
+    LfsSnapshot, LockState, MAX_LFS_POINTER_BYTES, Notice, Oid, OpOutcome, OpPhase, Phase, RefName,
+    RefsSnapshot, Refusal, RepoId, RepoPath, RepoState, StatusSnapshot, SubmoduleEntry,
     SubmoduleOp, SubmoduleRefusal, SubmoduleState, WorktreeCheckout, WorktreeEntry,
     WorktreeRefusal, WorktreeSpec, classify_submodule_state, format_byte_size,
     gitattributes_uses_lfs, normalize_worktree_path, open, parse_lfs_pointer, step,
@@ -217,9 +217,8 @@ fn opening_a_repo_starts_with_a_full_read_command() {
 #[test]
 fn lfs_pointer_supports_extensions_and_rejects_duplicates() {
     let oid = "a".repeat(64);
-    let with_ext = format!(
-        "version {LFS_SPEC_VERSION}\next-0-foo sha256:{oid}\noid sha256:{oid}\nsize 42\n"
-    );
+    let with_ext =
+        format!("version {LFS_SPEC_VERSION}\next-0-foo sha256:{oid}\noid sha256:{oid}\nsize 42\n");
     assert_eq!(
         parse_lfs_pointer(with_ext.as_bytes()),
         Some(LfsPointer {

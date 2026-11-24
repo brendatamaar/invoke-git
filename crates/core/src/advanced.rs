@@ -191,11 +191,7 @@ pub fn parse_lfs_pointer(bytes: &[u8]) -> Option<LfsPointer> {
                     return None;
                 }
                 let hex = value.strip_prefix("sha256:")?;
-                if hex.len() != 64
-                    || !hex
-                        .bytes()
-                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-                {
+                if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
                     return None;
                 }
                 oid_sha256 = Some(hex.to_owned());

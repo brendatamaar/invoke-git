@@ -41,11 +41,7 @@ pub(crate) fn read_advanced(
 ///
 /// Not called during `read_state`; used on demand by callers/UI/tests so
 /// routine state refreshes never spawn child processes.
-pub fn git_lfs_version(
-    git: &Git,
-    workdir: &Path,
-    env: &[(OsString, OsString)],
-) -> Option<String> {
+pub fn git_lfs_version(git: &Git, workdir: &Path, env: &[(OsString, OsString)]) -> Option<String> {
     let mut cmd = git.command(workdir);
     cmd.args(["lfs", "version"])
         .envs(env.iter().map(|(k, v)| (k, v)))
@@ -345,9 +341,7 @@ fn read_lfs(
         outcome.initialize_with_selection(&Default::default(), ["filter"]);
         for entry in index.entries() {
             use gix::index::entry::Mode;
-            if entry.stage_raw() != 0
-                || !matches!(entry.mode, Mode::FILE | Mode::FILE_EXECUTABLE)
-            {
+            if entry.stage_raw() != 0 || !matches!(entry.mode, Mode::FILE | Mode::FILE_EXECUTABLE) {
                 continue;
             }
             let rel = entry.path(index);

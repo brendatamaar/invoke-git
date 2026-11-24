@@ -1103,7 +1103,14 @@ mod tests {
         });
         assert_eq!(
             after_globals(&add_existing),
-            ["worktree", "add", "--no-guess-remote", "--", "/wt/feat", "feat"]
+            [
+                "worktree",
+                "add",
+                "--no-guess-remote",
+                "--",
+                "/wt/feat",
+                "feat"
+            ]
         );
 
         let add_new = invocation(&GitArgs::WorktreeAdd {
@@ -1115,7 +1122,15 @@ mod tests {
         });
         assert_eq!(
             after_globals(&add_new),
-            ["worktree", "add", "-b", "topic", "--", "/wt/new", &oid.to_string()]
+            [
+                "worktree",
+                "add",
+                "-b",
+                "topic",
+                "--",
+                "/wt/new",
+                &oid.to_string()
+            ]
         );
 
         let add_detach = invocation(&GitArgs::WorktreeAdd {
@@ -1124,7 +1139,14 @@ mod tests {
         });
         assert_eq!(
             after_globals(&add_detach),
-            ["worktree", "add", "--detach", "--", "/wt/det", &oid.to_string()]
+            [
+                "worktree",
+                "add",
+                "--detach",
+                "--",
+                "/wt/det",
+                &oid.to_string()
+            ]
         );
 
         let rm_plain = invocation(&GitArgs::WorktreeRemove {
@@ -1146,7 +1168,14 @@ mod tests {
         });
         assert_eq!(
             after_globals(&rm_locked),
-            ["worktree", "remove", "--force", "--force", "--", "/wt/locked"]
+            [
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                "--",
+                "/wt/locked"
+            ]
         );
 
         let sub_update = invocation(&GitArgs::Submodule {
@@ -1155,14 +1184,24 @@ mod tests {
         });
         assert_eq!(
             after_globals(&sub_update),
-            ["submodule", "update", "--init", "--recursive", "--", "libs/child"]
+            [
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+                "--",
+                "libs/child"
+            ]
         );
 
         let sub_sync = invocation(&GitArgs::Submodule {
             op: SubmoduleOp::SyncRecursive,
             path: None,
         });
-        assert_eq!(after_globals(&sub_sync), ["submodule", "sync", "--recursive"]);
+        assert_eq!(
+            after_globals(&sub_sync),
+            ["submodule", "sync", "--recursive"]
+        );
 
         let lfs_all = invocation(&GitArgs::LfsPull { path: None });
         assert_eq!(after_globals(&lfs_all), ["lfs", "pull"]);

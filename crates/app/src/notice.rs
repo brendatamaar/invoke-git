@@ -116,7 +116,9 @@ fn worktree_text(problem: &WorktreeRefusal) -> String {
         WorktreeRefusal::EmptyPath => "Choose a folder path for the worktree.".into(),
         WorktreeRefusal::InvalidPath => "That folder path is not valid for a worktree.".into(),
         WorktreeRefusal::InvalidBranch(_) => "That is not a valid branch name.".into(),
-        WorktreeRefusal::NoCommitsYet => "There are no commits yet to create a worktree from.".into(),
+        WorktreeRefusal::NoCommitsYet => {
+            "There are no commits yet to create a worktree from.".into()
+        }
         WorktreeRefusal::AlreadyExists => "A worktree already exists at that path.".into(),
         WorktreeRefusal::BranchAlreadyExists(name) => {
             format!("A branch named {} already exists.", name.0)
@@ -126,7 +128,10 @@ fn worktree_text(problem: &WorktreeRefusal) -> String {
         }
         WorktreeRefusal::NoSuchBranch(name) => format!("There is no branch named {}.", name.0),
         WorktreeRefusal::BranchCheckedOut(name) => {
-            format!("Branch {} is already checked out in another worktree.", name.0)
+            format!(
+                "Branch {} is already checked out in another worktree.",
+                name.0
+            )
         }
         WorktreeRefusal::NotFound => "That worktree is no longer listed.".into(),
         WorktreeRefusal::CannotRemoveMain => "The main worktree cannot be removed.".into(),

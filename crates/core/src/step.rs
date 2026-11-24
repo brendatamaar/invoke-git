@@ -204,7 +204,9 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         Event::WorktreeRemoveRequested { path, force } => {
             match advanced::validate_worktree_path(&path) {
                 Ok(path) => enqueue(&mut state, WriteRequest::WorktreeRemove { path, force }),
-                Err(why) => refuse_because(&mut state, Action::WorktreeRemove, Refusal::Worktree(why)),
+                Err(why) => {
+                    refuse_because(&mut state, Action::WorktreeRemove, Refusal::Worktree(why))
+                }
             }
         }
         Event::SubmoduleRequested { op, path } => {

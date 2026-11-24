@@ -22,7 +22,9 @@ use invoke_core::{
 use shell::advanced::{git_lfs_version, inspect_lfs_file};
 use shell::precondition::RepoPaths;
 use shell::read::read_event;
-use shell::{Git, GitRunner, InputsError, Source, StagingRunner, discover, load_inputs, read_state};
+use shell::{
+    Git, GitRunner, InputsError, Source, StagingRunner, discover, load_inputs, read_state,
+};
 
 /// An isolated temporary directory for fixture repos, deleted on drop.
 struct Sandbox {
@@ -264,7 +266,13 @@ fn submodule_status_detects_clean_uninitialized_out_of_sync_and_dirty() {
     sb.commit(&super_repo, "README.md", b"hello\n", "super initial");
     sb.git(
         &super_repo,
-        &["submodule", "add", "-q", child.to_str().unwrap(), "libs/child"],
+        &[
+            "submodule",
+            "add",
+            "-q",
+            child.to_str().unwrap(),
+            "libs/child",
+        ],
     );
     sb.git(&super_repo, &["commit", "-q", "-m", "add submodule"]);
 
@@ -341,7 +349,14 @@ fn lfs_detection_works_for_pointer_downloaded_and_missing_without_git_lfs() {
     );
     // Simulate a broken/missing git-lfs filter in repo config to prove reads
     // and diff/staging never break when git-lfs is absent.
-    sb.git(&repo, &["config", "filter.lfs.clean", "nonexistent-git-lfs clean -- %f"]);
+    sb.git(
+        &repo,
+        &[
+            "config",
+            "filter.lfs.clean",
+            "nonexistent-git-lfs clean -- %f",
+        ],
+    );
     sb.git(&repo, &["config", "filter.lfs.required", "true"]);
 
     // Commit pointer directly (bypassing filter via update-index or clean repo first).
@@ -353,7 +368,14 @@ fn lfs_detection_works_for_pointer_downloaded_and_missing_without_git_lfs() {
         SAMPLE_LFS_POINTER.as_bytes(),
         "add lfs pointer",
     );
-    sb.git(&repo, &["config", "filter.lfs.clean", "nonexistent-git-lfs clean -- %f"]);
+    sb.git(
+        &repo,
+        &[
+            "config",
+            "filter.lfs.clean",
+            "nonexistent-git-lfs clean -- %f",
+        ],
+    );
     sb.git(&repo, &["config", "filter.lfs.required", "true"]);
 
     let paths = RepoPaths {
@@ -410,7 +432,10 @@ fn lfs_detection_works_for_pointer_downloaded_and_missing_without_git_lfs() {
     let staging = StagingRunner::new(git, paths.clone()).with_env(sb.env.clone());
     let event = staging.apply(OpId(1), &Patch(patch), &inputs.based_on);
     assert!(
-        matches!(event, invoke_core::Event::OpFinished(OpId(1), OpOutcome::Succeeded)),
+        matches!(
+            event,
+            invoke_core::Event::OpFinished(OpId(1), OpOutcome::Succeeded)
+        ),
         "staging an LFS pointer file must succeed: {event:?}"
     );
 
@@ -572,7 +597,13 @@ fn submodule_update_init_recursive_and_sync_work_end_to_end() {
     sb.commit(&super_repo, "README.md", b"root\n", "super c1");
     sb.git(
         &super_repo,
-        &["submodule", "add", "-q", child.to_str().unwrap(), "libs/child"],
+        &[
+            "submodule",
+            "add",
+            "-q",
+            child.to_str().unwrap(),
+            "libs/child",
+        ],
     );
     sb.git(&super_repo, &["commit", "-q", "-m", "add child"]);
 
@@ -639,7 +670,10 @@ fn lfs_pull_reports_environment_error_when_git_lfs_is_missing_and_respects_lock_
     let mut no_lfs_env = sb.env.clone();
     no_lfs_env.push((OsString::from("PATH"), empty_bin.into_os_string()));
     // Also override GIT_EXEC_PATH so Git for Windows doesn't find bundled git-lfs.
-    no_lfs_env.push((OsString::from("GIT_EXEC_PATH"), sb.root.clone().into_os_string()));
+    no_lfs_env.push((
+        OsString::from("GIT_EXEC_PATH"),
+        sb.root.clone().into_os_string(),
+    ));
 
     let git = Git::detect("git").unwrap();
     // Resolve absolute git executable path so empty PATH still finds `git` itself.
@@ -668,7 +702,11 @@ fn lfs_pull_reports_environment_error_when_git_lfs_is_missing_and_respects_lock_
         match driver.outcome() {
             Some(OpOutcome::Failed(f)) => {
                 assert_eq!(f.class, ErrorClass::Environment);
-                assert!(f.details.contains("Git LFS is not installed"), "{}", f.details);
+                assert!(
+                    f.details.contains("Git LFS is not installed"),
+                    "{}",
+                    f.details
+                );
             }
             other => panic!("expected Environment error when git-lfs missing, got {other:?}"),
         }

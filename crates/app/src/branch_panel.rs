@@ -4,12 +4,15 @@
 //! cannot run (an existing name, the checked-out branch, a busy repo), and
 //! the repo view shows the refusal.
 
+use std::path::PathBuf;
+
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window,
-    div, px,
+    AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled,
+    Subscription, Window, div, px,
 };
 use invoke_core::{
-    BranchName, BranchStart, CommitMessage, Event, NameProblem, Oid, RefName, Snapshot, TagName,
+    BranchName, BranchStart, CommitMessage, Event, NameProblem, Oid, RefName, RepoPath, Snapshot,
+    SubmoduleOp, TagName, WorktreeSpec, same_worktree_path, validate_worktree_path,
 };
 use tokens::{SPACE_2, SPACE_3, TEXT_SMALL};
 use ui::convert::hsla;
@@ -19,6 +22,12 @@ use ui::{
 };
 
 use crate::session::RepoSession;
+
+/// Events emitted upward to `RepoView` / `Workspace` (P10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchPanelEvent {
+    OpenWorktree(PathBuf),
+}
 
 /// What the form above the list is for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +56,17 @@ enum Form {
         id: Oid,
         label: String,
         newest: bool,
+    },
+    /// P10: create a linked worktree.
+    AddWorktree {
+        create_branch: bool,
+    },
+    /// P10: confirm removing a linked worktree.
+    RemoveWorktree {
+        path: String,
+        label: String,
+        locked: bool,
+        force: bool,
     },
 }
 
@@ -102,9 +122,13 @@ pub struct BranchPanel {
     tag_name: Entity<TextEditor>,
     tag_message: Entity<TextEditor>,
     tag_remote: Entity<TextEditor>,
+    wt_path: Entity<TextEditor>,
+    wt_branch: Entity<TextEditor>,
     form: Form,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<BranchPanelEvent> for BranchPanel {}
 
 impl BranchPanel {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
@@ -113,6 +137,8 @@ impl BranchPanel {
         let tag_name = cx.new(|cx| TextEditor::new("Tag name", 1, cx).single_line());
         let tag_message = cx.new(|cx| TextEditor::new("Tag message", 3, cx));
         let tag_remote = cx.new(|cx| TextEditor::new("Remote name", 1, cx).single_line());
+        let wt_path = cx.new(|cx| TextEditor::new("Worktree folder path", 1, cx).single_line());
+        let wt_branch = cx.new(|cx| TextEditor::new("Branch name", 1, cx).single_line());
         let mut subscriptions = vec![
             cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| match event {
                 EditorEvent::Changed => cx.notify(),
@@ -124,7 +150,7 @@ impl BranchPanel {
             }),
             cx.observe(&session, |_, _, cx| cx.notify()),
         ];
-        for field in [&tag_name, &tag_message, &tag_remote] {
+        for field in [&tag_name, &tag_message, &tag_remote, &wt_path, &wt_branch] {
             subscriptions.push(cx.subscribe(field, |_, _, _: &EditorEvent, cx| cx.notify()));
         }
         Self {
@@ -134,6 +160,8 @@ impl BranchPanel {
             tag_name,
             tag_message,
             tag_remote,
+            wt_path,
+            wt_branch,
             form: Form::None,
             _subscriptions: subscriptions,
         }
@@ -203,6 +231,57 @@ impl BranchPanel {
             SideAction::StashPop(index) => self.stash(index, StashOp::Pop, cx),
             SideAction::StashDrop(index) => self.ask_to_drop(index, cx),
             SideAction::ManageTag(name) => self.open_tag(Form::ManageTag, &name, cx),
+            SideAction::WorktreeOpen(path) => {
+                cx.emit(BranchPanelEvent::OpenWorktree(PathBuf::from(path)));
+            }
+            SideAction::WorktreeRemove(path) => self.ask_to_remove_worktree(&path, cx),
+            SideAction::SubmoduleUpdate(path) => self.deliver(
+                Event::SubmoduleRequested {
+                    op: SubmoduleOp::UpdateInitRecursive,
+                    path: path.map(RepoPath),
+                },
+                cx,
+            ),
+            SideAction::SubmoduleSync(path) => self.deliver(
+                Event::SubmoduleRequested {
+                    op: SubmoduleOp::SyncRecursive,
+                    path: path.map(RepoPath),
+                },
+                cx,
+            ),
+        }
+    }
+
+    fn open_add_worktree(&mut self, cx: &mut Context<Self>) {
+        self.wt_path
+            .update(cx, |editor, cx| editor.set_text("", cx));
+        self.wt_branch
+            .update(cx, |editor, cx| editor.set_text("", cx));
+        self.form = Form::AddWorktree {
+            create_branch: true,
+        };
+        cx.notify();
+    }
+
+    fn ask_to_remove_worktree(&mut self, path: &str, cx: &mut Context<Self>) {
+        let entry = match &self.session.read(cx).state.snapshot {
+            Snapshot::Read { disk, .. } => disk
+                .advanced
+                .worktrees
+                .iter()
+                .find(|wt| same_worktree_path(&wt.path, path))
+                .cloned(),
+            Snapshot::NotRead => None,
+        };
+        if let Some(wt) = entry {
+            let locked = wt.locked.is_some();
+            self.form = Form::RemoveWorktree {
+                path: wt.path,
+                label: wt.name,
+                locked,
+                force: locked || wt.prunable,
+            };
+            cx.notify();
         }
     }
 
@@ -508,6 +587,26 @@ impl BranchPanel {
                 self.deliver(Event::BranchDeleteRequested { name, force }, cx);
                 self.close(cx);
             }
+            Form::AddWorktree { create_branch } => {
+                let path = self.wt_path.read(cx).text().trim().to_owned();
+                let branch = self.wt_branch.read(cx).text().trim().to_owned();
+                if validate_worktree_path(&path).is_ok() && BranchName::parse(&branch).is_ok() {
+                    let spec = if create_branch {
+                        WorktreeSpec::NewBranch {
+                            name: branch,
+                            at: BranchStart::Head,
+                        }
+                    } else {
+                        WorktreeSpec::ExistingBranch(BranchName(branch))
+                    };
+                    self.deliver(Event::WorktreeAddRequested { path, spec }, cx);
+                    self.close(cx);
+                }
+            }
+            Form::RemoveWorktree { path, force, .. } => {
+                self.deliver(Event::WorktreeRemoveRequested { path, force }, cx);
+                self.close(cx);
+            }
         }
     }
 }
@@ -521,14 +620,21 @@ enum StashOp {
 impl Render for BranchPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
-        let rows = match &self.session.read(cx).state.snapshot {
-            Snapshot::Read { disk, .. } => sidebar_rows(&disk.refs, &disk.head, &disk.stashes),
-            Snapshot::NotRead => Vec::new(),
+        let (rows, has_submodules, has_lfs) = match &self.session.read(cx).state.snapshot {
+            Snapshot::Read { disk, .. } => (
+                sidebar_rows(&disk.refs, &disk.head, &disk.stashes, &disk.advanced),
+                !disk.advanced.submodules.is_empty(),
+                disk.advanced.lfs.detected,
+            ),
+            Snapshot::NotRead => (Vec::new(), false, false),
         };
         let this = cx.entity();
         let new = cx.entity();
         let stash = cx.entity();
         let tag = cx.entity();
+        let wt_add = cx.entity();
+        let sub_update = cx.entity();
+        let lfs_pull = cx.entity();
         let mut panel = div()
             .flex()
             .flex_col()
@@ -559,15 +665,50 @@ impl Render for BranchPanel {
                     ),
             )
             .child(
-                div().px(px(SPACE_3)).pb(px(SPACE_2)).child(
-                    Button::new("new-tag", "+ Tag")
-                        .ghost()
-                        .on_click(move |_, _, cx| {
-                            tag.update(cx, |pane, cx| {
-                                pane.open_tag(Form::CreateTag { annotated: false }, "", cx)
-                            });
-                        }),
-                ),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(SPACE_2))
+                    .px(px(SPACE_3))
+                    .pb(px(SPACE_2))
+                    .child(
+                        Button::new("new-tag", "+ Tag")
+                            .ghost()
+                            .on_click(move |_, _, cx| {
+                                tag.update(cx, |pane, cx| {
+                                    pane.open_tag(Form::CreateTag { annotated: false }, "", cx)
+                                });
+                            }),
+                    )
+                    .child(Button::new("new-worktree", "+ Worktree").ghost().on_click(
+                        move |_, _, cx| {
+                            wt_add.update(cx, |pane, cx| pane.open_add_worktree(cx));
+                        },
+                    ))
+                    .children(has_submodules.then(|| {
+                        Button::new("submodules-update-all", "Update submodules")
+                            .ghost()
+                            .on_click(move |_, _, cx| {
+                                sub_update.update(cx, |pane, cx| {
+                                    pane.deliver(
+                                        Event::SubmoduleRequested {
+                                            op: SubmoduleOp::UpdateInitRecursive,
+                                            path: None,
+                                        },
+                                        cx,
+                                    )
+                                });
+                            })
+                    }))
+                    .children(has_lfs.then(|| {
+                        Button::new("lfs-pull-all", "LFS Pull")
+                            .ghost()
+                            .on_click(move |_, _, cx| {
+                                lfs_pull.update(cx, |pane, cx| {
+                                    pane.deliver(Event::LfsPullRequested { path: None }, cx)
+                                });
+                            })
+                    })),
             );
 
         let text = self.editor.read(cx).text().trim().to_owned();
@@ -805,6 +946,145 @@ impl Render for BranchPanel {
                                 .child(Button::new("form-delete", "Delete branch").danger().on_click(
                                     move |_, _, cx| ok.update(cx, |this, cx| this.submit(false, cx)),
                                 ))
+                                .child(cancel),
+                        ),
+                )
+            }
+            Form::AddWorktree { create_branch } => {
+                let path_ok = validate_worktree_path(self.wt_path.read(cx).text()).is_ok();
+                let branch_text = self.wt_branch.read(cx).text().trim().to_owned();
+                let branch_problem = BranchName::parse(&branch_text).err();
+                let toggle = cx.entity();
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(SPACE_2))
+                        .child(self.wt_path.clone())
+                        .child(self.wt_branch.clone())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(SPACE_2))
+                                .child(
+                                    Checkbox::new(
+                                        "wt-create-branch",
+                                        if create_branch {
+                                            CheckState::Checked
+                                        } else {
+                                            CheckState::Unchecked
+                                        },
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            toggle.update(cx, |this, cx| {
+                                                if let Form::AddWorktree { create_branch } =
+                                                    &mut this.form
+                                                {
+                                                    *create_branch = !*create_branch;
+                                                }
+                                                cx.notify();
+                                            })
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .text_style(&TEXT_SMALL, cx)
+                                        .text_color(hsla(p.ink_muted))
+                                        .child("Create new branch at HEAD"),
+                                ),
+                        )
+                        .children(branch_problem.filter(|_| !branch_text.is_empty()).map(
+                            |problem| {
+                                div()
+                                    .text_style(&TEXT_SMALL, cx)
+                                    .text_color(hsla(p.danger))
+                                    .child(name_problem_text(problem))
+                            },
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(SPACE_2))
+                                .child(
+                                    Button::new("form-wt-add", "Add worktree")
+                                        .primary()
+                                        .disabled(!path_ok || branch_problem.is_some())
+                                        .on_click(move |_, _, cx| {
+                                            ok.update(cx, |this, cx| this.submit(false, cx))
+                                        }),
+                                )
+                                .child(cancel),
+                        ),
+                )
+            }
+            Form::RemoveWorktree {
+                label,
+                locked,
+                force,
+                ..
+            } => {
+                let toggle = cx.entity();
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(SPACE_2))
+                        .child(
+                            div()
+                                .text_style(&TEXT_SMALL, cx)
+                                .text_color(hsla(p.ink))
+                                .child(if locked {
+                                    format!("Remove locked worktree {label}? Uncommitted files inside it will be deleted.")
+                                } else {
+                                    format!("Remove linked worktree {label}?")
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(SPACE_2))
+                                .child(
+                                    Checkbox::new(
+                                        "wt-force-remove",
+                                        if force {
+                                            CheckState::Checked
+                                        } else {
+                                            CheckState::Unchecked
+                                        },
+                                    )
+                                    .on_click(move |_, _, cx| {
+                                        toggle.update(cx, |this, cx| {
+                                            if let Form::RemoveWorktree { force, .. } =
+                                                &mut this.form
+                                            {
+                                                *force = !*force;
+                                            }
+                                            cx.notify();
+                                        })
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .text_style(&TEXT_SMALL, cx)
+                                        .text_color(hsla(p.ink_muted))
+                                        .child("Force remove (modified or locked)"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(SPACE_2))
+                                .child(
+                                    Button::new("form-wt-remove", "Remove worktree")
+                                        .danger()
+                                        .on_click(move |_, _, cx| {
+                                            ok.update(cx, |this, cx| this.submit(false, cx))
+                                        }),
+                                )
                                 .child(cancel),
                         ),
                 )

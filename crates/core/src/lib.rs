@@ -27,9 +27,9 @@ pub mod undo_codec;
 pub mod watch;
 
 pub use advanced::{
-    AdvancedSnapshot, LFS_SPEC_VERSION, LfsFile, LfsFileState, LfsPointer, LfsRefusal,
-    LfsSnapshot, MAX_LFS_POINTER_BYTES, SubmoduleEntry, SubmoduleOp, SubmoduleRefusal,
-    SubmoduleState, WorktreeCheckout, WorktreeEntry, WorktreeRefusal, WorktreeSpec, WorktreeTarget,
+    AdvancedSnapshot, LFS_SPEC_VERSION, LfsFile, LfsFileState, LfsPointer, LfsRefusal, LfsSnapshot,
+    MAX_LFS_POINTER_BYTES, SubmoduleEntry, SubmoduleOp, SubmoduleRefusal, SubmoduleState,
+    WorktreeCheckout, WorktreeEntry, WorktreeRefusal, WorktreeSpec, WorktreeTarget,
     classify_submodule_state, format_byte_size, gitattributes_uses_lfs, normalize_worktree_path,
     parse_lfs_pointer, same_worktree_path, validate_worktree_path, worktree_holding_branch,
 };
