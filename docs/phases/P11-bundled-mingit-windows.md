@@ -37,3 +37,4 @@ Menyediakan fallback MinGit terbundel di Windows bila system git (< 2.40 atau ti
   5. With MinGit: clone an HTTPS repo that needs auth: the app's askpass prompt appears; then one with a stored Windows credential (GCM): no prompt needed.
   6. Interactive rebase still launches the editor (`invoke-rebase-editor.exe` beside the app).
   7. Install under a path with spaces and a long path.
+- DoD run (2026-11-24): fmt + clippy `-D warnings` clean; `cargo check -p ui -p app` ok; `cargo test -p shell --test git_discovery` 10/10. In `cargo xtask check` the `harness` `first_half::model_based_sequences` failed once ("read ref: Could not traverse reference directory", ~32 min run while other worktrees were building) and `shell --test user_config` failed once in a workspace run; both passed when re-run alone and the rest of the workspace passed with `--no-fail-fast`. Looks like Windows file-system contention across parallel worktrees, not P11 code.
