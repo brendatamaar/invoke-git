@@ -1,6 +1,7 @@
 mod bench;
 mod fixtures;
 mod metadata;
+mod package;
 
 use std::env;
 use std::ffi::OsString;
@@ -16,6 +17,7 @@ fn main() -> ExitCode {
         [command] if command == "check" => check(false),
         // Core only: skip the GPUI crates everywhere (Linux and macOS CI).
         [command, flag] if command == "check" && flag == "--core" => check(true),
+        [command] if command == "package-windows" => package::package_windows(),
         [command] if command == "fixtures" => write_fixtures(),
         // Benchmarks against the ceilings in docs/perf-budgets.toml (task 25).
         [command] if command == "bench-check" => bench::bench_check(false),
@@ -23,7 +25,7 @@ fn main() -> ExitCode {
         [command, flag] if command == "bench-check" && flag == "--ui" => bench::bench_check(true),
         _ => {
             eprintln!(
-                "Usage: cargo xtask check [--core] | cargo xtask fixtures | cargo xtask bench-check [--ui]"
+                "Usage: cargo xtask check [--core] | cargo xtask fixtures | cargo xtask package-windows | cargo xtask bench-check [--ui]"
             );
             return ExitCode::FAILURE;
         }
