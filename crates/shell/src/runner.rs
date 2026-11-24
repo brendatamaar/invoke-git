@@ -207,6 +207,16 @@ impl Job {
         if let Err(failure) = crate::rebase::check(&self.paths, &self.args, &self.expect) {
             return OpOutcome::Failed(failure);
         }
+        // P10: fail fast with a clear Environment error when `git-lfs` is not
+        // installed rather than reporting an unexpected git failure.
+        if matches!(self.args, GitArgs::LfsPull { .. })
+            && crate::advanced::git_lfs_version(&self.git, &self.paths.workdir, &self.env).is_none()
+        {
+            return failed(
+                ErrorClass::Environment,
+                "Git LFS is not installed (`git-lfs` was not found on PATH). Install Git LFS to pull LFS objects.".into(),
+            );
+        }
         // Task 23: a request is one git run, except taking a side whole,
         // which is two; it stops at the first one that fails.
         let mut outcome = OpOutcome::Succeeded;

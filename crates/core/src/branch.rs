@@ -48,7 +48,12 @@ pub fn action_of(request: &WriteRequest) -> Option<Action> {
         | WriteRequest::Revert { .. }
         | WriteRequest::InteractiveRebase { .. }
         // P7.
-        | WriteRequest::Reset { .. } => None,
+        | WriteRequest::Reset { .. }
+        // P10.
+        | WriteRequest::WorktreeAdd { .. }
+        | WriteRequest::WorktreeRemove { .. }
+        | WriteRequest::Submodule { .. }
+        | WriteRequest::LfsPull { .. } => None,
     }
 }
 
@@ -232,7 +237,12 @@ fn check(
         | WriteRequest::Revert { .. }
         | WriteRequest::InteractiveRebase { .. }
         // P7.
-        | WriteRequest::Reset { .. } => Err(Refusal::NotYetSupported { task: 15 }),
+        | WriteRequest::Reset { .. }
+        // P10.
+        | WriteRequest::WorktreeAdd { .. }
+        | WriteRequest::WorktreeRemove { .. }
+        | WriteRequest::Submodule { .. }
+        | WriteRequest::LfsPull { .. } => Err(Refusal::NotYetSupported { task: 15 }),
     }
 }
 

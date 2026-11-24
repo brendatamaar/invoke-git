@@ -4,8 +4,9 @@
 //! The shell reads `.git` and worktree metadata into [`AdvancedSnapshot`] and
 //! executes CLI commands planned here through the system `git` CLI.
 
-use crate::ids::{BranchName, Oid, RepoPath};
-use crate::state::Head;
+use crate::ids::{BranchName, NameProblem, Oid, RepoPath};
+use crate::ops::{BranchStart, GitArgs, WriteRequest};
+use crate::state::{Action, DiskState, Head, Phase, Refusal};
 
 /// Maximum byte length of a valid Git LFS v1 pointer file per the Git LFS spec.
 pub const MAX_LFS_POINTER_BYTES: usize = 1024;
@@ -315,4 +316,251 @@ pub fn format_byte_size(bytes: u64) -> String {
     } else {
         format!("{:.2} GiB", b / GIB)
     }
+}
+
+/// What the user asked to check out in a new worktree (raw, before parsing).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorktreeSpec {
+    /// Check out an existing local branch in the new worktree.
+    ExistingBranch(BranchName),
+    /// Create a new branch at `at` and check it out in the new worktree.
+    NewBranch { name: String, at: BranchStart },
+    /// Check out a detached `HEAD` at `at`.
+    Detach(BranchStart),
+}
+
+/// Validated worktree checkout target carried inside [`WriteRequest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorktreeTarget {
+    ExistingBranch(BranchName),
+    NewBranch { name: BranchName, at: BranchStart },
+    Detach(BranchStart),
+}
+
+/// Resolved worktree target with concrete commit OIDs carried inside [`GitArgs`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorktreeCheckout {
+    ExistingBranch { name: BranchName, tip: Oid },
+    NewBranch { name: BranchName, at: Oid },
+    Detach(Oid),
+}
+
+/// Which submodule CLI action to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmoduleOp {
+    /// `git submodule init [-- <path>]`
+    Init,
+    /// `git submodule update --init --recursive [-- <path>]`
+    UpdateInitRecursive,
+    /// `git submodule sync --recursive [-- <path>]`
+    SyncRecursive,
+}
+
+/// Why a worktree request was refused by the pure core.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorktreeRefusal {
+    EmptyPath,
+    InvalidPath,
+    InvalidBranch(NameProblem),
+    NoCommitsYet,
+    AlreadyExists,
+    BranchAlreadyExists(BranchName),
+    BranchNameConflict(BranchName),
+    NoSuchBranch(BranchName),
+    BranchCheckedOut(BranchName),
+    NotFound,
+    CannotRemoveMain,
+    CannotRemoveCurrent,
+    Locked,
+}
+
+/// Why a submodule request was refused by the pure core.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubmoduleRefusal {
+    NoSubmodules,
+    NotFound(RepoPath),
+}
+
+/// Why a Git LFS request was refused by the pure core.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LfsRefusal {
+    NotDetected,
+}
+
+/// Validates a user-supplied filesystem path for a worktree operation.
+pub fn validate_worktree_path(raw: &str) -> Result<String, WorktreeRefusal> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(WorktreeRefusal::EmptyPath);
+    }
+    if trimmed.starts_with('-') || trimmed.chars().any(char::is_control) {
+        return Err(WorktreeRefusal::InvalidPath);
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Maps P10 write requests to their notice [`Action`]; `None` for other requests.
+pub fn action_of(request: &WriteRequest) -> Option<Action> {
+    match request {
+        WriteRequest::WorktreeAdd { .. } => Some(Action::WorktreeAdd),
+        WriteRequest::WorktreeRemove { .. } => Some(Action::WorktreeRemove),
+        WriteRequest::Submodule { .. } => Some(Action::Submodule),
+        WriteRequest::LfsPull { .. } => Some(Action::LfsPull),
+        _ => None,
+    }
+}
+
+/// Plans a P10 write request against `disk`. `None` for non-P10 requests.
+pub fn plan(request: &WriteRequest, disk: &DiskState) -> Option<Result<GitArgs, Refusal>> {
+    action_of(request)?;
+    Some(check(request, disk))
+}
+
+fn check(request: &WriteRequest, disk: &DiskState) -> Result<GitArgs, Refusal> {
+    if disk.phase != Phase::Clean {
+        return Err(Refusal::RepoBusy);
+    }
+    match request {
+        WriteRequest::WorktreeAdd { path, target } => plan_worktree_add(path, target, disk),
+        WriteRequest::WorktreeRemove { path, force } => plan_worktree_remove(path, *force, disk),
+        WriteRequest::Submodule { op, path } => plan_submodule(*op, path.as_ref(), disk),
+        WriteRequest::LfsPull { path } => plan_lfs_pull(path.as_ref(), disk),
+        _ => Err(Refusal::NotYetSupported { task: 0 }),
+    }
+}
+
+fn resolve_start(start: &BranchStart, head: &Head) -> Result<Oid, WorktreeRefusal> {
+    match start {
+        BranchStart::Head => match head {
+            Head::Branch { oid, .. } | Head::Detached(oid) => Ok(oid.clone()),
+            Head::Unborn(_) => Err(WorktreeRefusal::NoCommitsYet),
+        },
+        BranchStart::Commit(oid) => Ok(oid.clone()),
+    }
+}
+
+fn conflicting_branch(disk: &DiskState, name: &BranchName) -> Option<BranchName> {
+    let folder_of = |outer: &str, inner: &str| {
+        inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    disk.refs
+        .refs
+        .keys()
+        .filter_map(|full| full.0.strip_prefix("refs/heads/"))
+        .find(|existing| folder_of(existing, &name.0) || folder_of(&name.0, existing))
+        .map(|existing| BranchName(existing.to_owned()))
+}
+
+fn plan_worktree_add(
+    path: &str,
+    target: &WorktreeTarget,
+    disk: &DiskState,
+) -> Result<GitArgs, Refusal> {
+    let refuse = |why| Err(Refusal::Worktree(why));
+    if disk
+        .advanced
+        .worktrees
+        .iter()
+        .any(|wt| same_worktree_path(&wt.path, path))
+    {
+        return refuse(WorktreeRefusal::AlreadyExists);
+    }
+    let checkout = match target {
+        WorktreeTarget::ExistingBranch(name) => {
+            let Some(tip) = disk.refs.refs.get(&name.to_ref()) else {
+                return refuse(WorktreeRefusal::NoSuchBranch(name.clone()));
+            };
+            if worktree_holding_branch(&disk.advanced.worktrees, name).is_some() {
+                return refuse(WorktreeRefusal::BranchCheckedOut(name.clone()));
+            }
+            WorktreeCheckout::ExistingBranch {
+                name: name.clone(),
+                tip: tip.clone(),
+            }
+        }
+        WorktreeTarget::NewBranch { name, at } => {
+            let at = match resolve_start(at, &disk.head) {
+                Ok(oid) => oid,
+                Err(why) => return refuse(why),
+            };
+            if disk.refs.refs.contains_key(&name.to_ref()) {
+                return refuse(WorktreeRefusal::BranchAlreadyExists(name.clone()));
+            }
+            if let Some(other) = conflicting_branch(disk, name) {
+                return refuse(WorktreeRefusal::BranchNameConflict(other));
+            }
+            WorktreeCheckout::NewBranch {
+                name: name.clone(),
+                at,
+            }
+        }
+        WorktreeTarget::Detach(at) => {
+            let at = match resolve_start(at, &disk.head) {
+                Ok(oid) => oid,
+                Err(why) => return refuse(why),
+            };
+            WorktreeCheckout::Detach(at)
+        }
+    };
+    Ok(GitArgs::WorktreeAdd {
+        path: path.to_owned(),
+        checkout,
+    })
+}
+
+fn plan_worktree_remove(path: &str, force: bool, disk: &DiskState) -> Result<GitArgs, Refusal> {
+    let refuse = |why| Err(Refusal::Worktree(why));
+    let Some(wt) = disk
+        .advanced
+        .worktrees
+        .iter()
+        .find(|wt| same_worktree_path(&wt.path, path))
+    else {
+        return refuse(WorktreeRefusal::NotFound);
+    };
+    if wt.is_main {
+        return refuse(WorktreeRefusal::CannotRemoveMain);
+    }
+    if wt.is_current {
+        return refuse(WorktreeRefusal::CannotRemoveCurrent);
+    }
+    if wt.locked.is_some() && !force {
+        return refuse(WorktreeRefusal::Locked);
+    }
+    Ok(GitArgs::WorktreeRemove {
+        path: wt.path.clone(),
+        force,
+        locked: wt.locked.is_some(),
+        prunable: wt.prunable,
+    })
+}
+
+fn plan_submodule(
+    op: SubmoduleOp,
+    path: Option<&RepoPath>,
+    disk: &DiskState,
+) -> Result<GitArgs, Refusal> {
+    if disk.advanced.submodules.is_empty() {
+        return Err(Refusal::Submodule(SubmoduleRefusal::NoSubmodules));
+    }
+    if let Some(path) = path
+        && !disk.advanced.submodules.iter().any(|s| &s.path == path)
+    {
+        return Err(Refusal::Submodule(SubmoduleRefusal::NotFound(path.clone())));
+    }
+    Ok(GitArgs::Submodule {
+        op,
+        path: path.cloned(),
+    })
+}
+
+fn plan_lfs_pull(path: Option<&RepoPath>, disk: &DiskState) -> Result<GitArgs, Refusal> {
+    if !disk.advanced.lfs.detected {
+        return Err(Refusal::Lfs(LfsRefusal::NotDetected));
+    }
+    Ok(GitArgs::LfsPull {
+        path: path.cloned(),
+    })
 }

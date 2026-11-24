@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::advanced::{SubmoduleOp, WorktreeSpec};
 use crate::conflict::ResolveChoice;
 use crate::ids::{BranchName, IndexId, Oid, OpId, ReadId, RefName, RepoPath, TagName};
 use crate::ops::{
@@ -108,6 +109,22 @@ pub enum Event {
     StashApplyRequested(Oid),
     StashPopRequested(Oid),
     StashDropRequested(Oid),
+    // P10: worktrees, submodules, and Git LFS.
+    WorktreeAddRequested {
+        path: String,
+        spec: WorktreeSpec,
+    },
+    WorktreeRemoveRequested {
+        path: String,
+        force: bool,
+    },
+    SubmoduleRequested {
+        op: SubmoduleOp,
+        path: Option<RepoPath>,
+    },
+    LfsPullRequested {
+        path: Option<RepoPath>,
+    },
     RefreshRequested,
     NoticeDismissed,
     /// Task 17: remove `index.lock` that another process left. The UI asks

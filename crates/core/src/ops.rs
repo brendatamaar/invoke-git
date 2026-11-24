@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::advanced::{SubmoduleOp, WorktreeCheckout, WorktreeTarget};
 use crate::conflict::{Operation, ResolveChoice, Side};
 use crate::event::{HeadTarget, RefValue};
 use crate::ids::{BranchName, IndexId, Oid, RefName, RepoPath, TagName};
@@ -140,6 +141,22 @@ pub enum WriteRequest {
         mode: ResetMode,
         onto: HeadTarget,
     },
+    // P10: worktrees, submodules, and Git LFS.
+    WorktreeAdd {
+        path: String,
+        target: WorktreeTarget,
+    },
+    WorktreeRemove {
+        path: String,
+        force: bool,
+    },
+    Submodule {
+        op: SubmoduleOp,
+        path: Option<RepoPath>,
+    },
+    LfsPull {
+        path: Option<RepoPath>,
+    },
 }
 
 impl WriteRequest {
@@ -158,6 +175,10 @@ impl WriteRequest {
                 | WriteRequest::ResolveFile { .. }
                 | WriteRequest::Skip { .. }
                 | WriteRequest::Abort { .. }
+                | WriteRequest::WorktreeAdd { .. }
+                | WriteRequest::WorktreeRemove { .. }
+                | WriteRequest::Submodule { .. }
+                | WriteRequest::LfsPull { .. }
         )
     }
 }
@@ -343,6 +364,24 @@ pub enum GitArgs {
         mode: ResetMode,
         expected_ref: RefValue,
     },
+    // P10: worktrees, submodules, and Git LFS.
+    WorktreeAdd {
+        path: String,
+        checkout: WorktreeCheckout,
+    },
+    WorktreeRemove {
+        path: String,
+        force: bool,
+        locked: bool,
+        prunable: bool,
+    },
+    Submodule {
+        op: SubmoduleOp,
+        path: Option<RepoPath>,
+    },
+    LfsPull {
+        path: Option<RepoPath>,
+    },
 }
 
 impl GitArgs {
@@ -408,6 +447,14 @@ impl GitArgs {
             GitArgs::RenameBranch { from, tip, to } => {
                 vec![at(from, Some(tip)), at(to, None)]
             }
+            GitArgs::WorktreeAdd { checkout, .. } => match checkout {
+                WorktreeCheckout::ExistingBranch { name, tip } => vec![at(name, Some(tip))],
+                WorktreeCheckout::NewBranch { name, .. } => vec![at(name, None)],
+                WorktreeCheckout::Detach(_) => Vec::new(),
+            },
+            GitArgs::WorktreeRemove { .. }
+            | GitArgs::Submodule { .. }
+            | GitArgs::LfsPull { .. } => Vec::new(),
         }
     }
 
@@ -436,6 +483,11 @@ impl GitArgs {
                 | GitArgs::Push { .. }
                 | GitArgs::PushTag { .. }
                 | GitArgs::DeleteRemoteTag { .. }
+                | GitArgs::Submodule {
+                    op: SubmoduleOp::UpdateInitRecursive,
+                    ..
+                }
+                | GitArgs::LfsPull { .. }
         )
     }
 }

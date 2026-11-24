@@ -3,8 +3,8 @@
 //! only appears as "Details" (README, "Content fundamentals").
 
 use invoke_core::{
-    Action, BranchRefusal, CommitRefusal, ConflictRefusal, ErrorClass, Failure, Notice, OpOutcome,
-    Refusal, TagRefusal, UndoMoved,
+    Action, BranchRefusal, CommitRefusal, ConflictRefusal, ErrorClass, Failure, LfsRefusal, Notice,
+    OpOutcome, Refusal, SubmoduleRefusal, TagRefusal, UndoMoved, WorktreeRefusal,
 };
 
 /// How to draw a notice.
@@ -53,6 +53,10 @@ fn action_name(action: Action) -> &'static str {
         Action::InteractiveRebase => "Interactive rebase",
         Action::Revert => "Revert",
         Action::Reset => "Reset",
+        Action::WorktreeAdd => "Add worktree",
+        Action::WorktreeRemove => "Remove worktree",
+        Action::Submodule => "Submodule",
+        Action::LfsPull => "Git LFS pull",
         Action::RemoveLock => "Remove lock",
     }
 }
@@ -101,6 +105,50 @@ fn refusal_text(reason: &Refusal) -> String {
         Refusal::UncommittedChanges => {
             "Commit or stash your changes to tracked files first.".into()
         }
+        Refusal::Worktree(problem) => worktree_text(problem),
+        Refusal::Submodule(problem) => submodule_text(problem),
+        Refusal::Lfs(problem) => lfs_text(problem),
+    }
+}
+
+fn worktree_text(problem: &WorktreeRefusal) -> String {
+    match problem {
+        WorktreeRefusal::EmptyPath => "Choose a folder path for the worktree.".into(),
+        WorktreeRefusal::InvalidPath => "That folder path is not valid for a worktree.".into(),
+        WorktreeRefusal::InvalidBranch(_) => "That is not a valid branch name.".into(),
+        WorktreeRefusal::NoCommitsYet => "There are no commits yet to create a worktree from.".into(),
+        WorktreeRefusal::AlreadyExists => "A worktree already exists at that path.".into(),
+        WorktreeRefusal::BranchAlreadyExists(name) => {
+            format!("A branch named {} already exists.", name.0)
+        }
+        WorktreeRefusal::BranchNameConflict(name) => {
+            format!("{} conflicts with an existing branch name.", name.0)
+        }
+        WorktreeRefusal::NoSuchBranch(name) => format!("There is no branch named {}.", name.0),
+        WorktreeRefusal::BranchCheckedOut(name) => {
+            format!("Branch {} is already checked out in another worktree.", name.0)
+        }
+        WorktreeRefusal::NotFound => "That worktree is no longer listed.".into(),
+        WorktreeRefusal::CannotRemoveMain => "The main worktree cannot be removed.".into(),
+        WorktreeRefusal::CannotRemoveCurrent => {
+            "Cannot remove the worktree currently open in this tab.".into()
+        }
+        WorktreeRefusal::Locked => {
+            "That worktree is locked. Force removal to remove it anyway.".into()
+        }
+    }
+}
+
+fn submodule_text(problem: &SubmoduleRefusal) -> String {
+    match problem {
+        SubmoduleRefusal::NoSubmodules => "This repository has no submodules configured.".into(),
+        SubmoduleRefusal::NotFound(path) => format!("No submodule found at {}.", path.0),
+    }
+}
+
+fn lfs_text(problem: &LfsRefusal) -> String {
+    match problem {
+        LfsRefusal::NotDetected => "No Git LFS files are configured in this repository.".into(),
     }
 }
 

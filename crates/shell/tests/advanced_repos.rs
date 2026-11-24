@@ -10,16 +10,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use diff::{DiffOptions, Direction, Mode, PatchSpec, Pick, build_patch, diff_text};
 use invoke_core::{
-    Head, LfsFileState, OpId, OpOutcome, Patch, Phase, RepoPath, SubmoduleState,
-    same_worktree_path,
+    BranchName, BranchStart, Command as CoreCommand, ErrorClass, Event, Head, LfsFileState, Notice,
+    OpId, OpOutcome, Patch, Phase, RepoId, RepoPath, RepoState, SubmoduleOp, SubmoduleState,
+    WorktreeSpec, open, same_worktree_path, step,
 };
-use shell::advanced::inspect_lfs_file;
+use shell::advanced::{git_lfs_version, inspect_lfs_file};
 use shell::precondition::RepoPaths;
-use shell::{Git, InputsError, Source, StagingRunner, discover, load_inputs, read_state};
+use shell::read::read_event;
+use shell::{Git, GitRunner, InputsError, Source, StagingRunner, discover, load_inputs, read_state};
 
 /// An isolated temporary directory for fixture repos, deleted on drop.
 struct Sandbox {
@@ -435,4 +438,271 @@ fn lfs_detection_works_for_pointer_downloaded_and_missing_without_git_lfs() {
         state_missing.advanced.lfs.file(&path).unwrap().state,
         LfsFileState::Missing
     );
+}
+
+struct Driver {
+    paths: RepoPaths,
+    state: RepoState,
+    runner: GitRunner,
+}
+
+impl Driver {
+    fn open(paths: RepoPaths, env: Vec<(OsString, OsString)>) -> Self {
+        let git = Git::detect("git").unwrap();
+        let (state, commands) = open(RepoId {
+            root_commit: None,
+            remote_url: None,
+        });
+        let mut driver = Self {
+            runner: GitRunner::new(git, paths.clone()).with_env(env),
+            paths,
+            state,
+        };
+        for cmd in commands {
+            driver.exec(cmd);
+        }
+        driver
+    }
+
+    fn deliver(&mut self, event: Event) {
+        let (state, commands) = step(self.state.clone(), event);
+        self.state = state;
+        for cmd in commands {
+            self.exec(cmd);
+        }
+    }
+
+    fn exec(&mut self, command: CoreCommand) {
+        match command {
+            CoreCommand::ReadState { read, .. } => {
+                self.deliver(read_event(&self.paths, read));
+            }
+            CoreCommand::RunGit { op, args, expect } => {
+                let (tx, rx) = mpsc::channel();
+                self.runner.run(op, args, expect, tx);
+                loop {
+                    let event = rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("no OpFinished within 30 s");
+                    let done = matches!(event, Event::OpFinished(..));
+                    self.deliver(event);
+                    if done {
+                        break;
+                    }
+                }
+            }
+            other => panic!("unexpected command in P10 driver: {other:?}"),
+        }
+    }
+
+    fn outcome(&self) -> Option<OpOutcome> {
+        match &self.state.notice {
+            Some(Notice::OpEnded { outcome, .. }) => Some(outcome.clone()),
+            _ => None,
+        }
+    }
+}
+
+#[test]
+fn worktree_add_and_remove_end_to_end_with_lock_and_ref_guards() {
+    let sb = Sandbox::new();
+    let main = sb.init_repo("wt-e2e");
+    sb.commit(&main, "a.txt", b"hello\n", "c1");
+    sb.git(&main, &["branch", "existing-br"]);
+
+    let found = discover(&main).unwrap();
+    let mut driver = Driver::open(found.paths.clone(), sb.env.clone());
+
+    // 1. Add linked worktree on a new branch.
+    let wt_new = sb.root.join("wt-new");
+    driver.deliver(Event::WorktreeAddRequested {
+        path: wt_new.to_str().unwrap().to_owned(),
+        spec: WorktreeSpec::NewBranch {
+            name: "wt-branch".into(),
+            at: BranchStart::Head,
+        },
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+    assert!(wt_new.join(".git").is_file());
+    let disk = driver.state.fresh_disk().unwrap();
+    assert_eq!(disk.advanced.worktrees.len(), 2);
+    assert!(
+        disk.advanced
+            .worktrees
+            .iter()
+            .any(|w| same_worktree_path(&w.path, wt_new.to_str().unwrap()))
+    );
+
+    // 2. Lock guard (Law 12): holding `index.lock` refuses the write with PreconditionChanged.
+    let wt_blocked = sb.root.join("wt-blocked");
+    fs::write(found.paths.git_dir.join("index.lock"), b"lock").unwrap();
+    driver.deliver(Event::WorktreeAddRequested {
+        path: wt_blocked.to_str().unwrap().to_owned(),
+        spec: WorktreeSpec::ExistingBranch(BranchName("existing-br".into())),
+    });
+    fs::remove_file(found.paths.git_dir.join("index.lock")).unwrap();
+    match driver.outcome() {
+        Some(OpOutcome::Failed(f)) => assert_eq!(f.class, ErrorClass::PreconditionChanged),
+        other => panic!("expected PreconditionChanged with index.lock held, got {other:?}"),
+    }
+    assert!(!wt_blocked.exists());
+
+    // 3. Remove the linked worktree cleanly (even after locking it with force=true).
+    sb.git(&main, &["worktree", "lock", wt_new.to_str().unwrap()]);
+    driver.deliver(Event::RefreshRequested);
+    driver.deliver(Event::WorktreeRemoveRequested {
+        path: wt_new.to_str().unwrap().to_owned(),
+        force: true,
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+    assert!(!wt_new.exists());
+    assert_eq!(
+        driver.state.fresh_disk().unwrap().advanced.worktrees.len(),
+        1
+    );
+}
+
+#[test]
+fn submodule_update_init_recursive_and_sync_work_end_to_end() {
+    let sb = Sandbox::new();
+    let child = sb.init_repo("sub-child");
+    sb.commit(&child, "lib.txt", b"v1\n", "child v1");
+
+    let super_repo = sb.init_repo("sub-super");
+    sb.commit(&super_repo, "README.md", b"root\n", "super c1");
+    sb.git(
+        &super_repo,
+        &["submodule", "add", "-q", child.to_str().unwrap(), "libs/child"],
+    );
+    sb.git(&super_repo, &["commit", "-q", "-m", "add child"]);
+
+    // Clone without `--recurse-submodules` so the submodule starts Uninitialized.
+    let clone_dir = sb.root.join("sub-clone");
+    sb.git(
+        &sb.root,
+        &[
+            "clone",
+            "-q",
+            super_repo.to_str().unwrap(),
+            clone_dir.to_str().unwrap(),
+        ],
+    );
+    let found = discover(&clone_dir).unwrap();
+    let mut driver = Driver::open(found.paths.clone(), sb.env.clone());
+    assert_eq!(
+        driver.state.fresh_disk().unwrap().advanced.submodules[0].state,
+        SubmoduleState::Uninitialized
+    );
+
+    // Sync then update --init --recursive through the core+shell pipeline.
+    driver.deliver(Event::SubmoduleRequested {
+        op: SubmoduleOp::SyncRecursive,
+        path: None,
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+
+    driver.deliver(Event::SubmoduleRequested {
+        op: SubmoduleOp::UpdateInitRecursive,
+        path: Some(RepoPath("libs/child".into())),
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(
+        driver.state.fresh_disk().unwrap().advanced.submodules[0].state,
+        SubmoduleState::Clean
+    );
+    assert!(clone_dir.join("libs/child/lib.txt").is_file());
+}
+
+#[test]
+fn lfs_pull_reports_environment_error_when_git_lfs_is_missing_and_respects_lock_guard() {
+    let sb = Sandbox::new();
+    let repo = sb.init_repo("lfs-pull-repo");
+    sb.commit(
+        &repo,
+        ".gitattributes",
+        b"*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        "track lfs",
+    );
+    sb.commit(
+        &repo,
+        "asset.bin",
+        SAMPLE_LFS_POINTER.as_bytes(),
+        "add pointer",
+    );
+
+    let found = discover(&repo).unwrap();
+
+    // 1. Simulate a machine where `git-lfs` is NOT installed by pointing PATH
+    // to an empty temp directory (while invoking git itself via its full path).
+    let empty_bin = sb.root.join("empty-bin");
+    fs::create_dir_all(&empty_bin).unwrap();
+    let mut no_lfs_env = sb.env.clone();
+    no_lfs_env.push((OsString::from("PATH"), empty_bin.into_os_string()));
+    // Also override GIT_EXEC_PATH so Git for Windows doesn't find bundled git-lfs.
+    no_lfs_env.push((OsString::from("GIT_EXEC_PATH"), sb.root.clone().into_os_string()));
+
+    let git = Git::detect("git").unwrap();
+    // Resolve absolute git executable path so empty PATH still finds `git` itself.
+    let git_exe = which_git();
+    let git_abs = Git::detect(git_exe).unwrap_or(git);
+
+    // Verify helper detects absence when PATH/GIT_EXEC_PATH hide git-lfs.
+    let lfs_absent = git_lfs_version(&git_abs, &found.paths.workdir, &no_lfs_env).is_none();
+    if lfs_absent {
+        let mut driver = Driver {
+            paths: found.paths.clone(),
+            state: {
+                let (s, cmds) = open(RepoId {
+                    root_commit: None,
+                    remote_url: None,
+                });
+                let CoreCommand::ReadState { read, .. } = cmds[0] else {
+                    panic!()
+                };
+                let (s, _) = step(s, read_event(&found.paths, read));
+                s
+            },
+            runner: GitRunner::new(git_abs.clone(), found.paths.clone()).with_env(no_lfs_env),
+        };
+        driver.deliver(Event::LfsPullRequested { path: None });
+        match driver.outcome() {
+            Some(OpOutcome::Failed(f)) => {
+                assert_eq!(f.class, ErrorClass::Environment);
+                assert!(f.details.contains("Git LFS is not installed"), "{}", f.details);
+            }
+            other => panic!("expected Environment error when git-lfs missing, got {other:?}"),
+        }
+    }
+
+    // 2. Lock guard (Law 12): holding `index.lock` refuses LfsPull before running.
+    let mut driver = Driver::open(found.paths.clone(), sb.env.clone());
+    fs::write(found.paths.git_dir.join("index.lock"), b"lock").unwrap();
+    driver.deliver(Event::LfsPullRequested { path: None });
+    fs::remove_file(found.paths.git_dir.join("index.lock")).unwrap();
+    match driver.outcome() {
+        Some(OpOutcome::Failed(f)) => assert_eq!(f.class, ErrorClass::PreconditionChanged),
+        other => panic!("expected PreconditionChanged with index.lock held, got {other:?}"),
+    }
+}
+
+fn which_git() -> PathBuf {
+    #[cfg(windows)]
+    let cmd = ("where", "git");
+    #[cfg(not(windows))]
+    let cmd = ("which", "git");
+    Command::new(cmd.0)
+        .arg(cmd.1)
+        .output()
+        .ok()
+        .and_then(|o| {
+            o.status.success().then(|| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("git")
+                    .trim()
+                    .into()
+            })
+        })
+        .unwrap_or_else(|| PathBuf::from("git"))
 }

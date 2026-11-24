@@ -6,10 +6,14 @@ use std::path::Path;
 
 use invoke_core::watch::WatchRoots;
 use invoke_core::{
-    Area, BranchName, Head, LFS_SPEC_VERSION, LfsPointer, MAX_LFS_POINTER_BYTES, Oid, RepoId,
-    RepoState, SubmoduleState, WorktreeEntry, classify_submodule_state, format_byte_size,
-    gitattributes_uses_lfs, normalize_worktree_path, open, parse_lfs_pointer,
-    worktree_holding_branch,
+    Action, AdvancedSnapshot, Area, BranchName, BranchStart, Command, Conflicts, DiskState, Event,
+    GitArgs, Head, IndexId, LFS_SPEC_VERSION, LfsFile, LfsFileState, LfsPointer, LfsRefusal,
+    LfsSnapshot, LockState, MAX_LFS_POINTER_BYTES, Notice, Oid, OpOutcome, OpPhase, Phase,
+    RefName, RefsSnapshot, Refusal, RepoId, RepoPath, RepoState, StatusSnapshot, SubmoduleEntry,
+    SubmoduleOp, SubmoduleRefusal, SubmoduleState, WorktreeCheckout, WorktreeEntry,
+    WorktreeRefusal, WorktreeSpec, classify_submodule_state, format_byte_size,
+    gitattributes_uses_lfs, normalize_worktree_path, open, parse_lfs_pointer, step,
+    validate_worktree_path, worktree_holding_branch,
 };
 use proptest::prelude::*;
 
@@ -257,4 +261,315 @@ fn worktree_holding_branch_finds_checked_out_branch() {
     ];
     assert!(worktree_holding_branch(&wts, &BranchName("main".into())).is_some());
     assert!(worktree_holding_branch(&wts, &BranchName("dev".into())).is_none());
+}
+
+fn sample_disk(phase: Phase, lock: LockState) -> DiskState {
+    let oid1 = Oid::from_hex(&"1".repeat(40)).unwrap();
+    let oid2 = Oid::from_hex(&"2".repeat(40)).unwrap();
+    let mut refs = std::collections::BTreeMap::new();
+    refs.insert(RefName("refs/heads/main".into()), oid1.clone());
+    refs.insert(RefName("refs/heads/feature".into()), oid2.clone());
+    DiskState {
+        head: Head::Branch {
+            name: BranchName("main".into()),
+            oid: oid1.clone(),
+        },
+        phase,
+        index: IndexId::Checksum(oid1.clone()),
+        status: StatusSnapshot::default(),
+        refs: RefsSnapshot {
+            refs,
+            ..RefsSnapshot::default()
+        },
+        stashes: Vec::new(),
+        lock,
+        advanced: AdvancedSnapshot {
+            worktrees: vec![
+                WorktreeEntry {
+                    path: "/repo".into(),
+                    name: "repo".into(),
+                    head: Some(Head::Branch {
+                        name: BranchName("main".into()),
+                        oid: oid1.clone(),
+                    }),
+                    is_main: true,
+                    is_current: true,
+                    locked: None,
+                    prunable: false,
+                },
+                WorktreeEntry {
+                    path: "/repo-locked".into(),
+                    name: "repo-locked".into(),
+                    head: Some(Head::Detached(oid2.clone())),
+                    is_main: false,
+                    is_current: false,
+                    locked: Some("pinned".into()),
+                    prunable: false,
+                },
+            ],
+            submodules: vec![SubmoduleEntry {
+                name: "libs/child".into(),
+                path: RepoPath("libs/child".into()),
+                url: Some("https://example.com/child.git".into()),
+                index_oid: Some(oid2),
+                head_oid: None,
+                state: SubmoduleState::Uninitialized,
+            }],
+            lfs: LfsSnapshot {
+                detected: true,
+                files: vec![LfsFile {
+                    path: RepoPath("asset.bin".into()),
+                    pointer: Some(LfsPointer {
+                        oid_sha256: "a".repeat(64),
+                        size: 512,
+                    }),
+                    state: LfsFileState::Pointer,
+                }],
+            },
+        },
+    }
+}
+
+fn opened(disk: DiskState) -> RepoState {
+    let (state, commands) = open(RepoId {
+        root_commit: None,
+        remote_url: None,
+    });
+    let Command::ReadState { read, .. } = commands[0] else {
+        panic!("expected ReadState");
+    };
+    let (state, _) = step(state, Event::StateRead { read, disk });
+    state
+}
+
+proptest! {
+    /// Any path that is empty, whitespace-only, starts with `-`, or contains
+    /// control characters is rejected by `validate_worktree_path`.
+    #[test]
+    fn worktree_path_validation_rejects_flags_and_control_chars(
+        text in prop_oneof!["[ \t]{0,6}", "-[a-z0-9/]{0,12}", "[a-z]{1,4}[\r\n\0][a-z]{1,4}"]
+    ) {
+        prop_assert!(validate_worktree_path(&text).is_err());
+    }
+
+    /// When a repo is busy (merge/rebase in progress), every P10 write is
+    /// refused with `Refusal::RepoBusy` and emits no write commands.
+    #[test]
+    fn busy_repo_refuses_all_p10_operations(
+        op in prop_oneof![
+            Just(SubmoduleOp::Init),
+            Just(SubmoduleOp::UpdateInitRecursive),
+            Just(SubmoduleOp::SyncRecursive),
+        ]
+    ) {
+        let busy_disk = sample_disk(
+            Phase::Merging {
+                conflicts: Conflicts::default(),
+            },
+            LockState::Free,
+        );
+        for (event, action) in [
+            (
+                Event::WorktreeAddRequested {
+                    path: "/repo-new".into(),
+                    spec: WorktreeSpec::ExistingBranch(BranchName("feature".into())),
+                },
+                Action::WorktreeAdd,
+            ),
+            (
+                Event::WorktreeRemoveRequested {
+                    path: "/repo-locked".into(),
+                    force: true,
+                },
+                Action::WorktreeRemove,
+            ),
+            (
+                Event::SubmoduleRequested { op, path: None },
+                Action::Submodule,
+            ),
+            (Event::LfsPullRequested { path: None }, Action::LfsPull),
+        ] {
+            let state = opened(busy_disk.clone());
+            let (state, commands) = step(state, event);
+            prop_assert!(commands.iter().all(|c| !c.is_write()));
+            prop_assert_eq!(
+                state.notice,
+                Some(Notice::Refused {
+                    action,
+                    reason: Refusal::RepoBusy
+                })
+            );
+        }
+    }
+
+    /// Law 12 & Law 13: P10 operations wait while `index.lock` is held by
+    /// another process, dispatch once free, can be cancelled while running,
+    /// and trigger a fresh `ReadState` after cancellation.
+    #[test]
+    fn p10_ops_respect_lock_guard_and_support_cancellation(choice in 0u8..4) {
+        let event = match choice {
+            0 => Event::WorktreeAddRequested {
+                path: "/repo-new".into(),
+                spec: WorktreeSpec::ExistingBranch(BranchName("feature".into())),
+            },
+            1 => Event::WorktreeRemoveRequested {
+                path: "/repo-locked".into(),
+                force: true,
+            },
+            2 => Event::SubmoduleRequested {
+                op: SubmoduleOp::UpdateInitRecursive,
+                path: Some(RepoPath("libs/child".into())),
+            },
+            _ => Event::LfsPullRequested { path: None },
+        };
+
+        // 1. Held lock queues the operation without issuing any write command.
+        let state = opened(sample_disk(Phase::Clean, LockState::HeldByOther));
+        let (state, commands) = step(state, event);
+        prop_assert!(commands.is_empty());
+        prop_assert_eq!(state.ops.queued.len(), 1);
+        prop_assert!(state.ops.running.is_none());
+
+        // 2. Refresh sees lock freed -> op dispatches as `Command::RunGit`.
+        let (state, commands) = step(state, Event::RefreshRequested);
+        let Command::ReadState { read, .. } = commands[0] else {
+            panic!("expected ReadState");
+        };
+        let (state, commands) = step(
+            state,
+            Event::StateRead {
+                read,
+                disk: sample_disk(Phase::Clean, LockState::Free),
+            },
+        );
+        let run_op = commands.iter().find_map(|c| match c {
+            Command::RunGit { op, .. } => Some(*op),
+            _ => None,
+        });
+        let op = run_op.expect("expected RunGit once lock freed");
+        prop_assert!(state.ops.running.is_some());
+
+        // 3. Cancel emits `Command::CancelOp(op)` and enters `OpPhase::Cancelling`.
+        let (state, commands) = step(state, Event::OpCancelRequested(op));
+        prop_assert_eq!(commands, vec![Command::CancelOp(op)]);
+        prop_assert_eq!(
+            state.ops.running.as_ref().map(|r| &r.phase),
+            Some(&OpPhase::Cancelling)
+        );
+
+        // 4. Law 13: OpFinished(Cancelled) triggers a fresh full ReadState.
+        let (state, commands) = step(state, Event::OpFinished(op, OpOutcome::Cancelled));
+        prop_assert!(state.ops.running.is_none());
+        let has_read = commands
+            .iter()
+            .any(|c| matches!(c, Command::ReadState { .. }));
+        prop_assert!(has_read);
+    }
+}
+
+#[test]
+fn worktree_submodule_and_lfs_refusals_cover_edge_cases() {
+    let disk = sample_disk(Phase::Clean, LockState::Free);
+
+    // Branch already checked out in a worktree is refused.
+    let (s, _) = step(
+        opened(disk.clone()),
+        Event::WorktreeAddRequested {
+            path: "/repo-dup".into(),
+            spec: WorktreeSpec::ExistingBranch(BranchName("main".into())),
+        },
+    );
+    assert_eq!(
+        s.notice,
+        Some(Notice::Refused {
+            action: Action::WorktreeAdd,
+            reason: Refusal::Worktree(WorktreeRefusal::BranchCheckedOut(BranchName("main".into())))
+        })
+    );
+
+    // Removing main worktree is refused.
+    let (s, _) = step(
+        opened(disk.clone()),
+        Event::WorktreeRemoveRequested {
+            path: "/repo".into(),
+            force: true,
+        },
+    );
+    assert_eq!(
+        s.notice,
+        Some(Notice::Refused {
+            action: Action::WorktreeRemove,
+            reason: Refusal::Worktree(WorktreeRefusal::CannotRemoveMain)
+        })
+    );
+
+    // Removing locked worktree without force is refused.
+    let (s, _) = step(
+        opened(disk.clone()),
+        Event::WorktreeRemoveRequested {
+            path: "/repo-locked".into(),
+            force: false,
+        },
+    );
+    assert_eq!(
+        s.notice,
+        Some(Notice::Refused {
+            action: Action::WorktreeRemove,
+            reason: Refusal::Worktree(WorktreeRefusal::Locked)
+        })
+    );
+
+    // Unknown submodule path is refused.
+    let (s, _) = step(
+        opened(disk.clone()),
+        Event::SubmoduleRequested {
+            op: SubmoduleOp::SyncRecursive,
+            path: Some(RepoPath("libs/nope".into())),
+        },
+    );
+    assert_eq!(
+        s.notice,
+        Some(Notice::Refused {
+            action: Action::Submodule,
+            reason: Refusal::Submodule(SubmoduleRefusal::NotFound(RepoPath("libs/nope".into())))
+        })
+    );
+
+    // LFS pull when LFS not detected is refused.
+    let mut no_lfs = disk;
+    no_lfs.advanced.lfs = LfsSnapshot::default();
+    let (s, _) = step(opened(no_lfs), Event::LfsPullRequested { path: None });
+    assert_eq!(
+        s.notice,
+        Some(Notice::Refused {
+            action: Action::LfsPull,
+            reason: Refusal::Lfs(LfsRefusal::NotDetected)
+        })
+    );
+
+    // Expected ref guard is attached to WorktreeAdd for existing/new branches.
+    let (s, cmds) = step(
+        opened(sample_disk(Phase::Clean, LockState::Free)),
+        Event::WorktreeAddRequested {
+            path: "/repo-new".into(),
+            spec: WorktreeSpec::NewBranch {
+                name: "brand-new".into(),
+                at: BranchStart::Head,
+            },
+        },
+    );
+    assert!(s.ops.running.is_some());
+    let Some(Command::RunGit {
+        args:
+            args @ GitArgs::WorktreeAdd {
+                checkout: WorktreeCheckout::NewBranch { .. },
+                ..
+            },
+        ..
+    }) = cmds.first()
+    else {
+        panic!("expected WorktreeAdd RunGit: {cmds:?}");
+    };
+    assert_eq!(args.expected_refs().len(), 1);
+    assert_eq!(args.expected_refs()[0].oid, None);
 }
