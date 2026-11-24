@@ -22,6 +22,7 @@ Memungkinkan user melakukan stage, unstage, dan discard (yang tetap undoable & t
 - Combined single undo point untuk multi-file `Stage all` / `Discard all` (opsional nanti).
 
 ## Handoff notes
+- Review implementasi: snapshot index juga menyimpan tree staged agar blob tetap hidup saat Git prune, serta shared index agar split index dapat dipulihkan. Versi untuk Discard all dicatat sebelum konfirmasi dan harus berasal dari satu index.
 - Shell menjalankan add/restore staged pada salinan index sambil memegang `index.lock`. Discard menyiapkan checkout dengan filter Git, mencatat hasilnya untuk undo sebelum mengganti file, dan menjaga index persis. Snapshot file menyimpan mode Git, termasuk symlink. Tes fokus binary/non-UTF-8, intent-to-add, dan CRLF lulus di Windows.
 - Spec gap: atribut filesystem di luar mode Git (misalnya ACL atau bit izin selain executable) tidak dicakup model undo. Usulan: pertahankan cakupan byte, tipe, target symlink, dan mode Git yang didefinisikan spesifikasi.
 - Core menjadwalkan aksi file melalui antrean tulis. Stage/unstage menyimpan byte index sebagai blob agar flag intent-to-add dan index yang semula absen dapat dipulihkan. Kedua property test baru gagal saat guard expected-index sengaja dibalik, lalu perubahan tersebut dikembalikan.

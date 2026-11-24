@@ -677,6 +677,46 @@ fn whole_file_unstage_mode_only_and_undo_restore_exact_index() {
     assert_eq!(repo.worktree_bytes("script"), b"script\n");
 }
 
+#[test]
+fn whole_file_undo_keeps_staged_blobs_and_split_index_reachable() {
+    use invoke_core::{FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("file", "base\n");
+    repo.commit_all("base");
+    fs::write(repo.paths.workdir.join("file"), b"staged\0").unwrap();
+    repo.git(&["add", "--", "file"]);
+    repo.git(&["update-index", "--split-index"]);
+    let shared = fs::read_dir(&repo.paths.git_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sharedindex.")
+        })
+        .unwrap();
+    let before = fs::read(repo.paths.git_dir.join("index")).unwrap();
+    repo.git(&["config", "core.splitIndex", "false"]);
+    let mut driver = Driver::open(&repo);
+    driver.deliver(Event::FileRequested(FileRequest {
+        path: RepoPath("file".into()),
+        action: FileAction::Unstage,
+        based_on: shell::precondition::current(&repo.paths).unwrap().index,
+    }));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    if shared.exists() {
+        fs::remove_file(&shared).unwrap();
+    }
+    repo.git(&["prune", "--expire=now"]);
+    driver.deliver(Event::UndoRequested);
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(fs::read(repo.paths.git_dir.join("index")).unwrap(), before);
+    assert_eq!(repo.index_bytes("file").as_deref(), Some(&b"staged\0"[..]));
+    assert!(shared.is_file());
+}
+
 // ---- the status read ----------------------------------------------------
 
 #[test]

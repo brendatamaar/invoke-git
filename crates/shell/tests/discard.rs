@@ -407,26 +407,72 @@ fn whole_file_discard_refuses_a_changed_file_or_held_index_lock() {
 }
 
 #[test]
-#[cfg(unix)]
-fn whole_file_discard_and_undo_restore_mode_and_symlink() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+fn whole_file_actions_keep_symlink_targets_and_undo_restores_the_link() {
+    use invoke_core::{FileAction, FileRequest};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as symlink;
 
     let repo = TempRepo::new();
     let root = &repo.paths.workdir;
     let link = root.join("link");
-    let script = root.join("script");
-    repo.write("script", "script\n");
-    symlink("first", &link).unwrap();
+    repo.git(&["config", "core.symlinks", "true"]);
+    repo.write("first", "untouched first");
+    repo.write("second", "untouched second");
+    let created = symlink("first", &link);
+    #[cfg(windows)]
+    if created
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(1314))
+    {
+        eprintln!("Native symlinks require Windows developer mode or a symlink privilege");
+        return;
+    }
+    created.unwrap();
     repo.commit_all("base");
     fs::remove_file(&link).unwrap();
     symlink("second", &link).unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     let mut driver = Driver::open(&repo);
+    for (action, target) in [
+        (FileAction::Stage, "second"),
+        (FileAction::Unstage, "first"),
+    ] {
+        driver.deliver(Event::FileRequested(FileRequest {
+            path: RepoPath("link".into()),
+            action,
+            based_on: shell::precondition::current(&repo.paths).unwrap().index,
+        }));
+        assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+        assert_eq!(repo.git(&["show", ":link"]), target);
+        assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("second"));
+    }
     driver.deliver(whole_file_request(&repo, "link"));
     assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
     assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("first"));
     driver.undo();
     assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("second"));
+    assert_eq!(
+        repo.worktree_bytes("first").as_deref(),
+        Some(&b"untouched first"[..])
+    );
+    assert_eq!(
+        repo.worktree_bytes("second").as_deref(),
+        Some(&b"untouched second"[..])
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn whole_file_discard_and_undo_restore_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TempRepo::new();
+    let script = repo.paths.workdir.join("script");
+    repo.write("script", "script\n");
+    repo.commit_all("base");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut driver = Driver::open(&repo);
     driver.deliver(whole_file_request(&repo, "script"));
     assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
     assert_eq!(script.metadata().unwrap().permissions().mode() & 0o111, 0);
@@ -434,6 +480,39 @@ fn whole_file_discard_and_undo_restore_mode_and_symlink() {
     assert_eq!(
         script.metadata().unwrap().permissions().mode() & 0o111,
         0o111
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn whole_file_discard_and_undo_keep_git_symlink_emulation() {
+    // Git for Windows uses a plain file containing the link target when
+    // symlink creation is disabled. This fixture needs no extra privilege.
+    let repo = TempRepo::new();
+    repo.git(&["config", "core.symlinks", "false"]);
+    repo.write("target", "first");
+    repo.commit_all("base");
+    let blob = repo.git(&["rev-parse", "HEAD:target"]);
+    repo.git(&[
+        "update-index",
+        "--cacheinfo",
+        "120000",
+        blob.trim(),
+        "target",
+    ]);
+    repo.git(&["commit", "-qm", "record symlink"]);
+    repo.write("target", "second");
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "target"));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(
+        repo.worktree_bytes("target").as_deref(),
+        Some(&b"first"[..])
+    );
+    driver.undo();
+    assert_eq!(
+        repo.worktree_bytes("target").as_deref(),
+        Some(&b"second"[..])
     );
 }
 

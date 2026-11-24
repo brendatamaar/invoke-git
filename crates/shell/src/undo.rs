@@ -118,30 +118,10 @@ impl UndoRunner {
         }
         let real = self.paths.git_dir.join("index");
         if point.index_effect == IndexEffect::RestoreBytes {
-            let bytes = match fs::read(&real) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(error) => {
-                    return Err(fail(
-                        ErrorClass::Environment,
-                        format!("read index: {error}"),
-                    ));
-                }
-            };
-            precondition::check(&self.paths, &current)?;
-            let blob = self
-                .run(
-                    &["hash-object", "-w", "--no-filters", "--stdin"],
-                    &[],
-                    Some(&bytes),
-                )
-                .map_err(|details| fail(ErrorClass::Bug, details))?;
-            let id = Oid::from_hex(blob.trim())
-                .map_err(|error| fail(ErrorClass::Bug, format!("hash index: {error:?}")))?;
-            precondition::check(&self.paths, &current)?;
-            self.run(&["update-ref", &undo_ref(op), id.as_hex()], &[], None)
-                .map_err(|details| fail(ErrorClass::Bug, details))?;
-            return Ok(id);
+            let _lock = precondition::IndexLock::acquire(&self.paths, &current)?;
+            return self
+                .save_index_bytes(op, &real)
+                .map_err(|details| fail(ErrorClass::Bug, details));
         }
         let copy = self
             .paths
@@ -186,6 +166,48 @@ impl UndoRunner {
                 .map_err(|details| fail(ErrorClass::Bug, details))?;
         }
         Ok(tree)
+    }
+
+    fn save_index_bytes(&self, op: OpId, real: &std::path::Path) -> Result<Oid, String> {
+        let bytes = match fs::read(real) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(format!("read index: {error}")),
+        };
+        let hash_blob = |bytes: &[u8]| {
+            self.run(
+                &["hash-object", "-w", "--no-filters", "--stdin"],
+                &[],
+                Some(bytes),
+            )
+        };
+        let index = hash_blob(&bytes)?;
+        let mut entries = format!("100644 blob {}\tindex\n", index.trim());
+        let repo = precondition::open(&self.paths)?;
+        if let Some(name) = shared_index_name(&bytes, repo.object_hash())? {
+            let shared = fs::read(self.paths.git_dir.join(&name))
+                .map_err(|error| format!("read {name}: {error}"))?;
+            let blob = hash_blob(&shared)?;
+            entries.push_str(&format!("100644 blob {}\t{name}\n", blob.trim()));
+        }
+        // Git's GC cannot see the staged object ids inside a raw index blob.
+        // Keep the index tree reachable alongside it.
+        let scratch = precondition::ScratchDir::create(&self.paths.git_dir)
+            .map_err(|error| format!("prepare index snapshot: {error}"))?;
+        let copy = scratch.0.join("index");
+        if !bytes.is_empty() {
+            fs::write(&copy, &bytes).map_err(|error| format!("copy index: {error}"))?;
+        }
+        let staged = self.run(
+            &["write-tree"],
+            &[("GIT_INDEX_FILE", copy.as_os_str())],
+            None,
+        )?;
+        entries.push_str(&format!("040000 tree {}\tstaged\n", staged.trim()));
+        let tree = self.run(&["mktree"], &[], Some(entries.as_bytes()))?;
+        let id = Oid::from_hex(tree.trim()).map_err(|error| format!("save index: {error:?}"))?;
+        self.run(&["update-ref", &undo_ref(op), id.as_hex()], &[], None)?;
+        Ok(id)
     }
 
     /// Restores the recorded refs, atomically and only if each still holds
@@ -297,9 +319,34 @@ impl UndoRunner {
             let repo = precondition::open(&self.paths)?;
             let id = gix::ObjectId::from_hex(replay.tree.as_hex().as_bytes())
                 .map_err(|error| error.to_string())?;
-            repo.find_blob(id)
-                .map(|blob| blob.data.clone())
-                .map_err(|error| error.to_string())
+            let tree = repo.find_tree(id).map_err(|error| error.to_string())?;
+            let read = |name: &str| -> Result<gix::Blob<'_>, String> {
+                let entry = tree
+                    .lookup_entry_by_path(name)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("index snapshot is missing {name}"))?;
+                repo.find_blob(entry.object_id())
+                    .map_err(|error| error.to_string())
+            };
+            let index = read("index")?;
+            if let Some(name) = shared_index_name(&index.data, repo.object_hash())? {
+                let base = read(&name)?;
+                let path = self.paths.git_dir.join(&name);
+                match fs::read(&path) {
+                    Ok(bytes) if bytes == base.data => {}
+                    Ok(_) => return Err(format!("{name} differs from the saved shared index")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let scratch = precondition::ScratchDir::create(&self.paths.git_dir)
+                            .map_err(|error| format!("prepare shared index restore: {error}"))?;
+                        let copy = scratch.0.join(&name);
+                        fs::write(&copy, &base.data)
+                            .and_then(|()| fs::rename(&copy, &path))
+                            .map_err(|error| format!("restore {name}: {error}"))?;
+                    }
+                    Err(error) => return Err(format!("read {name}: {error}")),
+                }
+            }
+            Ok(index.data.clone())
         })();
         match result {
             Ok(bytes) => match lock.replace(&self.paths.git_dir, &bytes) {
@@ -422,6 +469,19 @@ impl UndoRunner {
             ))
         }
     }
+}
+
+fn shared_index_name(bytes: &[u8], hash: gix::hash::Kind) -> Result<Option<String>, String> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let timestamp = gix::index::State::new(hash).timestamp();
+    let (index, _) = gix::index::State::from_bytes(bytes, timestamp, hash, Default::default())
+        .map_err(|error| format!("decode saved index: {error}"))?;
+    Ok(index
+        .link()
+        .filter(|link| !link.shared_index_checksum.is_null())
+        .map(|link| format!("sharedindex.{}", link.shared_index_checksum)))
 }
 
 fn failed(class: ErrorClass, details: String) -> OpOutcome {

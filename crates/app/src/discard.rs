@@ -72,6 +72,12 @@ pub fn prepare(paths: &RepoPaths, files: Vec<RepoPath>) -> Result<Confirm, Strin
             Ok((path, inputs))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    if files
+        .windows(2)
+        .any(|pair| pair[0].1.based_on != pair[1].1.based_on)
+    {
+        return Err("The index changed while preparing the discard. Try again.".into());
+    }
     if files.len() == 1 {
         let (path, inputs) = files.remove(0);
         return Ok(whole_file(path, inputs));

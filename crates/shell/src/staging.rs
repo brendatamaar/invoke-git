@@ -265,6 +265,17 @@ pub fn load_inputs(
     if id(&index_path)? != before {
         return Err(InputsError::Moved);
     }
+    if let (Some(old), Some(new)) = (&old, &new)
+        && old.text == new.text
+        && old.executable != new.executable
+    {
+        let mode = |side: &Side| if side.executable { "100755" } else { "100644" };
+        return Err(InputsError::NotText(format!(
+            "Mode changed from {} to {}",
+            mode(old),
+            mode(new)
+        )));
+    }
     let executable = new
         .as_ref()
         .or(old.as_ref())

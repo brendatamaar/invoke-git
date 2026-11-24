@@ -440,21 +440,21 @@ mod tests {
             head(),
             refs(),
             index(),
-            any::<bool>(),
+            prop_oneof![
+                Just(IndexEffect::Rewrites),
+                Just(IndexEffect::RestoreBytes),
+                Just(IndexEffect::Untouched),
+            ],
             reversal(),
         )
             .prop_map(
-                |(op, label, head, refs, index, rewrites, reverse)| UndoPoint {
+                |(op, label, head, refs, index, index_effect, reverse)| UndoPoint {
                     op: OpId(op),
                     label,
                     head,
                     refs,
                     index,
-                    index_effect: if rewrites {
-                        IndexEffect::Rewrites
-                    } else {
-                        IndexEffect::Untouched
-                    },
+                    index_effect,
                     reverse,
                 },
             );

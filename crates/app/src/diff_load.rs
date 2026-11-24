@@ -64,10 +64,7 @@ pub fn load(paths: &RepoPaths, path: &RepoPath, section: Section) -> Loaded {
             data.inputs = Some(meta(&inputs));
             Loaded::Diff(Box::new(data))
         }
-        Err(InputsError::NotText(reason)) => {
-            let text = format!("{reason}. There is no text diff to show.");
-            Loaded::FileMessage { text, mode }
-        }
+        Err(InputsError::NotText(text)) => Loaded::FileMessage { text, mode },
         Err(InputsError::Read(error)) => {
             Loaded::Message(format!("Could not read {}: {error}", path.0))
         }

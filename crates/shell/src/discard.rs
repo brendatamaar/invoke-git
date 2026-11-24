@@ -136,7 +136,7 @@ impl DiscardRunner {
         // Prepare checkout using Git's smudge / EOL conversion. Record the
         // resulting bytes and mode for undo before replacing the real file.
         let scratch = tracked
-            .then(|| precondition::ScratchDir::create(&self.paths.workdir))
+            .then(|| scratch_for(&full))
             .transpose()
             .map_err(environment)?;
         let staged = if let Some(scratch) = &scratch {
@@ -496,7 +496,7 @@ fn write_link(bytes: &[u8], link: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::{symlink_dir, symlink_file};
     let (kind, bytes) = bytes.split_first().ok_or(io::ErrorKind::InvalidData)?;
-    if bytes.len() % 2 != 0 || *kind > 1 {
+    if !bytes.len().is_multiple_of(2) || *kind > 1 {
         return Err(io::ErrorKind::InvalidData.into());
     }
     let target: Vec<u16> = bytes
@@ -611,15 +611,18 @@ impl UndoRunner {
                 );
             }
         };
-        match file_version(&full, path, repo.object_hash()) {
-            Ok(now) if now == after => {}
-            Ok(_) => {
-                return stale(format!(
-                    "{} was changed after the discard; undo does not overwrite it",
+        let check = || -> Result<(), String> {
+            worktree_path(&self.paths.workdir, path)?;
+            if file_version(&full, path, repo.object_hash())? != after {
+                return Err(format!(
+                    "{} changed after the discard. Undo requires the discarded version.",
                     path.0
                 ));
             }
-            Err(details) => return stale(details),
+            Ok(())
+        };
+        if let Err(details) = check() {
+            return stale(details);
         }
         let environment =
             |error: io::Error| failed(ErrorClass::Environment, format!("{}: {error}", path.0));
@@ -632,7 +635,18 @@ impl UndoRunner {
                     Ok(object) => object,
                     Err(details) => return failed(ErrorClass::Bug, details),
                 };
-                if let Err(error) = write_file(&full, &object.data, file.mode) {
+                let scratch = match scratch_for(&full) {
+                    Ok(scratch) => scratch,
+                    Err(error) => return environment(error),
+                };
+                let temporary = scratch.0.join("file");
+                if let Err(error) = write_file(&temporary, &object.data, file.mode) {
+                    return environment(error);
+                }
+                if let Err(details) = check() {
+                    return stale(details);
+                }
+                if let Err(error) = install_file(&temporary, &full) {
                     return environment(error);
                 }
             }
@@ -646,20 +660,21 @@ impl UndoRunner {
     }
 }
 
-/// Writes `bytes` to `full` through a temporary file in the same folder, so
-/// the old file is replaced in one step and never left half written.
-fn write_file(full: &Path, bytes: &[u8], mode: WorktreeMode) -> io::Result<()> {
+/// Choose scratch space on the same filesystem as the eventual replacement.
+fn scratch_for(full: &Path) -> io::Result<precondition::ScratchDir> {
     let parent = full.parent().ok_or(io::ErrorKind::InvalidInput)?;
     let existing = parent
         .ancestors()
         .find(|dir| dir.is_dir())
         .ok_or(io::ErrorKind::NotFound)?;
-    let scratch = precondition::ScratchDir::create(existing)?;
-    let temporary = scratch.0.join("file");
+    precondition::ScratchDir::create(existing)
+}
+
+fn write_file(temporary: &Path, bytes: &[u8], mode: WorktreeMode) -> io::Result<()> {
     if mode == WorktreeMode::Symlink {
-        write_link(bytes, &temporary)?;
+        write_link(bytes, temporary)?;
     } else {
-        fs::write(&temporary, bytes)?;
+        fs::write(temporary, bytes)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -668,10 +683,10 @@ fn write_file(full: &Path, bytes: &[u8], mode: WorktreeMode) -> io::Result<()> {
             } else {
                 0o644
             };
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(permissions))?;
+            fs::set_permissions(temporary, fs::Permissions::from_mode(permissions))?;
         }
     }
-    install_file(&temporary, full)
+    Ok(())
 }
 
 fn install_file(source: &Path, target: &Path) -> io::Result<()> {
