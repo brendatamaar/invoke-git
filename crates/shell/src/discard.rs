@@ -204,9 +204,9 @@ impl DiscardRunner {
         expect_file: Option<&Oid>,
     ) -> OpOutcome {
         let stale = |details: String| failed(ErrorClass::PreconditionChanged, details);
-        let full = match worktree_path(&self.paths.workdir, path) {
+        let full = match locate(&self.paths.workdir, path) {
             Ok(full) => full,
-            Err(details) => return failed(ErrorClass::Bug, details),
+            Err(failure) => return OpOutcome::Failed(failure),
         };
         if self.paths.git_dir.join("index.lock").exists() {
             return stale("index.lock exists: another git process is running".into());
@@ -225,12 +225,12 @@ impl DiscardRunner {
             Ok(repo) => repo.object_hash(),
             Err(details) => return failed(ErrorClass::Bug, details),
         };
-        let before = match file_version(&full, path, hash) {
+        let before = match version_on_disk(&full, path, hash) {
             Ok(Some(file)) if file.mode == WorktreeMode::Symlink => {
                 return stale(format!("{} is now a symlink", path.0));
             }
             Ok(before) => before,
-            Err(details) => return failed(ErrorClass::Environment, details),
+            Err(failure) => return OpOutcome::Failed(failure),
         };
         let found = before.as_ref().map(|file| &file.blob);
         if found != expect_file {
@@ -375,7 +375,18 @@ fn checkout_entry(repo: &gix::Repository, path: &RepoPath) -> Result<bool, Strin
 /// `path` under `workdir`, refusing anything that could leave the repo or
 /// reach `.git`: a discard (and its undo) writes and deletes files.
 pub(crate) fn worktree_path(workdir: &Path, path: &RepoPath) -> Result<PathBuf, String> {
-    check_repo_path(path)?;
+    locate(workdir, path).map_err(|failure| failure.details)
+}
+
+/// [`worktree_path`], with what kind of failure it is: a path the core
+/// should never have built is a bug; a folder on the way that is now a
+/// link, a file, or named in another case on disk is a changed
+/// precondition; a lookup the system refuses is the environment.
+fn locate(workdir: &Path, path: &RepoPath) -> Result<PathBuf, Failure> {
+    check_repo_path(path).map_err(|details| Failure {
+        class: ErrorClass::Bug,
+        details,
+    })?;
     let mut full = workdir.to_path_buf();
     let mut parts = path.0.split('/').peekable();
     while let Some(part) = parts.next() {
@@ -384,9 +395,20 @@ pub(crate) fn worktree_path(workdir: &Path, path: &RepoPath) -> Result<PathBuf, 
             // `is_dir` is false for symlinks and junctions (name-surrogate
             // reparse points); a OneDrive placeholder folder is a folder.
             match fs::symlink_metadata(&full) {
-                Ok(metadata) if metadata.is_dir() => {}
+                Ok(metadata) if metadata.is_dir() => same_name_on_disk(&full, path)?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                _ => return Err(outside(path)),
+                Ok(_) => {
+                    return Err(Failure {
+                        class: ErrorClass::PreconditionChanged,
+                        details: outside(path),
+                    });
+                }
+                Err(error) => {
+                    return Err(Failure {
+                        class: ErrorClass::Environment,
+                        details: format!("{}: {error}", path.0),
+                    });
+                }
             }
         }
     }
@@ -457,14 +479,19 @@ fn same_name_on_disk(full: &Path, path: &RepoPath) -> Result<(), Failure> {
         class: ErrorClass::Environment,
         details: format!("{}: {error}", path.0),
     })?;
-    if Some(found.as_os_str()) == full.file_name() {
+    let expected = full.file_name().unwrap_or_default();
+    if found.as_os_str() == expected {
         return Ok(());
     }
+    let what = if expected == std::ffi::OsStr::new(&path.0) {
+        path.0.clone()
+    } else {
+        format!("{} (in {})", expected.to_string_lossy(), path.0)
+    };
     Err(Failure {
         class: ErrorClass::PreconditionChanged,
         details: format!(
-            "{} is named {} on disk. Rename it to match Git first.",
-            path.0,
+            "{what} is named {} on disk. Rename it to match Git first.",
             found.to_string_lossy()
         ),
     })
@@ -542,10 +569,22 @@ fn file_version(
     path: &RepoPath,
     hash: gix::hash::Kind,
 ) -> Result<Option<FileVersion>, String> {
-    read_file(full, path)?
+    version_on_disk(full, path, hash).map_err(|failure| failure.details)
+}
+
+/// [`file_version`], keeping the kind of failure from [`read_disk`].
+fn version_on_disk(
+    full: &Path,
+    path: &RepoPath,
+    hash: gix::hash::Kind,
+) -> Result<Option<FileVersion>, Failure> {
+    read_disk(full, path)?
         .map(|file| {
             Ok(FileVersion {
-                blob: blob_id(hash, &file.bytes)?,
+                blob: blob_id(hash, &file.bytes).map_err(|details| Failure {
+                    class: ErrorClass::Bug,
+                    details,
+                })?,
                 mode: file.mode,
             })
         })

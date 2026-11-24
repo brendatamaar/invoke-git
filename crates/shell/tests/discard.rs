@@ -1683,3 +1683,51 @@ fn a_read_only_file_named_like_the_backup_is_discarded_and_undone() {
         Some(&b"changed\0"[..])
     );
 }
+
+/// Re-check: a case mismatch in a folder on the way is caught like one in
+/// the file name, and both are a changed precondition for the patch runner
+/// (not an environment error or a bug).
+#[test]
+#[cfg(windows)]
+fn a_case_mismatch_on_the_way_or_at_the_leaf_is_a_changed_precondition() {
+    let repo = TempRepo::new();
+    repo.write("Dir/foo.txt", "a\nb\n");
+    repo.write("bar.txt", "a\nb\n");
+    repo.commit_all("base");
+    repo.write("Dir/foo.txt", "a\nB\n");
+    repo.write("bar.txt", "a\nB\n");
+    let root = &repo.paths.workdir;
+    fs::rename(root.join("Dir"), root.join("dir")).unwrap();
+    fs::rename(root.join("bar.txt"), root.join("Bar.txt")).unwrap();
+    let error = shell::discard::file_inputs(&repo.paths, &RepoPath("Dir/foo.txt".into()))
+        .err()
+        .expect("a folder named in another case must be refused");
+    assert!(error.contains("dir"), "{error}");
+    let discard = DiscardRunner::new(Git::detect("git").unwrap(), repo.paths.clone())
+        .with_env(repo.env.clone());
+    let blob = shell::staging::blob_id(gix::hash::Kind::Sha1, b"a\nB\n").unwrap();
+    for name in ["Dir/foo.txt", "bar.txt"] {
+        let patch = Patch(format!(
+            "diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -1,2 +1,2 @@\n a\n-B\n+b\n"
+        ));
+        let index = shell::precondition::current(&repo.paths).unwrap().index;
+        match discard.apply(OpId(3), &patch, &RepoPath(name.into()), &index, Some(&blob)) {
+            Event::OpFinished(_, OpOutcome::Failed(failure)) => {
+                assert_eq!(
+                    failure.class,
+                    ErrorClass::PreconditionChanged,
+                    "{name}: {failure:?}"
+                );
+            }
+            other => panic!("{name}: expected a refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        repo.worktree_bytes("dir/foo.txt").as_deref(),
+        Some(&b"a\nB\n"[..])
+    );
+    assert_eq!(
+        repo.worktree_bytes("Bar.txt").as_deref(),
+        Some(&b"a\nB\n"[..])
+    );
+}
