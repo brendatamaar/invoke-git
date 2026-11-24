@@ -163,7 +163,7 @@ impl DiscardRunner {
                 });
             }
             let staged = scratch.0.join(&path.0);
-            fix_link_kind(&staged, &full).map_err(environment)?;
+            fix_link_kind(&staged, &self.paths.workdir, path).map_err(environment)?;
             Some(staged)
         } else {
             None
@@ -183,8 +183,11 @@ impl DiscardRunner {
         if now()?.as_ref() != file {
             return Err(changed());
         }
-        if let Some(staged) = staged {
-            install_file(&staged, &full).map_err(environment)?;
+        if let (Some(staged), Some(scratch)) = (staged, scratch) {
+            install_or_keep(&staged, &full, scratch).map_err(|details| Failure {
+                class: ErrorClass::Environment,
+                details: format!("discard {}: {details}", path.0),
+            })?;
         } else {
             remove_leaf(&full).map_err(environment)?;
         }
@@ -761,8 +764,8 @@ impl UndoRunner {
                 if let Err(details) = check() {
                     return stale(details);
                 }
-                if let Err(error) = install_file(&temporary, &full) {
-                    return environment(error);
+                if let Err(details) = install_or_keep(&temporary, &full, scratch) {
+                    return failed(ErrorClass::Environment, format!("{}: {details}", path.0));
                 }
             }
             None => {
@@ -787,15 +790,14 @@ fn scratch_for(workdir: &Path) -> io::Result<precondition::ScratchDir> {
 /// missing, so a link to a directory came out as a file link: make it again
 /// with the kind the target has from where the link will live.
 #[cfg(windows)]
-fn fix_link_kind(staged: &Path, full: &Path) -> io::Result<()> {
+fn fix_link_kind(staged: &Path, workdir: &Path, path: &RepoPath) -> io::Result<()> {
     use std::os::windows::fs::{FileTypeExt, symlink_dir, symlink_file};
     let metadata = fs::symlink_metadata(staged)?;
     if !metadata.file_type().is_symlink() {
         return Ok(());
     }
     let target = fs::read_link(staged)?;
-    let parent = full.parent().ok_or(io::ErrorKind::InvalidInput)?;
-    let directory = parent.join(&target).is_dir();
+    let directory = wants_dir_link(workdir, path, &target);
     if metadata.file_type().is_symlink_dir() == directory {
         return Ok(());
     }
@@ -808,8 +810,38 @@ fn fix_link_kind(staged: &Path, full: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn fix_link_kind(_: &Path, _: &Path) -> io::Result<()> {
+fn fix_link_kind(_: &Path, _: &Path, _: &RepoPath) -> io::Result<()> {
     Ok(())
+}
+
+/// Whether a link at `link` to `target` is a directory link, decided only
+/// inside the worktree: the target must be relative, stay inside the repo
+/// when its `..` are applied as text, and lead to a real folder through real
+/// folders (no link is followed). An absolute, drive-relative or UNC target
+/// is never looked at (no network access), and gets Git's default, a file
+/// link.
+#[cfg(windows)]
+fn wants_dir_link(workdir: &Path, link: &RepoPath, target: &Path) -> bool {
+    use std::path::Component;
+    let mut parts: Vec<&std::ffi::OsStr> = link.0.split('/').map(std::ffi::OsStr::new).collect();
+    parts.pop();
+    for component in target.components() {
+        match component {
+            Component::Normal(part) => parts.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return false;
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => return false,
+        }
+    }
+    let mut full = workdir.to_path_buf();
+    parts.iter().all(|part| {
+        full.push(part);
+        fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.is_dir())
+    })
 }
 
 fn write_file(temporary: &Path, bytes: &[u8], mode: WorktreeMode) -> io::Result<()> {
@@ -831,23 +863,91 @@ fn write_file(temporary: &Path, bytes: &[u8], mode: WorktreeMode) -> io::Result<
     Ok(())
 }
 
-fn install_file(source: &Path, target: &Path) -> io::Result<()> {
-    let parent = target.parent().ok_or(io::ErrorKind::InvalidInput)?;
-    fs::create_dir_all(parent)?;
-    match fs::rename(source, target) {
-        // Windows will not rename over a read-only file or a directory
-        // link. The caller checked the target and saved it for undo, so it
-        // is removed the way a delete would, then the rename is retried.
-        Err(error)
-            if cfg!(windows)
-                && error.kind() == io::ErrorKind::PermissionDenied
-                && fs::symlink_metadata(target).is_ok() =>
-        {
-            remove_leaf(target)?;
-            fs::rename(source, target)
+/// [`install_file`], keeping the scratch folder (and the user's previous
+/// file in it) when that file could not be put back.
+fn install_or_keep(
+    source: &Path,
+    target: &Path,
+    scratch: precondition::ScratchDir,
+) -> Result<(), String> {
+    match install_file(source, target, &scratch) {
+        Ok(()) => Ok(()),
+        Err(error @ InstallError::Stranded { .. }) => {
+            std::mem::forget(scratch);
+            Err(error.to_string())
         }
-        result => result,
+        Err(error) => Err(error.to_string()),
     }
+}
+
+/// Why `install_file` failed.
+#[derive(Debug)]
+enum InstallError {
+    /// Nothing changed at the target.
+    Failed(io::Error),
+    /// The target was moved aside and could not be put back: it is kept at
+    /// `kept`, and the scratch folder holding it must not be removed.
+    Stranded { error: io::Error, kept: PathBuf },
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(error) => write!(f, "{error}"),
+            Self::Stranded { error, kept } => write!(
+                f,
+                "{error}. The previous file could not be put back and is kept at {}",
+                kept.display()
+            ),
+        }
+    }
+}
+
+/// Moves `source` to `target`. Nothing is ever deleted here: Windows will
+/// not rename over a read-only file or a directory link, so such a target
+/// (and only such a one) is first moved aside into `scratch`, and moved back
+/// if the second rename fails too.
+fn install_file(
+    source: &Path,
+    target: &Path,
+    scratch: &precondition::ScratchDir,
+) -> Result<(), InstallError> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| InstallError::Failed(io::ErrorKind::InvalidInput.into()))?;
+    fs::create_dir_all(parent).map_err(InstallError::Failed)?;
+    let error = match fs::rename(source, target) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if !(error.kind() == io::ErrorKind::PermissionDenied && blocks_rename(target)) {
+        return Err(InstallError::Failed(error));
+    }
+    let aside = scratch.0.join("previous");
+    fs::rename(target, &aside).map_err(|_| InstallError::Failed(error))?;
+    match fs::rename(source, target) {
+        Ok(()) => Ok(()),
+        Err(error) => match fs::rename(&aside, target) {
+            Ok(()) => Err(InstallError::Failed(error)),
+            Err(_) => Err(InstallError::Stranded { error, kept: aside }),
+        },
+    }
+}
+
+/// A target Windows refuses to be renamed over, though it may be moved: a
+/// read-only file, or a directory symlink or junction.
+#[cfg(windows)]
+fn blocks_rename(target: &Path) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    fs::symlink_metadata(target).is_ok_and(|metadata| {
+        metadata.file_type().is_symlink_dir()
+            || metadata.is_file() && metadata.permissions().readonly()
+    })
+}
+
+#[cfg(not(windows))]
+fn blocks_rename(_: &Path) -> bool {
+    false
 }
 
 fn remove_leaf(full: &Path) -> io::Result<()> {
@@ -985,5 +1085,150 @@ mod windows_tests {
         assert!(under_folder.is_ok(), "{under_folder:?}");
         assert_eq!(leaf, Ok(Ok(true)));
         assert!(through_junction.is_err(), "{through_junction:?}");
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "invoke-git-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn icacls(args: &[&std::ffi::OsStr]) {
+        let done = Command::new("icacls").args(args).output().unwrap();
+        assert!(done.status.success(), "icacls {args:?}: {done:?}");
+    }
+
+    fn set_read_only(path: &Path, on: bool) {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(on);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    /// Re-check: a rename that fails for a reason other than the target
+    /// (here the source may not be moved) must leave the user's file where
+    /// it was, writable or read-only.
+    #[test]
+    fn a_failed_install_never_loses_the_target() {
+        let root = temp_root("install");
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        let source = locked.join("source");
+        fs::write(&source, b"new").unwrap();
+        // Everyone may not delete the source or anything in its folder, so
+        // it cannot be renamed away.
+        let everyone = std::ffi::OsStr::new("*S-1-1-0:(DE)");
+        let children = std::ffi::OsStr::new("*S-1-1-0:(DC)");
+        let deny = std::ffi::OsStr::new("/deny");
+        icacls(&[source.as_os_str(), deny, everyone]);
+        icacls(&[locked.as_os_str(), deny, children]);
+        let mut outcomes = Vec::new();
+        for read_only in [false, true] {
+            let target = root.join(format!("target-{read_only}"));
+            fs::write(&target, b"user's").unwrap();
+            if read_only {
+                set_read_only(&target, true);
+            }
+            let scratch = precondition::ScratchDir::create(&root).unwrap();
+            let result = install_file(&source, &target, &scratch);
+            outcomes.push((
+                read_only,
+                result.map_err(|error| error.to_string()),
+                fs::read(&target).ok(),
+                fs::metadata(&target)
+                    .map(|m| m.permissions().readonly())
+                    .ok(),
+            ));
+            if read_only && target.exists() {
+                set_read_only(&target, false);
+            }
+        }
+        let remove = std::ffi::OsStr::new("/remove:d");
+        let sid = std::ffi::OsStr::new("*S-1-1-0");
+        icacls(&[locked.as_os_str(), remove, sid]);
+        icacls(&[source.as_os_str(), remove, sid]);
+        let _ = fs::remove_dir_all(&root);
+        for (read_only, result, bytes, kept_read_only) in outcomes {
+            assert!(result.is_err(), "read-only {read_only}: {result:?}");
+            assert_eq!(
+                bytes.as_deref(),
+                Some(&b"user's"[..]),
+                "read-only {read_only}"
+            );
+            assert_eq!(kept_read_only, Some(read_only));
+        }
+    }
+
+    /// The case the fallback exists for: a read-only target is replaced,
+    /// and the copy moved aside goes with the scratch folder.
+    #[test]
+    fn a_read_only_target_is_replaced_and_nothing_is_left_behind() {
+        let root = temp_root("install-ro");
+        let target = root.join("target");
+        fs::write(&target, b"user's").unwrap();
+        set_read_only(&target, true);
+        let scratch = precondition::ScratchDir::create(&root).unwrap();
+        let source = scratch.0.join("file");
+        fs::write(&source, b"new").unwrap();
+        let result = install_file(&source, &target, &scratch).map_err(|e| e.to_string());
+        let scratch_path = scratch.0.clone();
+        drop(scratch);
+        let bytes = fs::read(&target).ok();
+        let left = scratch_path.exists();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes.as_deref(), Some(&b"new"[..]));
+        assert!(!left, "the scratch folder was left behind");
+    }
+
+    /// Re-check: the link kind is decided only for relative targets that
+    /// stay inside the worktree through real folders. Anything else (an
+    /// absolute or UNC path, `..` out of the repo, a junction) keeps Git's
+    /// default, a file link, without looking outside.
+    #[test]
+    fn a_link_is_a_directory_link_only_for_a_folder_inside_the_worktree() {
+        let root = temp_root("link-kind");
+        let workdir = root.join("repo");
+        fs::create_dir_all(workdir.join("dir")).unwrap();
+        fs::create_dir_all(workdir.join("a")).unwrap();
+        fs::write(workdir.join("file"), b"x").unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        let junction = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(workdir.join("junction"))
+            .arg(root.join("outside"))
+            .output()
+            .unwrap();
+        let outside = root.join("outside");
+        let cases: Vec<(&str, PathBuf, bool)> = vec![
+            ("link", PathBuf::from("dir"), true),
+            ("a/link", PathBuf::from("../dir"), true),
+            ("link", PathBuf::from("a/../dir"), true),
+            ("link", PathBuf::from("file"), false),
+            ("link", PathBuf::from("missing"), false),
+            ("link", PathBuf::from("../outside"), false),
+            ("a/link", PathBuf::from("../../outside"), false),
+            ("link", outside.clone(), false),
+            ("link", PathBuf::from(r"\\localhost\C$"), false),
+            ("link", PathBuf::from(r"\outside"), false),
+            ("link", PathBuf::from("junction"), false),
+        ];
+        let found: Vec<bool> = cases
+            .iter()
+            .map(|(link, target, _)| wants_dir_link(&workdir, &RepoPath((*link).into()), target))
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert!(junction.status.success(), "{junction:?}");
+        for ((link, target, want), found) in cases.iter().zip(found) {
+            assert_eq!(found, *want, "{link} -> {}", target.display());
+        }
     }
 }
