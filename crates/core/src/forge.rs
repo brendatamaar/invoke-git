@@ -873,14 +873,12 @@ mod tests {
 
         assert_eq!(AccountBook::decode(""), AccountBook::default());
         assert_eq!(AccountBook::decode("garbage\n"), AccountBook::default());
-        let damaged = format!(
-            "invoke-git forge accounts v1\naccount\tgithub\n\
+        let damaged = "invoke-git forge accounts v1\naccount\tgithub\n\
              account\tnope\tpat\thttps://x.com\tu\n\
              account\tgithub\tpat\thttp://insecure.example\tu\n\
              prefer\tgithub.com\tgithub|https://github.com|ghost\n\
-             account\tgithub\tpat\thttps://github.com\tok\n"
-        );
-        let book = AccountBook::decode(&damaged);
+             account\tgithub\tpat\thttps://github.com\tok\n";
+        let book = AccountBook::decode(damaged);
         assert_eq!(book.accounts().len(), 1);
         assert_eq!(book.accounts()[0].username, "ok");
     }

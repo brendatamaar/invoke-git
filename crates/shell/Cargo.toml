@@ -12,6 +12,11 @@ gix = { workspace = true, features = ["index", "excludes", "status", "revision",
 graph = { path = "../graph" }
 notify = "8"
 rusqlite.workspace = true
+# Forge accounts (P8). `reqwest` for the GitHub/GitLab APIs and `keyring` for
+# tokens are both in the PRD build-vs-library table. Blocking client on
+# purpose: every call runs on a background thread, never in the UI.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }
+keyring = "4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -21,6 +26,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_IO",
     "Win32_System_Pipes",
     "Win32_System_JobObjects",
+    "Win32_Security_Cryptography",
 ] }
 
 [dev-dependencies]
