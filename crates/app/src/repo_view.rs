@@ -106,6 +106,9 @@ pub struct RepoView {
     last_read: Option<ReadId>,
     /// Numbers each diff request; an answer for an older one is dropped.
     request: u64,
+    /// The discard confirmation being prepared. Not tied to `request`, which
+    /// every watcher read bumps.
+    preparing: discard::Preparing,
 }
 
 fn has(status: &StatusSnapshot, section: Section, path: &RepoPath) -> bool {
@@ -262,6 +265,7 @@ impl RepoView {
             local_notice: None,
             last_read: None,
             request: 0,
+            preparing: discard::Preparing::default(),
         }
     }
 
@@ -571,6 +575,9 @@ impl RepoView {
                 what: What::Request(Box::new(event)),
             }
         };
+        // This confirmation is the newest; a file list still being prepared
+        // must not replace it.
+        self.preparing.drop_pending();
         self.local_notice = None;
         self.confirm = Some(confirm);
         cx.notify();
@@ -581,14 +588,14 @@ impl RepoView {
             return;
         }
         let paths = self.session.read(cx).discovered.paths.clone();
-        let request = self.request;
+        let ticket = self.preparing.start();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { discard::prepare(&paths, files) })
                 .await;
             this.update(cx, |this, cx| {
-                if this.request != request {
+                if !this.preparing.is_current(ticket) {
                     return;
                 }
                 match result {
@@ -625,6 +632,7 @@ impl RepoView {
     }
 
     fn cancel_discard(&mut self, cx: &mut Context<Self>) {
+        self.preparing.drop_pending();
         self.confirm = None;
         cx.notify();
     }

@@ -158,12 +158,50 @@ pub fn describe_files(count: usize) -> (String, String) {
     )
 }
 
+/// Numbers the discard confirmations being prepared off the main thread.
+/// Only the latest one may open, and only while the user has not moved on
+/// (cancelled, picked another file). Diff reloads, which run on every
+/// watcher read, have their own count and never drop one.
+#[derive(Debug, Default)]
+pub struct Preparing(u64);
+
+impl Preparing {
+    /// A new preparation; any older one is dropped when it answers.
+    pub fn start(&mut self) -> u64 {
+        self.0 += 1;
+        self.0
+    }
+
+    /// Drops whatever is being prepared.
+    pub fn drop_pending(&mut self) {
+        self.0 += 1;
+    }
+
+    pub fn is_current(&self, ticket: u64) -> bool {
+        self.0 == ticket
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use diff::{DiffOptions, diff_text};
     use invoke_core::IndexId;
 
     use super::*;
+
+    #[test]
+    fn only_the_latest_preparation_that_was_not_dropped_opens() {
+        let mut preparing = Preparing::default();
+        let first = preparing.start();
+        assert!(preparing.is_current(first));
+        let second = preparing.start();
+        assert!(!preparing.is_current(first));
+        assert!(preparing.is_current(second));
+        preparing.drop_pending();
+        assert!(!preparing.is_current(second));
+        let third = preparing.start();
+        assert!(preparing.is_current(third));
+    }
 
     fn inputs(old: bool, new: bool) -> InputsMeta {
         InputsMeta {
