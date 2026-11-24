@@ -849,6 +849,7 @@ mod tests {
                 url: None,
                 index_oid: Some(oid('a')),
                 head_oid: None,
+                head: None,
                 state: SubmoduleState::Uninitialized,
             }],
             lfs: Default::default(),

@@ -72,6 +72,8 @@ pub struct SubmoduleEntry {
     pub index_oid: Option<Oid>,
     /// Commit OID currently checked out at `HEAD` inside the submodule.
     pub head_oid: Option<Oid>,
+    /// Checked-out `HEAD` inside the submodule (detached vs local branch), if initialized.
+    pub head: Option<Head>,
     /// Derived status of this submodule.
     pub state: SubmoduleState,
 }
@@ -443,6 +445,13 @@ pub enum WorktreeRefusal {
 pub enum SubmoduleRefusal {
     NoSubmodules,
     NotFound(RepoPath),
+    /// Submodule has uncommitted or untracked changes that `update --checkout` could clobber.
+    Dirty(RepoPath),
+    /// Submodule has a local branch checked out; updating would detach or move it (Law 9).
+    OnBranch {
+        path: RepoPath,
+        branch: BranchName,
+    },
 }
 
 /// Why a Git LFS request was refused by the pure core.
@@ -616,6 +625,26 @@ fn plan_submodule(
         && !disk.advanced.submodules.iter().any(|s| &s.path == path)
     {
         return Err(Refusal::Submodule(SubmoduleRefusal::NotFound(path.clone())));
+    }
+    if op == SubmoduleOp::UpdateInitRecursive {
+        for sub in disk
+            .advanced
+            .submodules
+            .iter()
+            .filter(|s| path.is_none_or(|target| &s.path == target))
+        {
+            if let Some(Head::Branch { name, .. } | Head::Unborn(name)) = &sub.head {
+                return Err(Refusal::Submodule(SubmoduleRefusal::OnBranch {
+                    path: sub.path.clone(),
+                    branch: name.clone(),
+                }));
+            }
+            if sub.state == SubmoduleState::Dirty {
+                return Err(Refusal::Submodule(SubmoduleRefusal::Dirty(
+                    sub.path.clone(),
+                )));
+            }
+        }
     }
     Ok(GitArgs::Submodule {
         op,

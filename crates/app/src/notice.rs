@@ -148,6 +148,14 @@ fn submodule_text(problem: &SubmoduleRefusal) -> String {
     match problem {
         SubmoduleRefusal::NoSubmodules => "This repository has no submodules configured.".into(),
         SubmoduleRefusal::NotFound(path) => format!("No submodule found at {}.", path.0),
+        SubmoduleRefusal::Dirty(path) => format!(
+            "Submodule {} has uncommitted or untracked changes. Commit, stash, or discard them before updating.",
+            path.0
+        ),
+        SubmoduleRefusal::OnBranch { path, branch } => format!(
+            "Submodule {} is on branch {}. Detach HEAD before updating so the branch is not moved or detached.",
+            path.0, branch.0
+        ),
     }
 }
 

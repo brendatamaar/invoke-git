@@ -645,6 +645,175 @@ fn submodule_update_init_recursive_and_sync_work_end_to_end() {
 }
 
 #[test]
+fn submodule_update_forces_checkout_and_refuses_dirty_or_on_branch() {
+    let sb = Sandbox::new();
+    let child = sb.init_repo("sub-child-law9");
+    sb.commit(&child, "lib.txt", b"v1\n", "child v1");
+    sb.commit(&child, "lib.txt", b"v2\n", "child v2");
+
+    let super_repo = sb.init_repo("sub-super-law9");
+    sb.commit(&super_repo, "README.md", b"root\n", "super c1");
+    sb.git(
+        &super_repo,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            child.to_str().unwrap(),
+            "libs/child",
+        ],
+    );
+    sb.git(&super_repo, &["commit", "-q", "-m", "add child"]);
+
+    let clone_dir = sb.root.join("sub-clone-law9");
+    sb.git(
+        &sb.root,
+        &[
+            "clone",
+            "-q",
+            super_repo.to_str().unwrap(),
+            clone_dir.to_str().unwrap(),
+        ],
+    );
+    let found = discover(&clone_dir).unwrap();
+    let mut driver = Driver::open(found.paths.clone(), sb.env.clone());
+
+    // Initialize the submodule first (detached HEAD at v2).
+    driver.deliver(Event::SubmoduleRequested {
+        op: SubmoduleOp::UpdateInitRecursive,
+        path: None,
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+
+    let sub_dir = clone_dir.join("libs/child");
+    let v2_oid = sb.git(&sub_dir, &["rev-parse", "HEAD"]);
+
+    // Configure `submodule.libs/child.update = rebase` to prove `--checkout` overrides it.
+    sb.git(&clone_dir, &["config", "submodule.libs/child.update", "rebase"]);
+    // Detach at v1 (OutOfSync, clean, detached) -> update must check out v2 cleanly.
+    sb.git(&sub_dir, &["checkout", "-q", "--detach", "HEAD~1"]);
+    driver.deliver(Event::RefreshRequested);
+    driver.deliver(Event::SubmoduleRequested {
+        op: SubmoduleOp::UpdateInitRecursive,
+        path: Some(RepoPath("libs/child".into())),
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(sb.git(&sub_dir, &["rev-parse", "HEAD"]), v2_oid);
+
+    // 1. Submodule on a local branch (switched AFTER snapshot so shell guard runs too):
+    // must be refused and the branch tip must not move (Law 9).
+    sb.git(&sub_dir, &["checkout", "-q", "-b", "local-work", "HEAD~1"]);
+    let branch_before = sb.git(&sub_dir, &["rev-parse", "refs/heads/local-work"]);
+    driver.deliver(Event::SubmoduleRequested {
+        op: SubmoduleOp::UpdateInitRecursive,
+        path: Some(RepoPath("libs/child".into())),
+    });
+    match driver.outcome() {
+        Some(OpOutcome::Failed(f)) => {
+            assert_eq!(f.class, ErrorClass::Expected);
+            assert!(
+                f.details.contains("local-work"),
+                "expected branch name in refusal: {}",
+                f.details
+            );
+        }
+        other => panic!("expected shell refusal for on-branch submodule, got {other:?}"),
+    }
+    assert_eq!(
+        sb.git(&sub_dir, &["rev-parse", "refs/heads/local-work"]),
+        branch_before
+    );
+    assert_eq!(
+        sb.git(&sub_dir, &["symbolic-ref", "--short", "HEAD"]),
+        "local-work"
+    );
+
+    // 2. Submodule detached but dirty (dirtied AFTER snapshot so shell guard runs too):
+    // must be refused and dirty content preserved.
+    sb.git(&sub_dir, &["checkout", "-q", "--detach", "HEAD"]);
+    driver.deliver(Event::RefreshRequested);
+    fs::write(sub_dir.join("lib.txt"), b"uncommitted work\n").unwrap();
+    driver.deliver(Event::SubmoduleRequested {
+        op: SubmoduleOp::UpdateInitRecursive,
+        path: Some(RepoPath("libs/child".into())),
+    });
+    match driver.outcome() {
+        Some(OpOutcome::Failed(f)) => {
+            assert_eq!(f.class, ErrorClass::Expected);
+            assert!(
+                f.details.contains("uncommitted or untracked"),
+                "expected dirty refusal: {}",
+                f.details
+            );
+        }
+        other => panic!("expected shell refusal for dirty submodule, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(sub_dir.join("lib.txt")).unwrap(),
+        "uncommitted work\n"
+    );
+}
+
+#[test]
+fn submodule_action_uses_literal_pathspec_for_glob_names() {
+    let sb = Sandbox::new();
+    let child = sb.init_repo("sub-glob-child");
+    sb.commit(&child, "lib.txt", b"v1\n", "child v1");
+
+    let super_repo = sb.init_repo("sub-glob-super");
+    sb.commit(&super_repo, "README.md", b"root\n", "super c1");
+    sb.git(
+        &super_repo,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            child.to_str().unwrap(),
+            "libs/a[12]",
+        ],
+    );
+    sb.git(
+        &super_repo,
+        &["submodule", "add", "-q", child.to_str().unwrap(), "libs/a1"],
+    );
+    sb.git(&super_repo, &["commit", "-q", "-m", "add glob submodules"]);
+
+    let clone_dir = sb.root.join("sub-glob-clone");
+    sb.git(
+        &sb.root,
+        &[
+            "clone",
+            "-q",
+            super_repo.to_str().unwrap(),
+            clone_dir.to_str().unwrap(),
+        ],
+    );
+    let found = discover(&clone_dir).unwrap();
+    let mut driver = Driver::open(found.paths.clone(), sb.env.clone());
+
+    // Update ONLY `libs/a[12]` — `libs/a1` must remain Uninitialized.
+    driver.deliver(Event::SubmoduleRequested {
+        op: SubmoduleOp::UpdateInitRecursive,
+        path: Some(RepoPath("libs/a[12]".into())),
+    });
+    assert_eq!(driver.outcome(), Some(OpOutcome::Succeeded));
+
+    let subs = &driver.state.fresh_disk().unwrap().advanced.submodules;
+    let a12 = subs
+        .iter()
+        .find(|s| s.path == RepoPath("libs/a[12]".into()))
+        .unwrap();
+    let a1 = subs
+        .iter()
+        .find(|s| s.path == RepoPath("libs/a1".into()))
+        .unwrap();
+    assert_eq!(a12.state, SubmoduleState::Clean);
+    assert_eq!(a1.state, SubmoduleState::Uninitialized);
+    assert!(clone_dir.join("libs/a[12]/lib.txt").is_file());
+    assert!(!clone_dir.join("libs/a1/lib.txt").exists());
+}
+
+#[test]
 fn lfs_pull_reports_environment_error_when_git_lfs_is_missing_and_respects_lock_guard() {
     let sb = Sandbox::new();
     let repo = sb.init_repo("lfs-pull-repo");

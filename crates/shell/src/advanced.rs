@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 
 use gix::bstr::ByteSlice;
 use invoke_core::{
-    AdvancedSnapshot, LfsFile, LfsFileState, LfsPointer, LfsSnapshot, MAX_LFS_POINTER_BYTES,
-    RepoPath, StatusSnapshot, SubmoduleEntry, WorktreeEntry, classify_submodule_state,
-    gitattributes_uses_lfs, normalize_worktree_path, parse_lfs_pointer, same_worktree_path,
+    AdvancedSnapshot, ErrorClass, Failure, Head, LfsFile, LfsFileState, LfsPointer, LfsSnapshot,
+    MAX_LFS_POINTER_BYTES, RepoPath, StatusSnapshot, SubmoduleEntry, WorktreeEntry,
+    classify_submodule_state, gitattributes_uses_lfs, normalize_worktree_path, parse_lfs_pointer,
+    same_worktree_path,
 };
 
 use crate::git::Git;
@@ -276,9 +277,10 @@ fn read_submodules(worktree_repo: &gix::Repository, paths: &RepoPaths) -> Vec<Su
             .and_then(|id| precondition::oid(&id).ok());
 
         let sub_workdir = paths.workdir.join(&path_str);
-        let (initialized, head_oid, dirty) = if sub_workdir.join(".git").exists() {
+        let (initialized, head_oid, head, dirty) = if sub_workdir.join(".git").exists() {
             match gix::open_opts(&sub_workdir, precondition::options()) {
                 Ok(sub_repo) => {
+                    let head = precondition::read_head(&sub_repo).ok();
                     let head_oid = sub_repo
                         .head_id()
                         .ok()
@@ -290,12 +292,12 @@ fn read_submodules(worktree_repo: &gix::Repository, paths: &RepoPaths) -> Vec<Su
                     } else {
                         false
                     };
-                    (true, head_oid, dirty)
+                    (true, head_oid, head, dirty)
                 }
-                Err(_) => (false, None, false),
+                Err(_) => (false, None, None, false),
             }
         } else {
-            (false, None, false)
+            (false, None, None, false)
         };
 
         let state = classify_submodule_state(
@@ -311,11 +313,109 @@ fn read_submodules(worktree_repo: &gix::Repository, paths: &RepoPaths) -> Vec<Su
             url,
             index_oid,
             head_oid,
+            head,
             state,
         });
     }
     result.sort_by(|a, b| a.path.cmp(&b.path));
     result
+}
+
+/// P10: fresh on-disk guard before `git submodule update --init --recursive --checkout`.
+///
+/// Refuses when any targeted initialized submodule (or nested submodule inside it)
+/// holds `index.lock`, has a local branch checked out (Law 9), or has uncommitted
+/// or untracked changes in its working tree.
+pub(crate) fn check_submodule_update(
+    paths: &RepoPaths,
+    target: Option<&RepoPath>,
+) -> Result<(), Failure> {
+    let repo = precondition::open_with_worktree(paths)
+        .or_else(|_| precondition::open_with_worktree_without_lfs_filter(paths))
+        .map_err(|details| Failure {
+            class: ErrorClass::Bug,
+            details,
+        })?;
+    check_submodules_in(&repo, &paths.workdir, "", target)
+}
+
+fn check_submodules_in(
+    repo: &gix::Repository,
+    workdir: &Path,
+    prefix: &str,
+    target: Option<&RepoPath>,
+) -> Result<(), Failure> {
+    let Ok(Some(submodules)) = repo.submodules() else {
+        return Ok(());
+    };
+    for sub in submodules {
+        let Ok(path_bstr) = sub.path() else {
+            continue;
+        };
+        let rel = path_bstr.to_str_lossy().into_owned();
+        if let Some(filter) = target
+            && rel != filter.0
+        {
+            continue;
+        }
+        let display_path = if prefix.is_empty() {
+            rel.clone()
+        } else {
+            format!("{prefix}/{rel}")
+        };
+        let sub_workdir = workdir.join(&rel);
+        if !sub_workdir.join(".git").exists() {
+            continue;
+        }
+        let sub_repo = match gix::open_opts(&sub_workdir, precondition::options()) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let lock = sub_repo.git_dir().join("index.lock");
+        if lock.exists() {
+            return Err(Failure {
+                class: ErrorClass::PreconditionChanged,
+                details: format!(
+                    "{} exists: another git process is running in submodule {}",
+                    lock.display(),
+                    display_path
+                ),
+            });
+        }
+        if let Ok(Head::Branch { name, .. } | Head::Unborn(name)) =
+            precondition::read_head(&sub_repo)
+        {
+            return Err(Failure {
+                class: ErrorClass::Expected,
+                details: format!(
+                    "Refused to update submodule '{}': local branch '{}' is checked out. Detach HEAD before updating.",
+                    display_path, name.0
+                ),
+            });
+        }
+        let status_res = crate::status::read_status(&sub_repo).or_else(|_| {
+            let sub_paths = RepoPaths {
+                workdir: sub_workdir.clone(),
+                git_dir: sub_repo.git_dir().to_path_buf(),
+            };
+            precondition::open_with_worktree_without_lfs_filter(&sub_paths)
+                .and_then(|r| crate::status::read_status(&r))
+        });
+        if let Ok(status) = status_res
+            && !status.entries.is_empty()
+        {
+            return Err(Failure {
+                class: ErrorClass::Expected,
+                details: format!(
+                    "Refused to update submodule '{}': working tree has uncommitted or untracked changes.",
+                    display_path
+                ),
+            });
+        }
+        // Check nested submodules recursively (all of them once the parent matched).
+        check_submodules_in(&sub_repo, &sub_workdir, &display_path, None)?;
+    }
+    Ok(())
 }
 
 fn read_lfs(

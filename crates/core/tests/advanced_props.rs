@@ -359,6 +359,7 @@ fn sample_disk(phase: Phase, lock: LockState) -> DiskState {
                 url: Some("https://example.com/child.git".into()),
                 index_oid: Some(oid2),
                 head_oid: None,
+                head: None,
                 state: SubmoduleState::Uninitialized,
             }],
             lfs: LfsSnapshot {
@@ -562,6 +563,61 @@ fn worktree_submodule_and_lfs_refusals_cover_edge_cases() {
         Some(Notice::Refused {
             action: Action::WorktreeRemove,
             reason: Refusal::Worktree(WorktreeRefusal::Locked)
+        })
+    );
+
+    // Dirty submodule refuses UpdateInitRecursive but allows SyncRecursive.
+    let mut dirty_sub = disk.clone();
+    dirty_sub.advanced.submodules[0].state = SubmoduleState::Dirty;
+    let (s, cmds) = step(
+        opened(dirty_sub.clone()),
+        Event::SubmoduleRequested {
+            op: SubmoduleOp::UpdateInitRecursive,
+            path: None,
+        },
+    );
+    assert!(cmds.iter().all(|c| !c.is_write()));
+    assert_eq!(
+        s.notice,
+        Some(Notice::Refused {
+            action: Action::Submodule,
+            reason: Refusal::Submodule(SubmoduleRefusal::Dirty(RepoPath("libs/child".into())))
+        })
+    );
+    let (_, sync_cmds) = step(
+        opened(dirty_sub),
+        Event::SubmoduleRequested {
+            op: SubmoduleOp::SyncRecursive,
+            path: None,
+        },
+    );
+    assert!(sync_cmds.iter().any(|c| c.is_write()));
+
+    // Submodule on a local branch refuses UpdateInitRecursive (Law 9).
+    let mut branch_sub = disk.clone();
+    let sub_oid = Oid::from_hex(&"2".repeat(40)).unwrap();
+    branch_sub.advanced.submodules[0].head_oid = Some(sub_oid.clone());
+    branch_sub.advanced.submodules[0].head = Some(Head::Branch {
+        name: BranchName("topic".into()),
+        oid: sub_oid,
+    });
+    branch_sub.advanced.submodules[0].state = SubmoduleState::Clean;
+    let (s, cmds) = step(
+        opened(branch_sub),
+        Event::SubmoduleRequested {
+            op: SubmoduleOp::UpdateInitRecursive,
+            path: Some(RepoPath("libs/child".into())),
+        },
+    );
+    assert!(cmds.iter().all(|c| !c.is_write()));
+    assert_eq!(
+        s.notice,
+        Some(Notice::Refused {
+            action: Action::Submodule,
+            reason: Refusal::Submodule(SubmoduleRefusal::OnBranch {
+                path: RepoPath("libs/child".into()),
+                branch: BranchName("topic".into()),
+            })
         })
     );
 

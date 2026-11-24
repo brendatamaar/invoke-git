@@ -438,7 +438,11 @@ pub fn invocation(args: &GitArgs) -> Invocation {
             match op {
                 SubmoduleOp::Init => argv.push("init".into()),
                 SubmoduleOp::UpdateInitRecursive => {
-                    argv.extend(["update", "--init", "--recursive"].map(OsString::from));
+                    // Always force `--checkout` so configured `submodule.<name>.update`
+                    // (merge/rebase) can never silently move a checked-out branch (Law 9).
+                    argv.extend(
+                        ["update", "--init", "--recursive", "--checkout"].map(OsString::from),
+                    );
                 }
                 SubmoduleOp::SyncRecursive => {
                     argv.extend(["sync", "--recursive"].map(OsString::from));
@@ -446,7 +450,9 @@ pub fn invocation(args: &GitArgs) -> Invocation {
             }
             if let Some(path) = path {
                 argv.push("--".into());
-                argv.push((&path.0).into());
+                // Use `:(literal)` pathspec magic so submodule paths containing
+                // glob characters (e.g. `libs/a[12]`) never match other submodules.
+                argv.push(format!(":(literal){}", path.0).into());
             }
             plain(argv)
         }
@@ -1189,8 +1195,9 @@ mod tests {
                 "update",
                 "--init",
                 "--recursive",
+                "--checkout",
                 "--",
-                "libs/child"
+                ":(literal)libs/child"
             ]
         );
 

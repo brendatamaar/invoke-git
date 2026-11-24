@@ -207,6 +207,14 @@ impl Job {
         if let Err(failure) = crate::rebase::check(&self.paths, &self.args, &self.expect) {
             return OpOutcome::Failed(failure);
         }
+        if let GitArgs::Submodule {
+            op: invoke_core::SubmoduleOp::UpdateInitRecursive,
+            path,
+        } = &self.args
+            && let Err(failure) = crate::advanced::check_submodule_update(&self.paths, path.as_ref())
+        {
+            return OpOutcome::Failed(failure);
+        }
         // P10: fail fast with a clear Environment error when `git-lfs` is not
         // installed rather than reporting an unexpected git failure.
         if matches!(self.args, GitArgs::LfsPull { .. })
