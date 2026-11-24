@@ -122,19 +122,40 @@ impl std::fmt::Display for ForgeError {
 
 impl std::error::Error for ForgeError {}
 
-/// Keeps an OAuth error code to letters, digits and underscores, so a
-/// hostile server cannot put a sentence (or a token) in it.
+/// The OAuth error codes the forges are documented to send (RFC 6749, RFC
+/// 8628, GitHub and GitLab). Anything else is shown as `unknown_error`, so a
+/// hostile server cannot put its own text, or a token, in a message.
+const KNOWN_CODES: &[&str] = &[
+    "access_denied",
+    "authorization_pending",
+    "bad_verification_code",
+    "device_flow_disabled",
+    "expired_token",
+    "incorrect_client_credentials",
+    "incorrect_device_code",
+    "insufficient_scope",
+    "invalid_client",
+    "invalid_grant",
+    "invalid_request",
+    "invalid_scope",
+    "invalid_token",
+    "redirect_uri_mismatch",
+    "server_error",
+    "slow_down",
+    "temporarily_unavailable",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "unsupported_response_type",
+    "unverified_user_email",
+];
+
+/// An OAuth error code from a server, reduced to a known one.
 pub fn clean_code(code: &str) -> String {
-    let cleaned: String = code
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .take(48)
-        .collect();
-    if cleaned.is_empty() {
-        "unknown_error".into()
-    } else {
-        cleaned
-    }
+    KNOWN_CODES
+        .iter()
+        .find(|known| **known == code.trim())
+        .map_or("unknown_error", |known| known)
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -142,11 +163,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_hostile_error_code_is_flattened() {
+    fn only_documented_oauth_codes_are_shown() {
         assert_eq!(clean_code("access_denied"), "access_denied");
-        assert_eq!(clean_code("a b\nc=ghp_secret"), "abcghp_secret");
-        assert_eq!(clean_code("\n\r "), "unknown_error");
-        assert_eq!(clean_code(&"x".repeat(500)).len(), 48);
+        assert_eq!(clean_code(" invalid_grant\n"), "invalid_grant");
+        for hostile in [
+            "a b\nc=ghp_secret",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "invalid_grant_but_the_code_was_the-code",
+            "ACCESS_DENIED",
+            "",
+            "\n\r ",
+        ] {
+            assert_eq!(clean_code(hostile), "unknown_error", "{hostile:?}");
+        }
+        assert_eq!(clean_code(&"x".repeat(500)), "unknown_error");
     }
 
     #[test]

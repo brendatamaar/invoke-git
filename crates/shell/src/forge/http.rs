@@ -18,12 +18,23 @@ use super::secrets::Secret;
 /// An answer larger than this is refused.
 const MAX_BODY: u64 = 8 * 1024 * 1024;
 
-#[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     /// Header names in lower case.
     headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// Shows the status and sizes only: a body can hold a device code, a token or
+/// an authorization code, and must not reach a log through `{:?}`.
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers.len())
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 impl HttpResponse {
@@ -52,7 +63,12 @@ impl HttpResponse {
 }
 
 pub struct Http {
+    /// For https: the system proxy settings apply (the proxy only sees an
+    /// encrypted tunnel).
     client: reqwest::blocking::Client,
+    /// For http, which is only ever this machine: never through a proxy, or
+    /// the bearer token would travel to it in clear text.
+    local: reqwest::blocking::Client,
 }
 
 /// The origin part of `url` (`scheme://authority`), parsed with the same
@@ -65,14 +81,38 @@ pub fn origin_of_url(url: &str) -> Option<Origin> {
 
 impl Http {
     pub fn new() -> Result<Http, ForgeError> {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(concat!("invoke-git/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| ForgeError::Network)?;
-        Ok(Http { client })
+        Self::build(None)
+    }
+
+    /// `proxy` replaces the system proxy for https (tests aim it at a local
+    /// server to prove http never uses one).
+    pub(crate) fn build(proxy: Option<&str>) -> Result<Http, ForgeError> {
+        let base = || {
+            reqwest::blocking::Client::builder()
+                .user_agent(concat!("invoke-git/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+        };
+        let mut secure = base();
+        if let Some(proxy) = proxy {
+            secure = secure.proxy(reqwest::Proxy::all(proxy).map_err(|_| ForgeError::Network)?);
+        }
+        let secure = secure.build().map_err(|_| ForgeError::Network)?;
+        let local = base().no_proxy().build().map_err(|_| ForgeError::Network)?;
+        Ok(Http {
+            client: secure,
+            local,
+        })
+    }
+
+    /// The client for this address: http (this machine) bypasses proxies.
+    fn client_for(&self, url: &str) -> &reqwest::blocking::Client {
+        if url.len() >= 5 && url[..5].eq_ignore_ascii_case("http:") {
+            &self.local
+        } else {
+            &self.client
+        }
     }
 
     pub fn get(
@@ -83,7 +123,7 @@ impl Http {
         extra: &[(&str, &str)],
     ) -> Result<HttpResponse, ForgeError> {
         check_url(url)?;
-        let mut request = self.client.get(url).header("Accept", accept);
+        let mut request = self.client_for(url).get(url).header("Accept", accept);
         for (name, value) in extra {
             request = request.header(*name, *value);
         }
@@ -102,7 +142,7 @@ impl Http {
     ) -> Result<HttpResponse, ForgeError> {
         check_url(url)?;
         let mut request = self
-            .client
+            .client_for(url)
             .post(url)
             .header("Accept", "application/json")
             .header("Content-Type", "application/x-www-form-urlencoded")
@@ -240,6 +280,68 @@ mod tests {
         );
     }
 
+    /// Answers one request on a local port; the flag says if one came.
+    fn one_shot(
+        body: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = seen.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                flag.store(true, Ordering::SeqCst);
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (addr, seen)
+    }
+
+    #[test]
+    fn http_to_this_machine_never_goes_through_a_proxy() {
+        use std::sync::atomic::Ordering;
+        let (proxy, proxy_seen) = one_shot("from the proxy");
+        let (target, target_seen) = one_shot("from the target");
+        // Every https request would use this proxy; http must not.
+        let http = Http::build(Some(&format!("http://{proxy}"))).unwrap();
+        let token = Secret::new("tok-for-the-target").unwrap();
+        let response = http
+            .get(
+                &format!("http://{target}/x"),
+                Some(&token),
+                "application/json",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(response.text(), "from the target");
+        assert!(target_seen.load(Ordering::SeqCst));
+        assert!(
+            !proxy_seen.load(Ordering::SeqCst),
+            "the bearer token went to the proxy in clear text"
+        );
+    }
+
+    #[test]
+    fn a_response_never_prints_its_body() {
+        let mut response = HttpResponse::for_test(200, &[("set-cookie", "s=cookie-secret")]);
+        response.body = br#"{"access_token":"gho_SECRET","device_code":"dev-secret"}"#.to_vec();
+        let shown = format!("{response:?}");
+        for secret in ["gho_SECRET", "dev-secret", "cookie-secret", "access_token"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        assert!(shown.contains("200"));
+    }
     #[test]
     fn only_secure_or_local_urls_are_sent() {
         for ok in [
