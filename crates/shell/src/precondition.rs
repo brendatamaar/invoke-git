@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use invoke_core::{BranchName, ErrorClass, Expect, Failure, Head, IndexId, Oid, RefValue};
 
@@ -200,7 +200,12 @@ impl IndexLock {
 
     /// Install an index using Git's lock-and-rename protocol. An empty
     /// snapshot denotes an absent index.
-    pub(crate) fn replace(mut self, git_dir: &Path, bytes: &[u8]) -> io::Result<()> {
+    pub(crate) fn replace(
+        mut self,
+        git_dir: &Path,
+        bytes: &[u8],
+        modified: Option<SystemTime>,
+    ) -> io::Result<()> {
         let index = git_dir.join("index");
         if bytes.is_empty() {
             return match fs::remove_file(index) {
@@ -210,6 +215,9 @@ impl IndexLock {
         }
         let mut file = self.file.take().expect("open lock file");
         file.write_all(bytes)?;
+        if let Some(modified) = modified {
+            file.set_modified(modified)?;
+        }
         file.sync_all()?;
         drop(file);
         fs::rename(self.path.as_ref().expect("owned lock"), index)?;

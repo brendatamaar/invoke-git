@@ -104,7 +104,19 @@ impl StagingRunner {
         let scratch = precondition::ScratchDir::create(&self.paths.git_dir).map_err(environment)?;
         let copy = scratch.0.join("index");
         if expect.index != IndexId::Absent {
-            fs::copy(self.paths.git_dir.join("index"), &copy).map_err(environment)?;
+            let original = self.paths.git_dir.join("index");
+            let modified = original
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .map_err(environment)?;
+            fs::copy(original, &copy).map_err(environment)?;
+            // Git compares entry stat times with the index's timestamp to
+            // decide which files need rehashing despite matching stat data.
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&copy)
+                .and_then(|file| file.set_modified(modified))
+                .map_err(environment)?;
         }
         let mut command = self.git.command(&self.paths.workdir);
         if matches!(args, GitArgs::RestoreStagedPath(_)) && matches!(expect.head, Head::Unborn(_)) {
@@ -131,7 +143,11 @@ impl StagingRunner {
         }
         let bytes = fs::read(&copy).map_err(environment)?;
         lock.verify(&self.paths, expect)?;
-        lock.replace(&self.paths.git_dir, &bytes)
+        let modified = copy
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map_err(environment)?;
+        lock.replace(&self.paths.git_dir, &bytes, Some(modified))
             .map_err(environment)
     }
 
@@ -233,8 +249,7 @@ pub struct DiffInputs {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputsError {
-    /// Binary, not UTF-8, a symlink, a submodule or an intent-to-add entry:
-    /// no text patch can stage it (a later task adds `git add` for these).
+    /// A file change that cannot be expressed as a line patch.
     NotText(String),
     /// The index moved while it was read; read again.
     Moved,

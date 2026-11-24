@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use invoke_core::{
     ErrorClass, Event, Failure, Head, HeadRestore, HeadTarget, IndexEffect, Oid, OpId, OpOutcome,
@@ -188,6 +189,19 @@ impl UndoRunner {
         };
         let index = hash_blob(&bytes)?;
         let mut entries = format!("100644 blob {}\tindex\n", index.trim());
+        if !bytes.is_empty() {
+            let modified = real
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .map_err(|error| format!("read index timestamp: {error}"))?;
+            let (duration, sign) = match modified.duration_since(UNIX_EPOCH) {
+                Ok(duration) => (duration, 1),
+                Err(error) => (error.duration(), -1),
+            };
+            let timestamp = (sign * duration.as_nanos() as i128).to_le_bytes();
+            let blob = hash_blob(&timestamp)?;
+            entries.push_str(&format!("100644 blob {}\tindex-time\n", blob.trim()));
+        }
         let repo = precondition::open(&self.paths)?;
         if let Some(name) = shared_index_name(&bytes, repo.object_hash())? {
             let shared = fs::read(self.paths.git_dir.join(&name))
@@ -334,6 +348,11 @@ impl UndoRunner {
                     .map_err(|error| error.to_string())
             };
             let index = read("index")?;
+            let modified = if index.data.is_empty() {
+                None
+            } else {
+                Some(index_timestamp(&read("index-time")?.data)?)
+            };
             if let Some(name) = shared_index_name(&index.data, repo.object_hash())? {
                 let base = read(&name)?;
                 let path = self.paths.git_dir.join(&name);
@@ -351,10 +370,10 @@ impl UndoRunner {
                     Err(error) => return Err(format!("read {name}: {error}")),
                 }
             }
-            Ok(index.data.clone())
+            Ok((index.data.clone(), modified))
         })();
         match result {
-            Ok(bytes) => match lock.replace(&self.paths.git_dir, &bytes) {
+            Ok((bytes, modified)) => match lock.replace(&self.paths.git_dir, &bytes, modified) {
                 Ok(()) => OpOutcome::Succeeded,
                 Err(error) => failed(ErrorClass::Environment, format!("restore index: {error}")),
             },
@@ -487,6 +506,20 @@ fn shared_index_name(bytes: &[u8], hash: gix::hash::Kind) -> Result<Option<Strin
         .link()
         .filter(|link| !link.shared_index_checksum.is_null())
         .map(|link| format!("sharedindex.{}", link.shared_index_checksum)))
+}
+
+fn index_timestamp(bytes: &[u8]) -> Result<SystemTime, String> {
+    let nanos = i128::from_le_bytes(bytes.try_into().map_err(|_| "invalid index timestamp")?);
+    let distance = nanos.unsigned_abs();
+    let seconds =
+        u64::try_from(distance / 1_000_000_000).map_err(|_| "index timestamp overflow")?;
+    let duration = Duration::new(seconds, (distance % 1_000_000_000) as u32);
+    let time = if nanos < 0 {
+        UNIX_EPOCH.checked_sub(duration)
+    } else {
+        UNIX_EPOCH.checked_add(duration)
+    };
+    time.ok_or_else(|| "index timestamp outside the supported range".into())
 }
 
 fn failed(class: ErrorClass, details: String) -> OpOutcome {

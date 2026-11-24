@@ -605,7 +605,9 @@ fn whole_file_stage_unstage_and_undo_keep_worktree_and_intent_to_add() {
     for (name, bytes) in [("binary[1]", &b"x\0\x01"[..]), ("encoded", &b"\xffabc"[..])] {
         fs::write(repo.paths.workdir.join(name), bytes).unwrap();
         repo.git(&["--literal-pathspecs", "add", "-N", "--", name]);
-        let before = fs::read(repo.paths.git_dir.join("index")).unwrap();
+        let index_path = repo.paths.git_dir.join("index");
+        let before = fs::read(&index_path).unwrap();
+        let timestamp = index_path.metadata().unwrap().modified().unwrap();
         let mut driver = Driver::open(&repo);
         let path = RepoPath(name.into());
         for action in [FileAction::Stage, FileAction::Unstage] {
@@ -630,7 +632,11 @@ fn whole_file_stage_unstage_and_undo_keep_worktree_and_intent_to_add() {
             driver.deliver(Event::UndoRequested);
             assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
         }
-        assert_eq!(fs::read(repo.paths.git_dir.join("index")).unwrap(), before);
+        assert_eq!(fs::read(&index_path).unwrap(), before);
+        assert_eq!(
+            index_path.metadata().unwrap().modified().unwrap(),
+            timestamp
+        );
         assert_eq!(repo.worktree_bytes(name), bytes);
     }
 }
