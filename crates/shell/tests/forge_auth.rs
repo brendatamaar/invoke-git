@@ -2806,6 +2806,16 @@ fn different_data_dirs_use_separate_keychain_namespaces() {
         after_create.service(),
         "namespace tag changed after directory creation"
     );
+
+    // Uncreated sibling names that differ only in case stay distinct (so a
+    // case-sensitive parent directory on Windows never merges two profiles).
+    let upper = shell::forge::KeyringStore::for_data_dir(&base.0.join("Profile"));
+    let lower = shell::forge::KeyringStore::for_data_dir(&base.0.join("profile"));
+    assert_ne!(
+        upper.service(),
+        lower.service(),
+        "case-distinct profiles must not be merged"
+    );
 }
 
 #[test]
@@ -2817,7 +2827,7 @@ fn abort_does_not_block_the_caller_when_undo_waits_on_the_keychain() {
     run_until_committed(&runner, &service);
 
     store.delete_delay_ms.store(400, Ordering::SeqCst);
-    let (events, _inbox) = mpsc::channel();
+    let (events, inbox) = mpsc::channel();
     let started = Instant::now();
     runner.execute(SignInCommand::Abort, events);
     assert!(
@@ -2826,8 +2836,16 @@ fn abort_does_not_block_the_caller_when_undo_waits_on_the_keychain() {
         started.elapsed()
     );
 
-    wait_until(
-        || service.accounts().is_empty() && store.inner.is_empty(),
-        "background undo never finished",
+    let reply = inbox
+        .recv_timeout(Duration::from_secs(5))
+        .expect("background undo never sent CleanedUp");
+    assert_eq!(
+        reply,
+        SignInEvent::Reply {
+            attempt: Attempt(1),
+            reply: SignInReply::CleanedUp,
+        }
     );
+    assert!(service.accounts().is_empty());
+    assert!(store.inner.is_empty());
 }

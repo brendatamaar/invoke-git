@@ -115,10 +115,9 @@ impl SignInRunner {
                 if let Some(commit) = committed {
                     let service = self.service.clone();
                     let out = Outbox { attempt, events };
-                    thread::spawn(move || {
-                        if let Err(error) = service.undo_commit(&commit) {
-                            out.post(SignInReply::CleanupFailed(error.user_message()));
-                        }
+                    thread::spawn(move || match service.undo_commit(&commit) {
+                        Ok(()) => out.post(SignInReply::CleanedUp),
+                        Err(error) => out.post(SignInReply::CleanupFailed(error.user_message())),
                     });
                 }
             }
@@ -140,20 +139,27 @@ impl SignInRunner {
     }
 }
 
-/// The answer for a failed step. A failed undo after a cancel is the one
-/// error a cancelled flow still reports.
+/// The answer for a failed step. After a cancel, cleanup completion or
+/// failure is still reported so the UI refreshes to match disk/keychain.
 fn failure_reply(cancel: &FlowControl, error: &ForgeError) -> SignInReply {
     if cancel.is_cancelled() && *error == ForgeError::RollbackFailed {
         SignInReply::CleanupFailed(error.user_message())
+    } else if cancel.is_cancelled() && *error == ForgeError::Cancelled {
+        SignInReply::CleanedUp
     } else {
         SignInReply::Errored(error.user_message())
     }
 }
 
-/// Sends an answer unless the flow was cancelled meanwhile (a failed undo
-/// is still sent: the user must hear of it).
+/// Sends an answer unless the flow was cancelled meanwhile (cleanup outcomes
+/// are still sent so the UI refreshes or warns the user).
 fn send(cancel: &FlowControl, out: &Outbox, reply: SignInReply) {
-    if !cancel.is_cancelled() || matches!(reply, SignInReply::CleanupFailed(_)) {
+    if !cancel.is_cancelled()
+        || matches!(
+            reply,
+            SignInReply::CleanedUp | SignInReply::CleanupFailed(_)
+        )
+    {
         out.post(reply);
     }
 }

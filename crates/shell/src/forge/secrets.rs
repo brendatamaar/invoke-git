@@ -218,11 +218,14 @@ fn normalize_data_dir(dir: &std::path::Path) -> String {
     }
     let text = full.to_string_lossy();
     let trimmed = if cfg!(windows) {
+        // `canonicalize` already returns the exact on-disk casing for every
+        // existing component, so case-insensitive directories normalize
+        // naturally while case-sensitive parents keep distinct names apart.
         text.strip_prefix(r"\\?\")
             .unwrap_or(&text)
             .replace('/', "\\")
             .trim_end_matches('\\')
-            .to_lowercase()
+            .to_owned()
     } else {
         text.trim_end_matches('/').to_owned()
     };

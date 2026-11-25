@@ -689,6 +689,8 @@ pub enum SignInReply {
     Denied,
     Expired,
     Errored(String),
+    /// After a cancel: the undo of an already stored account succeeded.
+    CleanedUp,
     /// After a cancel: the undo of an already stored account failed.
     CleanupFailed(String),
 }

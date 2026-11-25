@@ -310,6 +310,13 @@ impl AccountsView {
     }
 
     fn deliver(&mut self, event: SignInEvent, cx: &mut Context<Self>) {
+        let cleaned_up = matches!(
+            event,
+            SignInEvent::Reply {
+                reply: invoke_core::forge::SignInReply::CleanedUp,
+                ..
+            }
+        );
         let before = self.phase.clone();
         let (phase, commands) =
             step_sign_in(std::mem::replace(&mut self.phase, SignInPhase::Idle), event);
@@ -333,6 +340,9 @@ impl AccountsView {
                 }
             }
             (_, SignInPhase::Authorized(_)) if !matches!(before, SignInPhase::Authorized(_)) => {
+                cx.emit(AccountsEvent::Changed);
+            }
+            _ if cleaned_up => {
                 cx.emit(AccountsEvent::Changed);
             }
             _ => {}
