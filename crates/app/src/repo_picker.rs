@@ -326,9 +326,11 @@ impl Render for RepoPicker {
                     })
                     .collect()
             })
+            .size_full()
             .track_scroll(&self.scroll);
             body = body.child(
                 div()
+                    .w_full()
                     .h(px(rows.min(VISIBLE_ROWS) as f32 * ROW_LIST))
                     .child(list),
             );
