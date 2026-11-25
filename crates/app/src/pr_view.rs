@@ -545,16 +545,19 @@ impl PrPane {
                         this.ensure_service_and_reload(cx);
                     }
                     Err(err) => {
-                        let (message, reconnect) =
-                            if kind == ForgeKind::GitLab && err == ForgeError::Forbidden {
-                                (
-                                    "GitLab refused merge request creation (HTTP 403). If this account was connected with `read_api`, reconnect it so it has the `api` scope."
-                                        .into(),
-                                    true,
-                                )
-                            } else {
-                                (err.user_message(), err.needs_reconnect())
-                            };
+                        let (message, reconnect) = match (kind, &err) {
+                            (ForgeKind::GitLab, ForgeError::Forbidden) => (
+                                "GitLab refused merge request creation (HTTP 403). If this account was connected with `read_api`, reconnect it so it has the `api` scope."
+                                    .into(),
+                                true,
+                            ),
+                            (ForgeKind::GitHub, ForgeError::Forbidden) => (
+                                "GitHub refused pull request creation (HTTP 403). Ensure your token has `repo` scope (classic) or `Pull requests: Read and write` access to this repository (fine-grained)."
+                                    .into(),
+                                true,
+                            ),
+                            _ => (err.user_message(), err.needs_reconnect()),
+                        };
                         this.create_state = CreateState::Failed { message, reconnect };
                     }
                 }
@@ -670,28 +673,14 @@ impl Render for PrPane {
         if self.mode == Mode::Accounts
             && let Some(accounts) = &self.accounts_view
         {
+            // AccountsView already renders its own centered dialog, padding,
+            // and background (same pattern as CloneView).
             return div()
                 .flex()
-                .flex_col()
                 .flex_1()
                 .min_h(px(0.))
                 .min_w(px(0.))
-                .items_center()
-                .justify_center()
-                .bg(hsla(p.bg_app))
-                .p(px(SPACE_4))
-                .child(
-                    div()
-                        .id("pr-accounts-scroll")
-                        .w(px(DIALOG))
-                        .max_h_full()
-                        .overflow_y_scroll()
-                        .bg(hsla(p.bg_panel))
-                        .border_1()
-                        .border_color(hsla(p.line))
-                        .rounded(px(RADIUS_MD))
-                        .child(accounts.clone()),
-                )
+                .child(accounts.clone())
                 .into_any_element();
         }
 
