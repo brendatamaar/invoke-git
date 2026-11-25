@@ -580,6 +580,12 @@ impl AccountBook {
 // Sign-in: one machine for the device flow and the browser flow.
 // ---------------------------------------------------------------------------
 
+/// One sign-in attempt. The UI numbers its attempts; every answer the shell
+/// sends back names the attempt it belongs to, so an answer that arrives
+/// after its attempt was cancelled or replaced is recognised and dropped.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Attempt(pub u64);
+
 /// How the user proves who they are.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SignInMethod {
@@ -607,7 +613,9 @@ pub enum SignInFailure {
     Denied,
     /// The code or the page timed out.
     Expired,
-    Cancelled,
+    /// The user cancelled this attempt. Its number is kept: the shell may
+    /// still report that undoing it failed.
+    Cancelled(Attempt),
     /// Anything else, as a sentence that holds no secret.
     Error(String),
     /// Cancelled, but undoing what the flow had already stored failed: a
@@ -619,12 +627,16 @@ pub enum SignInFailure {
 pub enum SignInPhase {
     Idle,
     /// Asking the forge for a code (or starting the browser flow).
-    Requesting(SignInMethod),
+    Requesting {
+        method: SignInMethod,
+        attempt: Attempt,
+    },
     AwaitingUser {
         method: SignInMethod,
         prompt: UserPrompt,
         /// Seconds between polls (device flow only).
         interval_secs: u32,
+        attempt: Attempt,
     },
     /// Signed in. The token is already in the keychain.
     Authorized(ForgeAccount),
@@ -633,19 +645,38 @@ pub enum SignInPhase {
 
 impl SignInPhase {
     pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            SignInPhase::Requesting(_) | SignInPhase::AwaitingUser { .. }
-        )
+        self.attempt().is_some()
+    }
+
+    /// The attempt in progress, if one is.
+    pub fn attempt(&self) -> Option<Attempt> {
+        match self {
+            SignInPhase::Requesting { attempt, .. } | SignInPhase::AwaitingUser { attempt, .. } => {
+                Some(*attempt)
+            }
+            _ => None,
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignInEvent {
     // From the UI.
-    Begin(SignInMethod),
+    Begin {
+        method: SignInMethod,
+        attempt: Attempt,
+    },
     Cancel,
-    // From the shell.
+    /// From the shell, about one attempt.
+    Reply {
+        attempt: Attempt,
+        reply: SignInReply,
+    },
+}
+
+/// What the shell reports about an attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignInReply {
     PromptReady {
         prompt: UserPrompt,
         interval_secs: u32,
@@ -664,8 +695,11 @@ pub enum SignInEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignInCommand {
-    /// Ask the forge for a code, or start the browser flow.
-    Request(SignInMethod),
+    /// Ask the forge for a code, or start the browser flow, for `attempt`.
+    Request {
+        method: SignInMethod,
+        attempt: Attempt,
+    },
     /// Ask the forge once more, after this many seconds.
     PollAfter { secs: u32 },
     /// Stop whatever is running (poll timer, local listener).
@@ -689,26 +723,63 @@ pub fn step_sign_in(phase: SignInPhase, event: SignInEvent) -> (SignInPhase, Vec
     use SignInCommand as C;
     use SignInEvent as E;
     use SignInPhase as P;
+    use SignInReply as R;
     match (phase, event) {
-        (P::Idle | P::Authorized(_) | P::Failed(_), E::Begin(method)) => {
-            (P::Requesting(method), vec![C::Request(method)])
+        (P::Idle | P::Authorized(_) | P::Failed(_), E::Begin { method, attempt }) => (
+            P::Requesting { method, attempt },
+            vec![C::Request { method, attempt }],
+        ),
+        (phase, E::Cancel) => match phase.attempt() {
+            Some(attempt) => (P::Failed(SignInFailure::Cancelled(attempt)), vec![C::Abort]),
+            None => (phase, vec![]),
+        },
+        // The only answer a finished attempt still takes: its undo failed.
+        (P::Failed(SignInFailure::Cancelled(cancelled)), E::Reply { attempt, reply })
+            if attempt == cancelled =>
+        {
+            match reply {
+                R::CleanupFailed(message) => (
+                    P::Failed(SignInFailure::CancelledWithLeftover(message)),
+                    vec![],
+                ),
+                _ => (P::Failed(SignInFailure::Cancelled(cancelled)), vec![]),
+            }
         }
+        // An answer for the attempt in progress.
+        (phase, E::Reply { attempt, reply }) if phase.attempt() == Some(attempt) => {
+            answer(phase, attempt, reply)
+        }
+        // Anything else is late or stray (an answer for an older attempt, a
+        // second Begin): nothing changes.
+        (phase, _) => (phase, vec![]),
+    }
+}
+
+/// An answer for the attempt in progress.
+fn answer(
+    phase: SignInPhase,
+    attempt: Attempt,
+    reply: SignInReply,
+) -> (SignInPhase, Vec<SignInCommand>) {
+    use SignInPhase as P;
+    use SignInReply as R;
+    match (phase, reply) {
         (
-            P::Requesting(method),
-            E::PromptReady {
+            P::Requesting { method, .. },
+            R::PromptReady {
                 prompt,
                 interval_secs,
             },
         ) => {
             let interval_secs = interval_secs.clamp(1, MAX_INTERVAL);
-            let commands = poll(method, interval_secs);
             (
                 P::AwaitingUser {
                     method,
                     prompt,
                     interval_secs,
+                    attempt,
                 },
-                commands,
+                poll(method, interval_secs),
             )
         }
         (
@@ -716,13 +787,15 @@ pub fn step_sign_in(phase: SignInPhase, event: SignInEvent) -> (SignInPhase, Vec
                 method,
                 prompt,
                 interval_secs,
+                ..
             },
-            E::Pending,
+            R::Pending,
         ) => (
             P::AwaitingUser {
                 method,
                 prompt,
                 interval_secs,
+                attempt,
             },
             poll(method, interval_secs),
         ),
@@ -731,8 +804,9 @@ pub fn step_sign_in(phase: SignInPhase, event: SignInEvent) -> (SignInPhase, Vec
                 method,
                 prompt,
                 interval_secs,
+                ..
             },
-            E::SlowDown,
+            R::SlowDown,
         ) => {
             let interval_secs = (interval_secs + SLOW_DOWN_STEP).min(MAX_INTERVAL);
             (
@@ -740,25 +814,17 @@ pub fn step_sign_in(phase: SignInPhase, event: SignInEvent) -> (SignInPhase, Vec
                     method,
                     prompt,
                     interval_secs,
+                    attempt,
                 },
                 poll(method, interval_secs),
             )
         }
-        (phase, E::Granted(account)) if phase.is_active() => (P::Authorized(account), vec![]),
-        (phase, E::Denied) if phase.is_active() => (P::Failed(SignInFailure::Denied), vec![]),
-        (phase, E::Expired) if phase.is_active() => (P::Failed(SignInFailure::Expired), vec![]),
-        (phase, E::Errored(message)) if phase.is_active() => {
-            (P::Failed(SignInFailure::Error(message)), vec![])
-        }
-        (phase, E::Cancel) if phase.is_active() => {
-            (P::Failed(SignInFailure::Cancelled), vec![C::Abort])
-        }
-        (P::Failed(SignInFailure::Cancelled), E::CleanupFailed(message)) => (
-            P::Failed(SignInFailure::CancelledWithLeftover(message)),
-            vec![],
-        ),
-        // Anything else is late or stray (a poll answer after cancel, a
-        // second Begin): nothing changes.
+        (_, R::Granted(account)) => (P::Authorized(account), vec![]),
+        (_, R::Denied) => (P::Failed(SignInFailure::Denied), vec![]),
+        (_, R::Expired) => (P::Failed(SignInFailure::Expired), vec![]),
+        (_, R::Errored(message)) => (P::Failed(SignInFailure::Error(message)), vec![]),
+        // Out of order for this phase (a poll answer before the prompt, a
+        // cleanup report while running): nothing changes.
         (phase, _) => (phase, vec![]),
     }
 }
@@ -1045,36 +1111,6 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_undo_after_cancel_is_told_and_nothing_else_changes_a_finished_flow() {
-        let (phase, _) = step_sign_in(
-            SignInPhase::Idle,
-            SignInEvent::Begin(SignInMethod::GitHubDevice),
-        );
-        let (phase, _) = step_sign_in(phase, SignInEvent::Cancel);
-        let (phase, commands) =
-            step_sign_in(phase, SignInEvent::CleanupFailed("remove the entry".into()));
-        assert_eq!(
-            phase,
-            SignInPhase::Failed(SignInFailure::CancelledWithLeftover(
-                "remove the entry".into()
-            ))
-        );
-        assert!(commands.is_empty());
-        // It is told once, and only for a cancel.
-        let (again, _) = step_sign_in(phase.clone(), SignInEvent::CleanupFailed("x".into()));
-        assert_eq!(again, phase);
-        for other in [
-            SignInPhase::Idle,
-            SignInPhase::Authorized(github_account()),
-            SignInPhase::Failed(SignInFailure::Denied),
-            SignInPhase::Requesting(SignInMethod::GitHubDevice),
-        ] {
-            let (after, _) = step_sign_in(other.clone(), SignInEvent::CleanupFailed("x".into()));
-            assert_eq!(after, other);
-        }
-    }
-
-    #[test]
     fn ssh_aliases_never_stand_in_for_a_web_address() {
         let mut book = AccountBook::default();
         book.add(account(ForgeKind::GitHub, "github.com", "ana"));
@@ -1243,48 +1279,71 @@ mod tests {
         }
     }
 
+    const FIRST: Attempt = Attempt(1);
+    const SECOND: Attempt = Attempt(2);
+
+    fn begin(method: SignInMethod, attempt: Attempt) -> SignInEvent {
+        SignInEvent::Begin { method, attempt }
+    }
+
+    fn reply(attempt: Attempt, reply: SignInReply) -> SignInEvent {
+        SignInEvent::Reply { attempt, reply }
+    }
+
+    fn ready(attempt: Attempt, interval_secs: u32) -> SignInEvent {
+        reply(
+            attempt,
+            SignInReply::PromptReady {
+                prompt: prompt(),
+                interval_secs,
+            },
+        )
+    }
+
     #[test]
     fn the_device_flow_polls_until_the_user_is_done() {
-        let (phase, commands) = step_sign_in(
-            SignInPhase::Idle,
-            SignInEvent::Begin(SignInMethod::GitHubDevice),
+        let (phase, commands) =
+            step_sign_in(SignInPhase::Idle, begin(SignInMethod::GitHubDevice, FIRST));
+        assert_eq!(
+            phase,
+            SignInPhase::Requesting {
+                method: SignInMethod::GitHubDevice,
+                attempt: FIRST
+            }
         );
-        assert_eq!(phase, SignInPhase::Requesting(SignInMethod::GitHubDevice));
         assert_eq!(
             commands,
-            vec![SignInCommand::Request(SignInMethod::GitHubDevice)]
+            vec![SignInCommand::Request {
+                method: SignInMethod::GitHubDevice,
+                attempt: FIRST
+            }]
         );
-        let (phase, commands) = step_sign_in(
-            phase,
-            SignInEvent::PromptReady {
-                prompt: prompt(),
-                interval_secs: 5,
-            },
-        );
+        let (phase, commands) = step_sign_in(phase, ready(FIRST, 5));
         assert_eq!(commands, vec![SignInCommand::PollAfter { secs: 5 }]);
-        let (phase, commands) = step_sign_in(phase, SignInEvent::Pending);
+        let (phase, commands) = step_sign_in(phase, reply(FIRST, SignInReply::Pending));
         assert_eq!(commands, vec![SignInCommand::PollAfter { secs: 5 }]);
-        let (phase, commands) = step_sign_in(phase, SignInEvent::SlowDown);
+        let (phase, commands) = step_sign_in(phase, reply(FIRST, SignInReply::SlowDown));
         assert_eq!(commands, vec![SignInCommand::PollAfter { secs: 10 }]);
-        let (phase, commands) = step_sign_in(phase, SignInEvent::Granted(github_account()));
+        let (phase, commands) =
+            step_sign_in(phase, reply(FIRST, SignInReply::Granted(github_account())));
         assert_eq!(phase, SignInPhase::Authorized(github_account()));
         assert!(commands.is_empty());
     }
 
     #[test]
     fn the_browser_flow_waits_without_polling() {
-        let (phase, _) = step_sign_in(
-            SignInPhase::Idle,
-            SignInEvent::Begin(SignInMethod::GitLabBrowser),
-        );
+        let (phase, _) = step_sign_in(SignInPhase::Idle, begin(SignInMethod::GitLabBrowser, FIRST));
         let (phase, commands) = step_sign_in(
             phase,
-            SignInEvent::PromptReady {
-                prompt: UserPrompt::Browser {
-                    url: "https://gitlab.com/oauth/authorize?x=1".into(),
+            reply(
+                FIRST,
+                SignInReply::PromptReady {
+                    prompt: UserPrompt::Browser {
+                        url: "https://gitlab.com/oauth/authorize?x=1".into(),
+                    },
+                    interval_secs: 0,
                 },
-                interval_secs: 0,
-            },
+            ),
         );
         assert!(commands.is_empty());
         assert!(matches!(phase, SignInPhase::AwaitingUser { .. }));
@@ -1292,15 +1351,15 @@ mod tests {
 
     #[test]
     fn cancel_stops_the_flow_and_late_answers_change_nothing() {
-        let (phase, _) = step_sign_in(
-            SignInPhase::Idle,
-            SignInEvent::Begin(SignInMethod::GitHubDevice),
-        );
+        let (phase, _) = step_sign_in(SignInPhase::Idle, begin(SignInMethod::GitHubDevice, FIRST));
         let (phase, commands) = step_sign_in(phase, SignInEvent::Cancel);
-        assert_eq!(phase, SignInPhase::Failed(SignInFailure::Cancelled));
+        assert_eq!(phase, SignInPhase::Failed(SignInFailure::Cancelled(FIRST)));
         assert_eq!(commands, vec![SignInCommand::Abort]);
         // A poll answer that was already in flight must not sign in.
-        let (after, commands) = step_sign_in(phase.clone(), SignInEvent::Granted(github_account()));
+        let (after, commands) = step_sign_in(
+            phase.clone(),
+            reply(FIRST, SignInReply::Granted(github_account())),
+        );
         assert_eq!(after, phase);
         assert!(commands.is_empty());
         // Nothing to cancel when idle.
@@ -1310,77 +1369,168 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_for_an_older_attempt_never_reaches_the_new_one() {
+        // The first attempt was cancelled; its answers were still queued
+        // when the second began.
+        let (phase, _) = step_sign_in(SignInPhase::Idle, begin(SignInMethod::GitHubDevice, FIRST));
+        let (phase, _) = step_sign_in(phase, SignInEvent::Cancel);
+        let (phase, _) = step_sign_in(phase, begin(SignInMethod::GitHubDevice, SECOND));
+        let (phase, _) = step_sign_in(phase, ready(SECOND, 5));
+        for stale in [
+            SignInReply::Granted(github_account()),
+            SignInReply::Denied,
+            SignInReply::Expired,
+            SignInReply::Errored("old".into()),
+            SignInReply::Pending,
+            SignInReply::SlowDown,
+            SignInReply::PromptReady {
+                prompt: prompt(),
+                interval_secs: 1,
+            },
+            SignInReply::CleanupFailed("old".into()),
+        ] {
+            let (after, commands) = step_sign_in(phase.clone(), reply(FIRST, stale.clone()));
+            assert_eq!(after, phase, "{stale:?}");
+            assert!(commands.is_empty(), "{stale:?}");
+        }
+        // The new attempt's own answer still counts.
+        let (after, _) = step_sign_in(phase, reply(SECOND, SignInReply::Granted(github_account())));
+        assert_eq!(after, SignInPhase::Authorized(github_account()));
+    }
+
+    #[test]
     fn refusals_and_errors_end_the_flow_and_it_can_start_again() {
-        for (event, failure) in [
-            (SignInEvent::Denied, SignInFailure::Denied),
-            (SignInEvent::Expired, SignInFailure::Expired),
+        for (answer, failure) in [
+            (SignInReply::Denied, SignInFailure::Denied),
+            (SignInReply::Expired, SignInFailure::Expired),
             (
-                SignInEvent::Errored("no network".into()),
+                SignInReply::Errored("no network".into()),
                 SignInFailure::Error("no network".into()),
             ),
         ] {
-            let (phase, _) = step_sign_in(
-                SignInPhase::Idle,
-                SignInEvent::Begin(SignInMethod::GitHubDevice),
-            );
-            let (phase, commands) = step_sign_in(phase, event);
+            let (phase, _) =
+                step_sign_in(SignInPhase::Idle, begin(SignInMethod::GitHubDevice, FIRST));
+            let (phase, commands) = step_sign_in(phase, reply(FIRST, answer));
             assert_eq!(phase, SignInPhase::Failed(failure));
             assert!(commands.is_empty());
-            let (phase, commands) =
-                step_sign_in(phase, SignInEvent::Begin(SignInMethod::GitLabBrowser));
-            assert_eq!(phase, SignInPhase::Requesting(SignInMethod::GitLabBrowser));
+            let (phase, commands) = step_sign_in(phase, begin(SignInMethod::GitLabBrowser, SECOND));
+            assert_eq!(
+                phase,
+                SignInPhase::Requesting {
+                    method: SignInMethod::GitLabBrowser,
+                    attempt: SECOND
+                }
+            );
             assert_eq!(commands.len(), 1);
         }
         // A second Begin while one is running is ignored.
-        let (phase, _) = step_sign_in(
-            SignInPhase::Idle,
-            SignInEvent::Begin(SignInMethod::GitHubDevice),
-        );
-        let (after, commands) = step_sign_in(
-            phase.clone(),
-            SignInEvent::Begin(SignInMethod::GitLabBrowser),
-        );
+        let (phase, _) = step_sign_in(SignInPhase::Idle, begin(SignInMethod::GitHubDevice, FIRST));
+        let (after, commands) =
+            step_sign_in(phase.clone(), begin(SignInMethod::GitLabBrowser, SECOND));
         assert_eq!(after, phase);
         assert!(commands.is_empty());
     }
 
-    fn event() -> impl Strategy<Value = SignInEvent> {
+    #[test]
+    fn a_failed_undo_after_cancel_is_told_and_nothing_else_changes_a_finished_flow() {
+        let (phase, _) = step_sign_in(SignInPhase::Idle, begin(SignInMethod::GitHubDevice, FIRST));
+        let (phase, _) = step_sign_in(phase, SignInEvent::Cancel);
+        // A report for another attempt is not this one's.
+        let (same, _) = step_sign_in(
+            phase.clone(),
+            reply(SECOND, SignInReply::CleanupFailed("other".into())),
+        );
+        assert_eq!(same, phase);
+        let (phase, commands) = step_sign_in(
+            phase,
+            reply(FIRST, SignInReply::CleanupFailed("remove the entry".into())),
+        );
+        assert_eq!(
+            phase,
+            SignInPhase::Failed(SignInFailure::CancelledWithLeftover(
+                "remove the entry".into()
+            ))
+        );
+        assert!(commands.is_empty());
+        // It is told once, and only for a cancel.
+        let (again, _) = step_sign_in(
+            phase.clone(),
+            reply(FIRST, SignInReply::CleanupFailed("x".into())),
+        );
+        assert_eq!(again, phase);
+        for other in [
+            SignInPhase::Idle,
+            SignInPhase::Authorized(github_account()),
+            SignInPhase::Failed(SignInFailure::Denied),
+            SignInPhase::Requesting {
+                method: SignInMethod::GitHubDevice,
+                attempt: FIRST,
+            },
+        ] {
+            let (after, _) = step_sign_in(
+                other.clone(),
+                reply(FIRST, SignInReply::CleanupFailed("x".into())),
+            );
+            assert_eq!(after, other);
+        }
+    }
+
+    fn answer() -> impl Strategy<Value = SignInReply> {
         prop_oneof![
-            Just(SignInEvent::Begin(SignInMethod::GitHubDevice)),
-            Just(SignInEvent::Begin(SignInMethod::GitLabBrowser)),
-            Just(SignInEvent::Cancel),
-            (0u32..1000).prop_map(|interval_secs| SignInEvent::PromptReady {
+            (0u32..1000).prop_map(|interval_secs| SignInReply::PromptReady {
                 prompt: prompt(),
                 interval_secs
             }),
-            Just(SignInEvent::Pending),
-            Just(SignInEvent::SlowDown),
-            Just(SignInEvent::Granted(github_account())),
-            Just(SignInEvent::Denied),
-            Just(SignInEvent::Expired),
-            Just(SignInEvent::Errored("x".into())),
-            Just(SignInEvent::CleanupFailed("x".into())),
+            Just(SignInReply::Pending),
+            Just(SignInReply::SlowDown),
+            Just(SignInReply::Granted(github_account())),
+            Just(SignInReply::Denied),
+            Just(SignInReply::Expired),
+            Just(SignInReply::Errored("x".into())),
+            Just(SignInReply::CleanupFailed("x".into())),
+        ]
+    }
+
+    fn event() -> impl Strategy<Value = SignInEvent> {
+        let attempt = (0u64..4).prop_map(Attempt);
+        prop_oneof![
+            attempt.clone().prop_map(|attempt| SignInEvent::Begin {
+                method: SignInMethod::GitHubDevice,
+                attempt
+            }),
+            attempt.clone().prop_map(|attempt| SignInEvent::Begin {
+                method: SignInMethod::GitLabBrowser,
+                attempt
+            }),
+            Just(SignInEvent::Cancel),
+            (attempt, answer()).prop_map(|(attempt, reply)| SignInEvent::Reply { attempt, reply }),
         ]
     }
 
     proptest! {
-        /// Whatever order events arrive in: a finished flow only restarts
-        /// through `Begin`, a poll is never asked from a phase that is not
-        /// waiting, and the interval stays within its bounds.
+        /// Whatever order events arrive in: an answer only ever moves the
+        /// attempt it names, a finished flow only restarts through `Begin`, a
+        /// poll is never asked from a phase that is not waiting, and the
+        /// interval stays within its bounds.
         #[test]
         fn the_sign_in_machine_keeps_its_promises(events in proptest::collection::vec(event(), 0..40)) {
             let mut phase = SignInPhase::Idle;
             for event in events {
-                let begins = matches!(event, SignInEvent::Begin(_));
-                // The one thing a finished flow still accepts: news that the undo
-                // after a cancel failed.
-                let leftover = matches!(event, SignInEvent::CleanupFailed(_))
-                    && phase == SignInPhase::Failed(SignInFailure::Cancelled);
                 let before = phase.clone();
-                let (next, commands) = step_sign_in(phase, event);
+                let (next, commands) = step_sign_in(phase, event.clone());
+                if let SignInEvent::Reply { attempt, reply } = &event {
+                    let current = before.attempt() == Some(*attempt);
+                    // The one thing a finished attempt still accepts: news
+                    // that its undo after a cancel failed.
+                    let leftover = matches!(reply, SignInReply::CleanupFailed(_))
+                        && before == SignInPhase::Failed(SignInFailure::Cancelled(*attempt));
+                    if !current && !leftover {
+                        prop_assert_eq!(&next, &before);
+                        prop_assert!(commands.is_empty());
+                    }
+                }
                 if matches!(before, SignInPhase::Authorized(_) | SignInPhase::Failed(_))
-                    && !begins
-                    && !leftover
+                    && !matches!(event, SignInEvent::Begin { .. } | SignInEvent::Reply { .. })
                 {
                     prop_assert_eq!(&next, &before);
                     prop_assert!(commands.is_empty());
@@ -1398,6 +1548,7 @@ mod tests {
                 phase = next;
             }
         }
+
 
         #[test]
         fn a_book_never_holds_two_accounts_with_one_key(

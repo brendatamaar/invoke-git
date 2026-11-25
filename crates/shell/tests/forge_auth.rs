@@ -17,8 +17,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use invoke_core::forge::{
-    AccountBook, AuthMethod, ForgeAccount, ForgeKind, OriginProblem, Resolution, SignInCommand,
-    SignInEvent, SignInFailure, SignInMethod, SignInPhase, UserPrompt, Visibility, step_sign_in,
+    AccountBook, Attempt, AuthMethod, ForgeAccount, ForgeKind, OriginProblem, Resolution,
+    SignInCommand, SignInEvent, SignInFailure, SignInMethod, SignInPhase, SignInReply, UserPrompt,
+    Visibility, step_sign_in,
 };
 use shell::forge::codec::{base64url, parse_query, sha256};
 use shell::forge::{
@@ -342,7 +343,13 @@ fn sign_in_until(
     stop: impl Fn() -> bool,
 ) -> SignInPhase {
     let (events, inbox) = mpsc::channel();
-    let (mut phase, commands) = step_sign_in(SignInPhase::Idle, SignInEvent::Begin(method));
+    let (mut phase, commands) = step_sign_in(
+        SignInPhase::Idle,
+        SignInEvent::Begin {
+            method,
+            attempt: Attempt(1),
+        },
+    );
     for command in commands {
         runner.execute(command, events.clone());
     }
@@ -531,7 +538,10 @@ fn cancelling_stops_the_polling() {
     let (events, inbox) = mpsc::channel();
     let (phase, commands) = step_sign_in(
         SignInPhase::Idle,
-        SignInEvent::Begin(SignInMethod::GitHubDevice),
+        SignInEvent::Begin {
+            method: SignInMethod::GitHubDevice,
+            attempt: Attempt(1),
+        },
     );
     for command in commands {
         runner.execute(command, events.clone());
@@ -543,7 +553,10 @@ fn cancelling_stops_the_polling() {
         runner.execute(command, events.clone());
     }
     let (phase, commands) = step_sign_in(phase, SignInEvent::Cancel);
-    assert_eq!(phase, SignInPhase::Failed(SignInFailure::Cancelled));
+    assert_eq!(
+        phase,
+        SignInPhase::Failed(SignInFailure::Cancelled(Attempt(1)))
+    );
     assert_eq!(commands, vec![SignInCommand::Abort]);
     for command in commands {
         runner.execute(command, events.clone());
@@ -1950,7 +1963,10 @@ fn run_until_committed(runner: &SignInRunner, service: &ForgeService) {
     let (events, inbox) = mpsc::channel();
     let (mut phase, commands) = step_sign_in(
         SignInPhase::Idle,
-        SignInEvent::Begin(SignInMethod::GitHubDevice),
+        SignInEvent::Begin {
+            method: SignInMethod::GitHubDevice,
+            attempt: Attempt(1),
+        },
     );
     for command in commands {
         runner.execute(command, events.clone());
@@ -2030,7 +2046,13 @@ fn cancel_before_the_commit_stores_nothing_even_for_a_second_sign_in() {
     let service = service(&mock, store.clone(), None);
     let runner = SignInRunner::new(service.clone());
     let (events, _inbox) = mpsc::channel();
-    runner.execute(SignInCommand::Request(SignInMethod::GitHubDevice), events);
+    runner.execute(
+        SignInCommand::Request {
+            method: SignInMethod::GitHubDevice,
+            attempt: Attempt(1),
+        },
+        events,
+    );
     abort(&runner);
     let account = service
         .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA_SECOND")
@@ -2195,8 +2217,10 @@ fn a_cancel_from_inside_the_keychain_write_neither_deadlocks_nor_keeps_the_accou
 fn wait_for_cleanup_failed(inbox: &mpsc::Receiver<SignInEvent>) -> Option<String> {
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(5) {
-        if let Ok(SignInEvent::CleanupFailed(message)) =
-            inbox.recv_timeout(Duration::from_millis(25))
+        if let Ok(SignInEvent::Reply {
+            reply: SignInReply::CleanupFailed(message),
+            ..
+        }) = inbox.recv_timeout(Duration::from_millis(25))
         {
             return Some(message);
         }
@@ -2225,8 +2249,11 @@ fn a_cancel_whose_undo_fails_says_so_instead_of_staying_silent() {
     assert!(!store.inner.is_empty());
     // The machine shows it on the cancelled screen.
     let (phase, _) = step_sign_in(
-        SignInPhase::Failed(SignInFailure::Cancelled),
-        SignInEvent::CleanupFailed(message),
+        SignInPhase::Failed(SignInFailure::Cancelled(Attempt(1))),
+        SignInEvent::Reply {
+            attempt: Attempt(1),
+            reply: SignInReply::CleanupFailed(message),
+        },
     );
     assert!(matches!(
         phase,
@@ -2248,7 +2275,10 @@ fn a_failed_undo_of_a_write_cancelled_midway_is_reported_by_the_flow() {
     let (events, inbox) = mpsc::channel();
     let (mut phase, commands) = step_sign_in(
         SignInPhase::Idle,
-        SignInEvent::Begin(SignInMethod::GitHubDevice),
+        SignInEvent::Begin {
+            method: SignInMethod::GitHubDevice,
+            attempt: Attempt(1),
+        },
     );
     for command in commands {
         runner.execute(command, events.clone());
@@ -2261,7 +2291,10 @@ fn a_failed_undo_of_a_write_cancelled_midway_is_reported_by_the_flow() {
             "no report of the failed undo"
         );
         match inbox.recv_timeout(Duration::from_millis(25)) {
-            Ok(SignInEvent::CleanupFailed(text)) => message = Some(text),
+            Ok(SignInEvent::Reply {
+                reply: SignInReply::CleanupFailed(text),
+                ..
+            }) => message = Some(text),
             Ok(event) => {
                 let (next, commands) = step_sign_in(phase, event);
                 phase = next;
@@ -2411,7 +2444,10 @@ fn a_cancelled_device_request_that_answers_late_cannot_replace_the_new_one() {
     let runner = SignInRunner::new(service);
     let (events, inbox) = mpsc::channel();
     runner.execute(
-        SignInCommand::Request(SignInMethod::GitHubDevice),
+        SignInCommand::Request {
+            method: SignInMethod::GitHubDevice,
+            attempt: Attempt(1),
+        },
         events.clone(),
     );
     eventually("the first request never arrived", || {
@@ -2419,12 +2455,21 @@ fn a_cancelled_device_request_that_answers_late_cannot_replace_the_new_one() {
     });
     abort(&runner);
     runner.execute(
-        SignInCommand::Request(SignInMethod::GitHubDevice),
+        SignInCommand::Request {
+            method: SignInMethod::GitHubDevice,
+            attempt: Attempt(2),
+        },
         events.clone(),
     );
     let ready = inbox.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(
-        matches!(ready, SignInEvent::PromptReady { .. }),
+        matches!(
+            ready,
+            SignInEvent::Reply {
+                attempt: Attempt(2),
+                reply: SignInReply::PromptReady { .. }
+            }
+        ),
         "{ready:?}"
     );
     // Now the stale answer lands.
@@ -2442,7 +2487,13 @@ fn a_cancelled_device_request_that_answers_late_cannot_replace_the_new_one() {
     // And the stale attempt said nothing (only the new poll answered).
     thread::sleep(Duration::from_millis(100));
     for event in inbox.try_iter() {
-        assert_eq!(event, SignInEvent::Pending);
+        assert_eq!(
+            event,
+            SignInEvent::Reply {
+                attempt: Attempt(2),
+                reply: SignInReply::Pending
+            }
+        );
     }
 }
 
@@ -2643,4 +2694,75 @@ fn an_undo_whose_list_write_fails_stops_before_the_keychain() {
     // two agree, and the user is told to clean up.
     assert_eq!(service.accounts().len(), 1);
     assert!(!store.inner.is_empty(), "the token was deleted anyway");
+}
+
+#[test]
+fn a_late_granted_from_a_cancelled_attempt_never_connects_the_next_one() {
+    let mock = device_mock("granted");
+    let store = memory();
+    let service = service(&mock, store.clone(), None);
+    let runner = SignInRunner::new(service.clone());
+    let (events, inbox) = mpsc::channel();
+    // Attempt 1 runs until its account is stored; its `Granted` stays queued.
+    let (mut phase, commands) = step_sign_in(
+        SignInPhase::Idle,
+        SignInEvent::Begin {
+            method: SignInMethod::GitHubDevice,
+            attempt: Attempt(1),
+        },
+    );
+    for command in commands {
+        runner.execute(command, events.clone());
+    }
+    let mut queued = Vec::new();
+    let started = Instant::now();
+    while !queued.iter().any(|e| {
+        matches!(
+            e,
+            SignInEvent::Reply {
+                reply: SignInReply::Granted(_),
+                ..
+            }
+        )
+    }) {
+        assert!(started.elapsed() < Duration::from_secs(15), "never granted");
+        if let Ok(event) = inbox.recv_timeout(Duration::from_millis(5)) {
+            if matches!(
+                event,
+                SignInEvent::Reply {
+                    reply: SignInReply::Granted(_),
+                    ..
+                }
+            ) {
+                queued.push(event);
+                continue;
+            }
+            let (next, commands) = step_sign_in(phase, event);
+            phase = next;
+            for command in commands {
+                runner.execute(command, events.clone());
+            }
+        }
+    }
+    // The user cancels it and starts attempt 2 before the UI read the answer.
+    let (next, commands) = step_sign_in(phase, SignInEvent::Cancel);
+    for command in commands {
+        runner.execute(command, events.clone());
+    }
+    let (next, _) = step_sign_in(
+        next,
+        SignInEvent::Begin {
+            method: SignInMethod::GitHubDevice,
+            attempt: Attempt(2),
+        },
+    );
+    // Now the old answer is read.
+    let (after, _) = step_sign_in(next.clone(), queued.remove(0));
+    assert_eq!(after, next, "an old answer moved the new attempt");
+    assert!(!matches!(after, SignInPhase::Authorized(_)));
+    assert!(
+        service.accounts().is_empty(),
+        "the cancelled account stayed"
+    );
+    assert!(store.is_empty());
 }

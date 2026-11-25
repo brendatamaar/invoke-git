@@ -15,8 +15,8 @@ use gpui::{
     Styled, Subscription, Task, Window, div, px,
 };
 use invoke_core::forge::{
-    AccountBook, AuthMethod, ForgeAccount, ForgeKind, SignInCommand, SignInEvent, SignInFailure,
-    SignInMethod, SignInPhase, UserPrompt, step_sign_in,
+    AccountBook, Attempt, AuthMethod, ForgeAccount, ForgeKind, SignInCommand, SignInEvent,
+    SignInFailure, SignInMethod, SignInPhase, UserPrompt, step_sign_in,
 };
 use shell::forge::{ForgeError, ForgeService, KeyringStore, ServiceConfig, SignInRunner};
 use tokens::{
@@ -135,7 +135,7 @@ pub enum SignInScreen {
 pub fn sign_in_screen(phase: &SignInPhase) -> SignInScreen {
     match phase {
         SignInPhase::Idle => SignInScreen::Idle,
-        SignInPhase::Requesting(method) => SignInScreen::Starting(*method),
+        SignInPhase::Requesting { method, .. } => SignInScreen::Starting(*method),
         SignInPhase::AwaitingUser { prompt, .. } => match prompt {
             UserPrompt::DeviceCode {
                 user_code,
@@ -155,7 +155,7 @@ pub fn failure_text(failure: &SignInFailure) -> String {
     match failure {
         SignInFailure::Denied => "The request was declined on the website.".into(),
         SignInFailure::Expired => "The code expired. Start again.".into(),
-        SignInFailure::Cancelled => "Cancelled.".into(),
+        SignInFailure::Cancelled(_) => "Cancelled.".into(),
         SignInFailure::Error(message) => message.clone(),
         SignInFailure::CancelledWithLeftover(message) => {
             format!("Cancelled, but it could not be fully undone. {message}")
@@ -219,6 +219,9 @@ pub struct AccountsView {
     checking: bool,
     /// A disconnect or preference change running in the background.
     changing: Option<AccountChange>,
+    /// The number the next sign-in attempt gets. Answers carry it back, so a
+    /// late answer for an earlier attempt is dropped by the machine.
+    next_attempt: u64,
     notice: Option<(BannerKind, String)>,
     _pump: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -285,6 +288,7 @@ impl AccountsView {
             instance,
             checking: false,
             changing: None,
+            next_attempt: 1,
             notice: None,
             _pump: Self::pump(inbox, cx),
             _subscriptions: subscriptions,
@@ -295,7 +299,9 @@ impl AccountsView {
 
     fn begin(&mut self, method: SignInMethod, cx: &mut Context<Self>) {
         self.notice = None;
-        self.deliver(SignInEvent::Begin(method), cx);
+        let attempt = Attempt(self.next_attempt);
+        self.next_attempt += 1;
+        self.deliver(SignInEvent::Begin { method, attempt }, cx);
     }
 
     fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
@@ -312,7 +318,7 @@ impl AccountsView {
             self.runner.execute(command, self.events.clone());
         }
         match (&before, &self.phase) {
-            (SignInPhase::Requesting(_), SignInPhase::AwaitingUser { prompt, .. }) => {
+            (SignInPhase::Requesting { .. }, SignInPhase::AwaitingUser { prompt, .. }) => {
                 // Take the user to the page; the code (or the approval
                 // button) is waiting there.
                 let url = match prompt {
@@ -860,17 +866,26 @@ mod tests {
     fn the_screen_follows_the_phase() {
         assert_eq!(sign_in_screen(&SignInPhase::Idle), SignInScreen::Idle);
         assert_eq!(
-            sign_in_screen(&SignInPhase::Requesting(SignInMethod::GitHubDevice)),
+            sign_in_screen(&SignInPhase::Requesting {
+                method: SignInMethod::GitHubDevice,
+                attempt: Attempt(1)
+            }),
             SignInScreen::Starting(SignInMethod::GitHubDevice)
         );
         let (phase, _) = step_sign_in(
-            SignInPhase::Requesting(SignInMethod::GitHubDevice),
-            SignInEvent::PromptReady {
-                prompt: UserPrompt::DeviceCode {
-                    user_code: "AB-12".into(),
-                    verification_url: "https://github.com/login/device".into(),
+            SignInPhase::Requesting {
+                method: SignInMethod::GitHubDevice,
+                attempt: Attempt(1),
+            },
+            SignInEvent::Reply {
+                attempt: Attempt(1),
+                reply: invoke_core::forge::SignInReply::PromptReady {
+                    prompt: UserPrompt::DeviceCode {
+                        user_code: "AB-12".into(),
+                        verification_url: "https://github.com/login/device".into(),
+                    },
+                    interval_secs: 5,
                 },
-                interval_secs: 5,
             },
         );
         assert_eq!(
@@ -949,13 +964,17 @@ mod tests {
     #[test]
     fn closing_the_screen_stops_a_running_sign_in_and_never_undoes_a_finished_one() {
         for running in [
-            SignInPhase::Requesting(SignInMethod::GitHubDevice),
+            SignInPhase::Requesting {
+                method: SignInMethod::GitHubDevice,
+                attempt: Attempt(1),
+            },
             SignInPhase::AwaitingUser {
                 method: SignInMethod::GitLabBrowser,
                 prompt: UserPrompt::Browser {
                     url: "https://gitlab.com/oauth/authorize".into(),
                 },
                 interval_secs: 1,
+                attempt: Attempt(2),
             },
         ] {
             assert_eq!(commands_on_close(&running), vec![SignInCommand::Abort]);
@@ -964,7 +983,7 @@ mod tests {
             SignInPhase::Idle,
             SignInPhase::Authorized(account()),
             SignInPhase::Failed(SignInFailure::Denied),
-            SignInPhase::Failed(SignInFailure::Cancelled),
+            SignInPhase::Failed(SignInFailure::Cancelled(Attempt(1))),
             SignInPhase::Failed(SignInFailure::Error("x".into())),
         ] {
             assert!(commands_on_close(&finished).is_empty(), "{finished:?}");

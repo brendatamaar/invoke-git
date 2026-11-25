@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use invoke_core::forge::{ForgeKind, Origin, SignInCommand, SignInEvent, SignInMethod, UserPrompt};
+use invoke_core::forge::{
+    Attempt, ForgeKind, Origin, SignInCommand, SignInEvent, SignInMethod, SignInReply, UserPrompt,
+};
 
 use super::api::{self, github::DevicePoll};
 use super::codec::{Pkce, base64url, parse_query};
@@ -36,16 +38,32 @@ struct DeviceSession {
 
 pub struct SignInRunner {
     service: ForgeService,
-    /// Cancel switch of the newest flow; older flows stay cancelled.
-    cancel: Mutex<Arc<FlowControl>>,
+    /// The newest attempt and its cancel switch; older ones stay cancelled.
+    cancel: Mutex<(Attempt, Arc<FlowControl>)>,
     device: Arc<Mutex<Option<DeviceSession>>>,
+}
+
+/// Where one attempt's answers go: every answer is tagged with the attempt,
+/// so the machine can drop the ones that come too late.
+struct Outbox {
+    attempt: Attempt,
+    events: Sender<SignInEvent>,
+}
+
+impl Outbox {
+    fn post(&self, reply: SignInReply) {
+        let _ = self.events.send(SignInEvent::Reply {
+            attempt: self.attempt,
+            reply,
+        });
+    }
 }
 
 impl SignInRunner {
     pub fn new(service: ForgeService) -> Self {
         Self {
             service,
-            cancel: Mutex::new(Arc::new(FlowControl::default())),
+            cancel: Mutex::new((Attempt(0), Arc::new(FlowControl::default()))),
             device: Arc::default(),
         }
     }
@@ -53,41 +71,45 @@ impl SignInRunner {
     /// Carries out one command from `step_sign_in`.
     pub fn execute(&self, command: SignInCommand, events: Sender<SignInEvent>) {
         match command {
-            SignInCommand::Request(method) => {
-                let cancel = self.fresh_cancel();
+            SignInCommand::Request { method, attempt } => {
+                let cancel = self.fresh_cancel(attempt);
                 let service = self.service.clone();
                 let device = self.device.clone();
+                let out = Outbox { attempt, events };
                 thread::spawn(move || {
                     let outcome = match method {
                         SignInMethod::GitHubDevice => {
-                            request_device_code(&service, &device, &cancel, &events)
+                            request_device_code(&service, &device, &cancel, &out)
                         }
-                        SignInMethod::GitLabBrowser => browser_flow(&service, &cancel, &events),
+                        SignInMethod::GitLabBrowser => browser_flow(&service, &cancel, &out),
                     };
                     if let Err(error) = outcome {
-                        send(&cancel, &events, failure_event(&cancel, &error));
+                        send(&cancel, &out, failure_reply(&cancel, &error));
                     }
                 });
             }
             SignInCommand::PollAfter { secs } => {
-                let cancel = self.current_cancel();
+                let (attempt, cancel) = self.current_cancel();
                 let service = self.service.clone();
                 let device = self.device.clone();
+                let out = Outbox { attempt, events };
                 thread::spawn(move || {
                     let wait = service.config().poll_unit * secs;
                     if sleep_unless_cancelled(wait, &cancel) {
                         return;
                     }
-                    let event = poll_once(&service, &device, &cancel);
-                    send(&cancel, &events, event);
+                    let reply = poll_once(&service, &device, &cancel);
+                    send(&cancel, &out, reply);
                 });
             }
             SignInCommand::Abort => {
                 // Never waits for a write in progress (that flow undoes its own
                 // write); undoes a finished commit. What is stored matches the
                 // "cancelled" shown, and a failed undo is reported, not dropped.
-                if let Err(error) = self.service.cancel_flow(&self.current_cancel()) {
-                    let _ = events.send(SignInEvent::CleanupFailed(error.user_message()));
+                let (attempt, cancel) = self.current_cancel();
+                if let Err(error) = self.service.cancel_flow(&cancel) {
+                    Outbox { attempt, events }
+                        .post(SignInReply::CleanupFailed(error.user_message()));
                 }
                 if let Ok(mut device) = self.device.lock() {
                     *device = None;
@@ -97,36 +119,35 @@ impl SignInRunner {
     }
 
     /// Retires whatever ran before (what it committed stays) and returns the
-    /// control for a new flow.
-    fn fresh_cancel(&self) -> Arc<FlowControl> {
+    /// control for a new attempt.
+    fn fresh_cancel(&self, attempt: Attempt) -> Arc<FlowControl> {
         let mut current = self.cancel.lock().unwrap_or_else(|p| p.into_inner());
-        current.retire();
-        *current = Arc::new(FlowControl::default());
-        current.clone()
+        current.1.retire();
+        *current = (attempt, Arc::new(FlowControl::default()));
+        current.1.clone()
     }
 
-    fn current_cancel(&self) -> Arc<FlowControl> {
-        self.cancel
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+    fn current_cancel(&self) -> (Attempt, Arc<FlowControl>) {
+        let current = self.cancel.lock().unwrap_or_else(|p| p.into_inner());
+        (current.0, current.1.clone())
     }
 }
 
-/// Sends an event unless the flow was cancelled meanwhile.
-/// The event for a failed step. A failed undo after a cancel is the one error a
-/// cancelled flow still reports.
-fn failure_event(cancel: &FlowControl, error: &ForgeError) -> SignInEvent {
+/// The answer for a failed step. A failed undo after a cancel is the one
+/// error a cancelled flow still reports.
+fn failure_reply(cancel: &FlowControl, error: &ForgeError) -> SignInReply {
     if cancel.is_cancelled() && *error == ForgeError::RollbackFailed {
-        SignInEvent::CleanupFailed(error.user_message())
+        SignInReply::CleanupFailed(error.user_message())
     } else {
-        SignInEvent::Errored(error.user_message())
+        SignInReply::Errored(error.user_message())
     }
 }
 
-fn send(cancel: &FlowControl, events: &Sender<SignInEvent>, event: SignInEvent) {
-    if !cancel.is_cancelled() || matches!(event, SignInEvent::CleanupFailed(_)) {
-        let _ = events.send(event);
+/// Sends an answer unless the flow was cancelled meanwhile (a failed undo
+/// is still sent: the user must hear of it).
+fn send(cancel: &FlowControl, out: &Outbox, reply: SignInReply) {
+    if !cancel.is_cancelled() || matches!(reply, SignInReply::CleanupFailed(_)) {
+        out.post(reply);
     }
 }
 
@@ -158,7 +179,7 @@ fn request_device_code(
     service: &ForgeService,
     device: &Mutex<Option<DeviceSession>>,
     cancel: &Arc<FlowControl>,
-    events: &Sender<SignInEvent>,
+    out: &Outbox,
 ) -> Result<(), ForgeError> {
     let client_id = client_id(service, ForgeKind::GitHub)?;
     let code =
@@ -180,8 +201,8 @@ fn request_device_code(
     }
     send(
         cancel,
-        events,
-        SignInEvent::PromptReady {
+        out,
+        SignInReply::PromptReady {
             prompt: UserPrompt::DeviceCode {
                 user_code: code.user_code,
                 verification_url: code.verification_uri,
@@ -198,7 +219,7 @@ fn poll_once(
     service: &ForgeService,
     device: &Mutex<Option<DeviceSession>>,
     cancel: &FlowControl,
-) -> SignInEvent {
+) -> SignInReply {
     let (code, client_id, deadline) = {
         let guard = device.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_ref() {
@@ -207,11 +228,11 @@ fn poll_once(
                 session.client_id.clone(),
                 session.deadline,
             ),
-            _ => return SignInEvent::Errored("The sign-in is no longer running.".into()),
+            _ => return SignInReply::Errored("The sign-in is no longer running.".into()),
         }
     };
     if Instant::now() >= deadline {
-        return SignInEvent::Expired;
+        return SignInReply::Expired;
     }
     let polled = api::github::poll_device_code(
         service.http(),
@@ -221,22 +242,22 @@ fn poll_once(
         service.now(),
     );
     match polled {
-        Ok(DevicePoll::Pending) => SignInEvent::Pending,
-        Ok(DevicePoll::SlowDown) => SignInEvent::SlowDown,
-        Ok(DevicePoll::Denied) => SignInEvent::Denied,
-        Ok(DevicePoll::Expired) => SignInEvent::Expired,
+        Ok(DevicePoll::Pending) => SignInReply::Pending,
+        Ok(DevicePoll::SlowDown) => SignInReply::SlowDown,
+        Ok(DevicePoll::Denied) => SignInReply::Denied,
+        Ok(DevicePoll::Expired) => SignInReply::Expired,
         Ok(DevicePoll::Granted(credential)) => {
             let origin = match service.origin_for_new(ForgeKind::GitHub, "") {
                 Ok(origin) => origin,
-                Err(error) => return failure_event(cancel, &error),
+                Err(error) => return failure_reply(cancel, &error),
             };
             match service.finish_oauth(ForgeKind::GitHub, origin, credential, cancel) {
-                Ok(account) => SignInEvent::Granted(account),
-                Err(error) => failure_event(cancel, &error),
+                Ok(account) => SignInReply::Granted(account),
+                Err(error) => failure_reply(cancel, &error),
             }
         }
-        Err(ForgeError::Network | ForgeError::TimedOut) => SignInEvent::Pending,
-        Err(error) => failure_event(cancel, &error),
+        Err(ForgeError::Network | ForgeError::TimedOut) => SignInReply::Pending,
+        Err(error) => failure_reply(cancel, &error),
     }
 }
 
@@ -339,7 +360,7 @@ fn request_line(stream: &mut TcpStream, cancel: &FlowControl, flow_end: Instant)
 fn browser_flow(
     service: &ForgeService,
     cancel: &FlowControl,
-    events: &Sender<SignInEvent>,
+    out: &Outbox,
 ) -> Result<(), ForgeError> {
     let client_id = client_id(service, ForgeKind::GitLab)?;
     let origin = Origin::parse(&service.config().gitlab_instance).map_err(ForgeError::BadOrigin)?;
@@ -370,8 +391,8 @@ fn browser_flow(
     );
     send(
         cancel,
-        events,
-        SignInEvent::PromptReady {
+        out,
+        SignInReply::PromptReady {
             prompt: UserPrompt::Browser { url },
             interval_secs: 0,
         },
@@ -383,7 +404,7 @@ fn browser_flow(
             return Ok(());
         }
         if Instant::now() >= end {
-            send(cancel, events, SignInEvent::Expired);
+            send(cancel, out, SignInReply::Expired);
             return Ok(());
         }
         let mut stream = match listener.accept() {
@@ -409,7 +430,7 @@ fn browser_flow(
                     "200 OK",
                     &page("Sign-in was cancelled. You can close this tab."),
                 );
-                send(cancel, events, SignInEvent::Denied);
+                send(cancel, out, SignInReply::Denied);
                 return Ok(());
             }
             Callback::Code(code) => {
@@ -438,7 +459,7 @@ fn browser_flow(
         service.now(),
     )?;
     let account = service.finish_oauth(ForgeKind::GitLab, origin, credential, cancel)?;
-    send(cancel, events, SignInEvent::Granted(account));
+    send(cancel, out, SignInReply::Granted(account));
     Ok(())
 }
 
