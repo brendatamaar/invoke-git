@@ -25,6 +25,10 @@ use super::service::{FlowControl, ForgeService};
 
 /// The device code of the flow in progress, kept for the polls.
 struct DeviceSession {
+    /// The attempt this code belongs to. A cancelled or replaced attempt that
+    /// finishes late never installs its code, and a poll only ever uses the
+    /// code of its own attempt.
+    owner: Arc<FlowControl>,
     code: Secret,
     client_id: String,
     deadline: Instant,
@@ -153,18 +157,27 @@ fn client_id(service: &ForgeService, kind: ForgeKind) -> Result<String, ForgeErr
 fn request_device_code(
     service: &ForgeService,
     device: &Mutex<Option<DeviceSession>>,
-    cancel: &FlowControl,
+    cancel: &Arc<FlowControl>,
     events: &Sender<SignInEvent>,
 ) -> Result<(), ForgeError> {
     let client_id = client_id(service, ForgeKind::GitHub)?;
     let code =
         api::github::request_device_code(service.http(), &service.config().github, &client_id)?;
     let session = DeviceSession {
+        owner: cancel.clone(),
         code: code.device_code.clone(),
         client_id,
         deadline: Instant::now() + service.config().poll_unit * code.expires_in.min(3600) as u32,
     };
-    *device.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
+    {
+        // Checked under the session lock: Abort and a new attempt flag this
+        // attempt before they touch the session, so a stale answer is dropped.
+        let mut current = device.lock().unwrap_or_else(|p| p.into_inner());
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        *current = Some(session);
+    }
     send(
         cancel,
         events,
@@ -189,12 +202,12 @@ fn poll_once(
     let (code, client_id, deadline) = {
         let guard = device.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_ref() {
-            Some(session) => (
+            Some(session) if std::ptr::eq(Arc::as_ptr(&session.owner), cancel) => (
                 session.code.clone(),
                 session.client_id.clone(),
                 session.deadline,
             ),
-            None => return SignInEvent::Errored("The sign-in is no longer running.".into()),
+            _ => return SignInEvent::Errored("The sign-in is no longer running.".into()),
         }
     };
     if Instant::now() >= deadline {

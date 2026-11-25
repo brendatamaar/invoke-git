@@ -2360,3 +2360,71 @@ fn a_clone_address_that_carries_the_token_is_never_offered() {
     let names: Vec<&str> = listing.repos.iter().map(|r| r.full_name.as_str()).collect();
     assert_eq!(names, ["a/ok"]);
 }
+
+#[test]
+fn a_cancelled_device_request_that_answers_late_cannot_replace_the_new_one() {
+    // The first request for a code hangs until released; meanwhile the user
+    // cancels and starts again. The late answer must not become the code
+    // the new attempt polls with.
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let mock = Mock::start(move |port| {
+        Box::new(move |request| match request.path() {
+            "/login/device/code" => {
+                let code = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let started = Instant::now();
+                    while !gate.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(5)
+                    {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    "dev-STALE"
+                } else {
+                    "dev-FRESH"
+                };
+                Reply::json(&format!(
+                    r#"{{"device_code":"{code}","user_code":"AAAA-BBBB",
+                        "verification_uri":"http://127.0.0.1:{port}/device","expires_in":900,"interval":1}}"#
+                ))
+            }
+            _ => Reply::json(r#"{"error":"authorization_pending"}"#),
+        })
+    });
+    let service = service(&mock, memory(), None);
+    let runner = SignInRunner::new(service);
+    let (events, inbox) = mpsc::channel();
+    runner.execute(
+        SignInCommand::Request(SignInMethod::GitHubDevice),
+        events.clone(),
+    );
+    eventually("the first request never arrived", || {
+        !mock.requests_to("/login/device/code").is_empty()
+    });
+    abort(&runner);
+    runner.execute(
+        SignInCommand::Request(SignInMethod::GitHubDevice),
+        events.clone(),
+    );
+    let ready = inbox.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        matches!(ready, SignInEvent::PromptReady { .. }),
+        "{ready:?}"
+    );
+    // Now the stale answer lands.
+    release.store(true, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(300));
+    runner.execute(SignInCommand::PollAfter { secs: 1 }, events);
+    eventually("no poll was sent", || {
+        !mock.requests_to("/login/oauth/access_token").is_empty()
+    });
+    let polls = mock.requests_to("/login/oauth/access_token");
+    assert_eq!(
+        polls[0].form_value("device_code").as_deref(),
+        Some("dev-FRESH")
+    );
+    // And the stale attempt said nothing (only the new poll answered).
+    thread::sleep(Duration::from_millis(100));
+    for event in inbox.try_iter() {
+        assert_eq!(event, SignInEvent::Pending);
+    }
+}
