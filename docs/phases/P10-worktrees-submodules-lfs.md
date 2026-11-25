@@ -1,5 +1,5 @@
 # P10 - Worktrees, Submodules & Git LFS
-Status: review
+Status: done
 Depends on: P1
 Parallel-safe with: P4b, P5, P6, P7, P8, P9, P11
 

@@ -1,5 +1,5 @@
 # P1b - Non-Text Staging & Discard
-Status: review
+Status: done
 Depends on: P1
 Parallel-safe with: P3, P5, P6, P7, P8
 
