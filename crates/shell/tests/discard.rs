@@ -1792,3 +1792,31 @@ fn a_case_mismatch_on_the_way_or_at_the_leaf_is_a_changed_precondition() {
         Some(&b"a\nB\n"[..])
     );
 }
+
+#[test]
+fn whole_file_discard_keeps_scratch_out_of_an_in_tree_separate_git_dir() {
+    let mut repo = TempRepo::new();
+    repo.git(&["init", "-q", "--separate-git-dir", "metadata"]);
+    repo.paths.git_dir = repo.paths.workdir.join("metadata");
+    repo.git(&["config", "filter.spy.smudge",
+        "for f in metadata/.invoke-*; do if [ -e \"$f\" ]; then echo \"$f\"; fi; done > metadata/spy-listing; cat",
+    ]);
+    repo.write(".gitattributes", "tracked filter=spy\n");
+    repo.write("tracked", "base\n");
+    repo.git(&["add", "--", "tracked", ".gitattributes"]);
+    repo.git(&["commit", "-qm", "base"]);
+    repo.write("tracked", "changed\n");
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "tracked"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    let listing = fs::read_to_string(repo.paths.git_dir.join("spy-listing")).unwrap();
+    assert!(listing.is_empty(), "stageable scratch: {listing}");
+    assert_eq!(repo.worktree_bytes("tracked").unwrap(), b"base\n");
+    driver.undo();
+    assert_eq!(repo.worktree_bytes("tracked").unwrap(), b"changed\n");
+}

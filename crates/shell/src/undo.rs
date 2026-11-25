@@ -204,7 +204,7 @@ impl UndoRunner {
         }
         // Git's GC cannot see the staged object ids inside a raw index blob.
         // Keep the index tree reachable alongside it.
-        let scratch = precondition::ScratchDir::create(&self.paths.git_dir)
+        let scratch = precondition::ScratchDir::for_index(&self.paths)
             .map_err(|error| format!("prepare index snapshot: {error}"))?;
         let copy = scratch.0.join("index");
         if !bytes.is_empty() {
@@ -353,7 +353,7 @@ impl UndoRunner {
                     Ok(bytes) if bytes == base.data => {}
                     Ok(_) => return Err(format!("{name} differs from the saved shared index")),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        let scratch = precondition::ScratchDir::create(&self.paths.git_dir)
+                        let scratch = precondition::ScratchDir::for_index(&self.paths)
                             .map_err(|error| format!("prepare shared index restore: {error}"))?;
                         let copy = scratch.0.join(&name);
                         fs::write(&copy, &base.data)

@@ -106,7 +106,7 @@ impl StagingRunner {
                 )));
             }
         }
-        let scratch = precondition::ScratchDir::create(&self.paths.git_dir).map_err(environment)?;
+        let scratch = precondition::ScratchDir::for_index(&self.paths).map_err(environment)?;
         let copy = scratch.0.join("index");
         if expect.index != IndexId::Absent {
             let original = self.paths.git_dir.join("index");

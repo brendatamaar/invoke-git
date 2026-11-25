@@ -136,7 +136,7 @@ impl DiscardRunner {
         // Prepare checkout using Git's smudge / EOL conversion. Record the
         // resulting bytes and mode for undo before replacing the real file.
         let scratch = tracked
-            .then(|| scratch_for(&self.paths))
+            .then(|| precondition::ScratchDir::for_worktree(&self.paths))
             .transpose()
             .map_err(environment)?;
         let staged = if let Some(scratch) = &scratch {
@@ -511,7 +511,7 @@ fn disk_name(full: &Path) -> io::Result<OsString> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
 
-    let wide = verbatim_path(full)?;
+    let wide = precondition::verbatim_path(full)?;
     // SAFETY: `wide` is NUL-terminated, `data` is a plain struct written by
     // the call, and the search handle is closed right away.
     let data = unsafe {
@@ -672,7 +672,7 @@ impl UndoRunner {
         path: &RepoPath,
         file: Option<&OnDisk>,
     ) -> Result<(), String> {
-        let scratch = precondition::ScratchDir::create(&self.paths.git_dir)
+        let scratch = precondition::ScratchDir::for_index(&self.paths)
             .map_err(|error| format!("create snapshot directory: {error}"))?;
         let private = scratch.0.join("index");
         let env = [("GIT_INDEX_FILE", private.as_os_str())];
@@ -776,7 +776,7 @@ impl UndoRunner {
                     Ok(object) => object,
                     Err(details) => return failed(ErrorClass::Bug, details),
                 };
-                let scratch = match scratch_for(&self.paths) {
+                let scratch = match precondition::ScratchDir::for_worktree(&self.paths) {
                     Ok(scratch) => scratch,
                     Err(error) => return environment(error),
                 };
@@ -799,62 +799,6 @@ impl UndoRunner {
         }
         OpOutcome::Succeeded
     }
-}
-
-/// Scratch space for a file that will replace one in the worktree.
-///
-/// Under the git dir, which status and the watcher never list, when that is
-/// on the worktree's volume, so the final rename stays atomic. Every file
-/// under the worktree is on that volume: `worktree_path` refuses links and
-/// junctions on the way, so no mount point is crossed. A git dir elsewhere
-/// (`--separate-git-dir`, a linked worktree on another drive) falls back to
-/// the worktree root, where the folder can briefly show as untracked.
-fn scratch_for(paths: &RepoPaths) -> io::Result<precondition::ScratchDir> {
-    let base = if same_volume(&paths.git_dir, &paths.workdir)? {
-        &paths.git_dir
-    } else {
-        &paths.workdir
-    };
-    precondition::ScratchDir::create(base)
-}
-
-#[cfg(unix)]
-fn same_volume(a: &Path, b: &Path) -> io::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(fs::metadata(a)?.dev() == fs::metadata(b)?.dev())
-}
-
-/// Both paths resolve to the same volume mount point. `GetVolumePathNameW`
-/// only reads path components, so nothing is opened.
-#[cfg(windows)]
-fn same_volume(a: &Path, b: &Path) -> io::Result<bool> {
-    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
-    let volume = |path: &Path| -> io::Result<Vec<u16>> {
-        let wide = verbatim_path(path)?;
-        let mut buffer = vec![0u16; wide.len() + 1];
-        // SAFETY: `wide` is NUL-terminated and `buffer` holds as many units
-        // as the path itself plus one, which bounds the mount point's length.
-        let done =
-            unsafe { GetVolumePathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
-        if done == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let end = buffer
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(buffer.len());
-        buffer.truncate(end);
-        Ok(String::from_utf16_lossy(&buffer)
-            .to_lowercase()
-            .encode_utf16()
-            .collect())
-    };
-    Ok(volume(a)? == volume(b)?)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_volume(_: &Path, _: &Path) -> io::Result<bool> {
-    Ok(false)
 }
 
 /// Git for Windows picks a symlink's kind (file or directory) from what its
@@ -1016,41 +960,13 @@ fn install_file(
 fn rename_into_vacant_path(source: &Path, target: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
-    let source = verbatim_path(source)?;
-    let target = verbatim_path(target)?;
+    let source = precondition::verbatim_path(source)?;
+    let target = precondition::verbatim_path(target)?;
     // SAFETY: both path buffers are NUL-terminated and live through the call.
     if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-/// A NUL-terminated Win32 path that also supports paths over MAX_PATH.
-#[cfg(windows)]
-fn verbatim_path(path: &Path) -> io::Result<Vec<u16>> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let absolute: Vec<u16> = std::path::absolute(path)?
-        .as_os_str()
-        .encode_wide()
-        .map(|unit| {
-            if unit == u16::from(b'/') {
-                u16::from(b'\\')
-            } else {
-                unit
-            }
-        })
-        .collect();
-    let units = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
-    let mut wide = if absolute.starts_with(&units(r"\\?\")) {
-        absolute
-    } else if let Some(share) = absolute.strip_prefix(&units(r"\\")[..]) {
-        [units(r"\\?\UNC\"), share.to_vec()].concat()
-    } else {
-        [units(r"\\?\"), absolute].concat()
-    };
-    wide.push(0);
-    Ok(wide)
 }
 
 #[cfg(not(windows))]
