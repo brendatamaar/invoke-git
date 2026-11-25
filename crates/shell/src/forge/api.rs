@@ -731,10 +731,6 @@ pub mod gitlab {
     }
 
     fn expected_web_origin(origin: &Origin) -> Option<Origin> {
-        if !origin.is_https() {
-            // Local mock server in tests.
-            return None;
-        }
         Some(origin.clone())
     }
 

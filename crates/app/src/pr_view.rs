@@ -79,9 +79,9 @@ pub struct PrPane {
     /// Which screen to return to when closing Accounts (Browse or Create).
     return_mode: Mode,
     remotes: Vec<ConfiguredRemote>,
-    /// Configured `branch.<name>.remote` + `branch.<name>.merge` for the
-    /// current branch, read off the UI thread.
-    configured_upstream: Option<BranchUpstream>,
+    /// Configured `(local_branch, branch.<name>.remote + merge)` for the
+    /// branch it was read for, read off the UI thread.
+    configured_upstream: Option<(String, BranchUpstream)>,
     preferred_remote: Option<String>,
     filter: PrFilter,
     search: Entity<TextEditor>,
@@ -247,9 +247,9 @@ impl PrPane {
                         };
                         service.reload();
                         let remotes = read_remotes(&paths).map_err(LoadErr::Unavailable)?;
-                        let configured_upstream = current_branch
-                            .as_deref()
-                            .and_then(|b| read_branch_upstream(&paths, b));
+                        let configured_upstream = current_branch.as_deref().and_then(|b| {
+                            read_branch_upstream(&paths, b).map(|u| (b.to_owned(), u))
+                        });
                         let book = service.book();
                         let target = resolve_remote_for_list(&remotes, preferred.as_deref(), &book)
                             .map_err(|e| {
@@ -468,10 +468,19 @@ impl PrPane {
             return Err(PrTargetError::NotOnBranch);
         };
         let book = service.book();
+        let current_branch = match &disk.head {
+            Head::Branch { name, .. } => Some(name.0.as_str()),
+            _ => None,
+        };
+        let matching_upstream = self
+            .configured_upstream
+            .as_ref()
+            .filter(|(branch, _)| current_branch == Some(branch.as_str()))
+            .map(|(_, upstream)| upstream);
         resolve_create_target_with_config(
             &self.remotes,
             disk,
-            self.configured_upstream.as_ref(),
+            matching_upstream,
             self.create_base_remote.as_deref(),
             &book,
         )
@@ -562,13 +571,13 @@ enum LoadErr {
     Target(
         ForgeService,
         Vec<ConfiguredRemote>,
-        Option<BranchUpstream>,
+        Option<(String, BranchUpstream)>,
         PrTargetError,
     ),
     Api(
         ForgeService,
         Vec<ConfiguredRemote>,
-        Option<BranchUpstream>,
+        Option<(String, BranchUpstream)>,
         ForgeError,
     ),
 }

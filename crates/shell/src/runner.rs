@@ -433,9 +433,10 @@ impl Job {
     ///    reports `Cancelled` after Git has already switched branches (Law 13).
     /// 4. Always delete the temp ref via RAII drop guard.
     fn run_checkout_pr(&self, remote: &str, remote_ref: &str, local_branch: &str) -> OpOutcome {
+        static TEMP_REF_SEQ: AtomicU64 = AtomicU64::new(1);
+        let seq = TEMP_REF_SEQ.fetch_add(1, Ordering::Relaxed);
         let temp_ref = format!(
-            "refs/invoke-git/pr-checkout/op-{}-{}",
-            self.op.0,
+            "refs/invoke-git/pr-checkout/op-{}-{seq}",
             std::process::id()
         );
         struct TempRefGuard {
@@ -491,14 +492,8 @@ impl Job {
             return OpOutcome::Cancelled;
         }
 
-        // Re-verify all preconditions after the network fetch: `index.lock`,
-        // `HEAD`, `index`, destination branch absence, and clean worktree.
-        if let Err(failure) = precondition::check(&self.paths, &self.expect) {
-            return OpOutcome::Failed(failure);
-        }
-        if let Err(failure) = precondition::check_refs(&self.paths, &self.args.expected_refs()) {
-            return OpOutcome::Failed(failure);
-        }
+        // Resolve our isolated temp ref to its exact commit OID and verify
+        // worktree cleanliness.
         match crate::read::read_state(&self.paths) {
             Ok(disk) => {
                 if disk.phase != invoke_core::Phase::Clean || !disk.status.entries.is_empty() {
@@ -510,8 +505,6 @@ impl Job {
             }
             Err(failure) => return OpOutcome::Failed(failure),
         }
-
-        // Resolve our isolated temp ref to its exact commit OID.
         let target_oid = match precondition::open(&self.paths).and_then(|repo| {
             let mut reference = repo
                 .find_reference(&temp_ref)
@@ -524,6 +517,18 @@ impl Job {
             Ok(oid) => oid,
             Err(err) => return failed(ErrorClass::Bug, err),
         };
+
+        // Immediately before starting the deferred-cancellation switch, re-check
+        // cancellation, `index.lock`, `HEAD`, `index`, and destination ref absence.
+        if self.cancelled() {
+            return OpOutcome::Cancelled;
+        }
+        if let Err(failure) = precondition::check(&self.paths, &self.expect) {
+            return OpOutcome::Failed(failure);
+        }
+        if let Err(failure) = precondition::check_refs(&self.paths, &self.args.expected_refs()) {
+            return OpOutcome::Failed(failure);
+        }
 
         // Stage 2: local switch to the exact OID with `--no-overwrite-ignore`
         // and deferred cancellation (Law 13).

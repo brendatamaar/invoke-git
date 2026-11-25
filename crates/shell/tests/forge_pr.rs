@@ -378,7 +378,7 @@ fn github_list_detail_reviews_and_create_pr_same_repo_and_fork() {
     );
     let sent = Json::parse(&post_req.body).unwrap();
     assert_eq!(sent.str_field("head"), Some("alice:feat-x"));
-    assert_eq!(sent.str_field("head_repo"), Some("alice/tool"));
+    assert_eq!(sent.str_field("head_repo"), Some("tool"));
     assert_eq!(sent.str_field("base"), Some("main"));
     assert_eq!(sent.get("draft").and_then(Json::as_bool), Some(true));
 }
@@ -389,71 +389,76 @@ fn github_list_detail_reviews_and_create_pr_same_repo_and_fork() {
 
 #[test]
 fn gitlab_list_detail_approvals_and_create_fork_mr() {
-    let server = Server::start(|req| match (req.method.as_str(), req.target.as_str()) {
-        ("GET", "/api/v4/user") => Reply::json(r#"{"username":"alice"}"#),
-        ("GET", t)
-            if t.starts_with("/api/v4/projects/grp%2Fsub%2Ftool/merge_requests?state=opened") =>
-        {
-            Reply::json(
-                r#"[{
+    let server = Server::start(|req| {
+        let base = format!("http://{}", req.header("host").unwrap_or("127.0.0.1"));
+        match (req.method.as_str(), req.target.as_str()) {
+            ("GET", "/api/v4/user") => Reply::json(r#"{"username":"alice"}"#),
+            ("GET", t)
+                if t.starts_with(
+                    "/api/v4/projects/grp%2Fsub%2Ftool/merge_requests?state=opened",
+                ) =>
+            {
+                Reply::json(format!(
+                    r#"[{{
+                        "iid": 7,
+                        "title": "Fix parser",
+                        "description": "Fixes edge case",
+                        "state": "opened",
+                        "draft": false,
+                        "web_url": "{base}/grp/sub/tool/-/merge_requests/7",
+                        "updated_at": "2026-11-25T09:00:00Z",
+                        "author": {{"username": "bob"}},
+                        "source_branch": "fix-parser",
+                        "target_branch": "main",
+                        "sha": "cccccccccccccccccccccccccccccccccccccccc",
+                        "user_notes_count": 4,
+                        "has_conflicts": false
+                    }}]"#,
+                ))
+            }
+            ("GET", "/api/v4/projects/grp%2Fsub%2Ftool/merge_requests/7") => Reply::json(format!(
+                r#"{{
                     "iid": 7,
                     "title": "Fix parser",
                     "description": "Fixes edge case",
                     "state": "opened",
                     "draft": false,
-                    "web_url": "https://gitlab.example.com/grp/sub/tool/-/merge_requests/7",
-                    "updated_at": "2026-11-25T09:00:00Z",
-                    "author": {"username": "bob"},
+                    "web_url": "{base}/grp/sub/tool/-/merge_requests/7",
+                    "author": {{"username": "bob"}},
                     "source_branch": "fix-parser",
                     "target_branch": "main",
-                    "sha": "cccccccccccccccccccccccccccccccccccccccc",
                     "user_notes_count": 4,
                     "has_conflicts": false
-                }]"#,
-            )
+                }}"#,
+            )),
+            ("GET", "/api/v4/projects/grp%2Fsub%2Ftool/merge_requests/7/approvals") => Reply::json(
+                r#"{"approved": true, "approved_by": [{"user": {"username": "carol"}}]}"#,
+            ),
+            ("GET", "/api/v4/projects/grp%2Fsub%2Ftool") => Reply::json(r#"{"id": 777}"#),
+            ("POST", "/api/v4/projects/alice%2Ftool/merge_requests") => {
+                let body = Json::parse(&req.body).unwrap();
+                let title = body.str_field("title").unwrap();
+                let source = body.str_field("source_branch").unwrap();
+                let target = body.str_field("target_branch").unwrap();
+                Reply::status(
+                    201,
+                    format!(
+                        r#"{{
+                            "iid": 12,
+                            "title": "{title}",
+                            "description": "From fork",
+                            "state": "opened",
+                            "draft": true,
+                            "web_url": "{base}/grp/sub/tool/-/merge_requests/12",
+                            "author": {{"username": "alice"}},
+                            "source_branch": "{source}",
+                            "target_branch": "{target}"
+                        }}"#
+                    ),
+                )
+            }
+            _ => Reply::status(404, r#"{"message":"not found"}"#),
         }
-        ("GET", "/api/v4/projects/grp%2Fsub%2Ftool/merge_requests/7") => Reply::json(
-            r#"{
-                "iid": 7,
-                "title": "Fix parser",
-                "description": "Fixes edge case",
-                "state": "opened",
-                "draft": false,
-                "web_url": "https://gitlab.example.com/grp/sub/tool/-/merge_requests/7",
-                "author": {"username": "bob"},
-                "source_branch": "fix-parser",
-                "target_branch": "main",
-                "user_notes_count": 4,
-                "has_conflicts": false
-            }"#,
-        ),
-        ("GET", "/api/v4/projects/grp%2Fsub%2Ftool/merge_requests/7/approvals") => {
-            Reply::json(r#"{"approved": true, "approved_by": [{"user": {"username": "carol"}}]}"#)
-        }
-        ("GET", "/api/v4/projects/grp%2Fsub%2Ftool") => Reply::json(r#"{"id": 777}"#),
-        ("POST", "/api/v4/projects/alice%2Ftool/merge_requests") => {
-            let body = Json::parse(&req.body).unwrap();
-            let title = body.str_field("title").unwrap();
-            let source = body.str_field("source_branch").unwrap();
-            let target = body.str_field("target_branch").unwrap();
-            Reply::status(
-                201,
-                format!(
-                    r#"{{
-                        "iid": 12,
-                        "title": "{title}",
-                        "description": "From fork",
-                        "state": "opened",
-                        "draft": true,
-                        "web_url": "https://gitlab.example.com/grp/sub/tool/-/merge_requests/12",
-                        "author": {{"username": "alice"}},
-                        "source_branch": "{source}",
-                        "target_branch": "{target}"
-                    }}"#
-                ),
-            )
-        }
-        _ => Reply::status(404, r#"{"message":"not found"}"#),
     });
 
     let service = service_for_gitlab(&server);
@@ -1063,10 +1068,10 @@ fn review_pagination_gitlab_partial_approval_and_encoded_secret_scrubbing() {
         ("GET", "/repos/org/tool/pulls/10/reviews?per_page=100&page=2") => {
             Reply::json(r#"[{"user":{"login":"carol"},"state":"CHANGES_REQUESTED"}]"#)
         }
-        // GitHub list with percent-encoded token in web_url and raw token in Link next
+        // GitHub list with malformed `%ZZ` + percent-encoded token in web_url and raw token in Link next
         ("GET", t) if t.starts_with("/repos/org/tool/pulls?state=open") => {
             let evil_next = format!(
-                "<http://{}/repos/org/tool/pulls?state=open&tok=ghp_ENC_SECRET>; rel=\"next\"",
+                "<http://{}/repos/org/tool/pulls?state=open&bad=%ZZ&tok=ghp%5FENC%5FSECRET>; rel=\"next\"",
                 req.header("host").unwrap_or("127.0.0.1")
             );
             Reply::json(
@@ -1075,7 +1080,7 @@ fn review_pagination_gitlab_partial_approval_and_encoded_secret_scrubbing() {
                     "title": "Encoded secret link",
                     "body": "",
                     "state": "open",
-                    "html_url": "https://github.com/org/tool/pull/11?x=ghp%5FENC%5FSECRET",
+                    "html_url": "https://github.com/org/tool/pull/11?bad=%ZZ&x=ghp%5FENC%5FSECRET",
                     "user": {"login": "bob"},
                     "head": {"ref": "x"},
                     "base": {"ref": "main"}
@@ -1084,18 +1089,21 @@ fn review_pagination_gitlab_partial_approval_and_encoded_secret_scrubbing() {
             .with("Link", evil_next)
         }
         // GitLab MR with approved: false despite 1 of 2 approvers in approved_by
-        ("GET", "/api/v4/projects/grp%2Ftool/merge_requests/5") => Reply::json(
-            r#"{
-                "iid": 5,
-                "title": "Needs two approvals",
-                "description": "",
-                "state": "opened",
-                "web_url": "https://gitlab.example.com/grp/tool/-/merge_requests/5",
-                "author": {"username": "bob"},
-                "source_branch": "feat",
-                "target_branch": "main"
-            }"#,
-        ),
+        ("GET", "/api/v4/projects/grp%2Ftool/merge_requests/5") => {
+            let base = format!("http://{}", req.header("host").unwrap_or("127.0.0.1"));
+            Reply::json(format!(
+                r#"{{
+                    "iid": 5,
+                    "title": "Needs two approvals",
+                    "description": "",
+                    "state": "opened",
+                    "web_url": "{base}/grp/tool/-/merge_requests/5",
+                    "author": {{"username": "bob"}},
+                    "source_branch": "feat",
+                    "target_branch": "main"
+                }}"#,
+            ))
+        }
         ("GET", "/api/v4/projects/grp%2Ftool/merge_requests/5/approvals") => {
             Reply::json(r#"{"approved": false, "approved_by": [{"user": {"username": "carol"}}]}"#)
         }
@@ -1117,14 +1125,14 @@ fn review_pagination_gitlab_partial_approval_and_encoded_secret_scrubbing() {
         .unwrap();
     assert!(
         page.prs.is_empty(),
-        "percent-encoded token URL must be dropped"
+        "percent-encoded token URL (even with malformed %ZZ) must be dropped"
     );
     assert!(
         page.next.is_none(),
-        "next cursor carrying token must be dropped"
+        "next cursor carrying encoded token must be dropped"
     );
 
-    // 2. GitLab `approved: false` is respected even when `approved_by` is non-empty
+    // 2. GitLab `approved: false` maps explicitly to Pending (not Approved or None)
     let gl_service = service_for_gitlab(&server);
     let gl_acc = gl_service
         .connect_with_token(ForgeKind::GitLab, &server.url(), "glpat_tok_1")
@@ -1132,7 +1140,7 @@ fn review_pagination_gitlab_partial_approval_and_encoded_secret_scrubbing() {
     let mr = gl_service
         .get_pr_detail(&gl_acc.key(), "grp/tool", 5)
         .unwrap();
-    assert_ne!(mr.review_status, ReviewStatus::Approved);
+    assert_eq!(mr.review_status, ReviewStatus::Pending);
 }
 
 fn fake_disk_with_upstream(branch: &str, upstream_ref: &str) -> invoke_core::DiskState {

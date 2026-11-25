@@ -916,7 +916,7 @@ impl ForgeService {
                         &credential.access,
                         repo_path,
                         number,
-                    ) && status == ReviewStatus::Approved
+                    ) && status != ReviewStatus::None
                     {
                         mr.review_status = status;
                     }
@@ -947,10 +947,11 @@ impl ForgeService {
                 ForgeKind::GitHub => {
                     let (base_owner, base_repo) = split_github_path(&target.base_repo.path)?;
                     let (head, head_repo) = if target.is_fork {
-                        let (head_owner, _) = split_github_path(&target.head_repo.path)?;
+                        let (head_owner, head_repo_name) =
+                            split_github_path(&target.head_repo.path)?;
                         (
                             format!("{head_owner}:{}", target.head_branch),
-                            Some(target.head_repo.path.as_str()),
+                            Some(head_repo_name),
                         )
                     } else {
                         (target.head_branch.clone(), None)
@@ -1006,6 +1007,28 @@ fn split_github_path(path: &str) -> Result<(&str, &str), ForgeError> {
     Ok((owner, repo))
 }
 
+fn pct_decode_lossy(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn text_contains_secret(text: &str, credential: &Credential) -> bool {
     let secrets: Vec<String> = std::iter::once(&credential.access)
         .chain(credential.refresh.as_ref())
@@ -1015,13 +1038,8 @@ fn text_contains_secret(text: &str, credential: &Credential) -> bool {
     if secrets.iter().any(|secret| lower.contains(secret)) {
         return true;
     }
-    if let Some(decoded) = super::codec::pct_decode(text) {
-        let decoded_lower = decoded.to_ascii_lowercase();
-        if secrets.iter().any(|secret| decoded_lower.contains(secret)) {
-            return true;
-        }
-    }
-    false
+    let decoded_lower = pct_decode_lossy(text).to_ascii_lowercase();
+    secrets.iter().any(|secret| decoded_lower.contains(secret))
 }
 
 fn pr_contains_secret(pr: &PullRequest, credential: &Credential) -> bool {
