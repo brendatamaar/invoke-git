@@ -129,6 +129,12 @@ pub enum Event {
     LfsPullRequested {
         path: Option<RepoPath>,
     },
+    // P9: fetch a pull/merge request ref and check it out on a new local branch.
+    CheckoutPrRequested {
+        remote: String,
+        remote_ref: RefName,
+        local_branch: String,
+    },
     RefreshRequested,
     NoticeDismissed,
     /// Task 17: remove `index.lock` that another process left. The UI asks

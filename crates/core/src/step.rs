@@ -217,6 +217,46 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         Event::LfsPullRequested { path } => {
             enqueue(&mut state, WriteRequest::LfsPull { path });
         }
+        // P9: pull/merge request checkout.
+        Event::CheckoutPrRequested {
+            remote,
+            remote_ref,
+            local_branch,
+        } => {
+            let remote = remote.trim().to_owned();
+            if remote.is_empty()
+                || remote.starts_with('-')
+                || remote.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                refuse_because(
+                    &mut state,
+                    Action::CheckoutPr,
+                    Refusal::PrCheckout(crate::PrCheckoutRefusal::InvalidRemote),
+                );
+            } else if !crate::forge::is_valid_pr_ref(&remote_ref) {
+                refuse_because(
+                    &mut state,
+                    Action::CheckoutPr,
+                    Refusal::PrCheckout(crate::PrCheckoutRefusal::InvalidRef),
+                );
+            } else {
+                match BranchName::parse(&local_branch) {
+                    Ok(local_branch) => enqueue(
+                        &mut state,
+                        WriteRequest::CheckoutPr {
+                            remote,
+                            remote_ref,
+                            local_branch,
+                        },
+                    ),
+                    Err(problem) => refuse_because(
+                        &mut state,
+                        Action::CheckoutPr,
+                        Refusal::PrCheckout(crate::PrCheckoutRefusal::InvalidBranch(problem)),
+                    ),
+                }
+            }
+        }
         Event::UndoSnapshotTaken { op, tree } => {
             if let UndoPending::Recording { point } = &state.undo.pending
                 && point.op == op
@@ -1269,6 +1309,62 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                         continue;
                     }
                 }
+            }
+            WriteRequest::CheckoutPr {
+                remote,
+                remote_ref,
+                local_branch,
+            } => {
+                if disk.phase != Phase::Clean {
+                    refuse_because(state, Action::CheckoutPr, Refusal::RepoBusy);
+                    continue;
+                }
+                if !disk.status.entries.is_empty() {
+                    refuse_because(
+                        state,
+                        Action::CheckoutPr,
+                        Refusal::PrCheckout(crate::PrCheckoutRefusal::DirtyWorktree),
+                    );
+                    continue;
+                }
+                if disk.refs.refs.contains_key(&local_branch.to_ref()) {
+                    refuse_because(
+                        state,
+                        Action::CheckoutPr,
+                        Refusal::PrCheckout(crate::PrCheckoutRefusal::BranchAlreadyExists(
+                            local_branch.clone(),
+                        )),
+                    );
+                    continue;
+                }
+                let prefix = format!("{}/", local_branch.to_ref().0);
+                let target_ref = local_branch.to_ref().0;
+                if let Some(conflict) = disk.refs.refs.keys().find_map(|existing| {
+                    let short = existing.0.strip_prefix("refs/heads/")?;
+                    if existing.0.starts_with(&prefix)
+                        || target_ref.starts_with(&format!("{}/", existing.0))
+                    {
+                        Some(BranchName(short.to_owned()))
+                    } else {
+                        None
+                    }
+                }) {
+                    refuse_because(
+                        state,
+                        Action::CheckoutPr,
+                        Refusal::PrCheckout(crate::PrCheckoutRefusal::BranchNameConflict(conflict)),
+                    );
+                    continue;
+                }
+                commands.push(Command::RunGit {
+                    op: id,
+                    args: GitArgs::CheckoutPr {
+                        remote: remote.clone(),
+                        remote_ref: remote_ref.clone(),
+                        local_branch: local_branch.clone(),
+                    },
+                    expect,
+                });
             }
             branch_request => match branch::plan(branch_request, &disk, id) {
                 Some(Ok((args, point))) => {

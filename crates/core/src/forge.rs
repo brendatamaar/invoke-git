@@ -873,6 +873,487 @@ pub fn filter_repos(repos: &[RemoteRepo], query: &str) -> Vec<usize> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Pull requests & merge requests (P9): pure types, remote/fork resolution,
+// validation and filtering.
+// ---------------------------------------------------------------------------
+
+use crate::ids::{BranchName, RefName};
+use crate::state::{DiskState, Head, Tracking};
+
+/// One configured git remote (name and fetch/push URL).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfiguredRemote {
+    pub name: String,
+    pub url: String,
+}
+
+/// The forge host and repository path parsed from a git remote URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRepoRef {
+    pub target: RemoteTarget,
+    /// `owner/repo` on GitHub; `group/[sub/]project` on GitLab (`.git` stripped).
+    pub path: String,
+}
+
+impl RemoteRepoRef {
+    /// GitHub requires an exact `owner/repo` pair (two path segments).
+    pub fn github_owner_repo(&self) -> Option<(&str, &str)> {
+        let mut parts = self.path.split('/');
+        let owner = parts.next()?;
+        let repo = parts.next()?;
+        if parts.next().is_some() || owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        Some((owner, repo))
+    }
+}
+
+/// Parses a git remote URL into its target host/transport and repository path
+/// (`owner/repo` or `group/sub/project`), stripping a trailing `.git`.
+/// Returns `None` for local paths, malformed URLs, or unsafe/invalid repo paths.
+pub fn parse_remote_repo(url: &str) -> Option<RemoteRepoRef> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return None;
+    }
+    let target = remote_target(trimmed)?;
+    let raw_path = if let Some((_, rest)) = trimmed.split_once("://") {
+        let slash = rest.find('/')?;
+        &rest[slash + 1..]
+    } else {
+        let (_, path) = trimmed.split_once(':')?;
+        path
+    };
+    // Refuse query strings, fragments, backslashes, or whitespace in repo paths.
+    if raw_path.contains(['?', '#', '\\']) || raw_path.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let clean = raw_path.trim_matches('/');
+    let clean = clean.strip_suffix(".git").unwrap_or(clean);
+    let clean = clean.trim_end_matches('/');
+    let segments: Vec<&str> = clean.split('/').collect();
+    if segments.len() < 2
+        || segments
+            .iter()
+            .any(|seg| seg.is_empty() || *seg == "." || *seg == ".." || seg.contains(".."))
+    {
+        return None;
+    }
+    Some(RemoteRepoRef {
+        target,
+        path: segments.join("/"),
+    })
+}
+
+/// Lifecycle state of a pull request or merge request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+impl PrState {
+    pub fn label(self) -> &'static str {
+        match self {
+            PrState::Open => "Open",
+            PrState::Closed => "Closed",
+            PrState::Merged => "Merged",
+        }
+    }
+}
+
+/// Filter passed to the forge list API.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum PrFilter {
+    #[default]
+    Open,
+    Closed,
+    All,
+}
+
+impl PrFilter {
+    pub fn github_param(self) -> &'static str {
+        match self {
+            PrFilter::Open => "open",
+            PrFilter::Closed => "closed",
+            PrFilter::All => "all",
+        }
+    }
+
+    pub fn gitlab_param(self) -> &'static str {
+        match self {
+            PrFilter::Open => "opened",
+            PrFilter::Closed => "closed",
+            PrFilter::All => "all",
+        }
+    }
+}
+
+/// Aggregate review / approval status of a PR or MR.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ReviewStatus {
+    Approved,
+    ChangesRequested,
+    Commented,
+    Pending,
+    #[default]
+    None,
+}
+
+impl ReviewStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReviewStatus::Approved => "Approved",
+            ReviewStatus::ChangesRequested => "Changes requested",
+            ReviewStatus::Commented => "Commented",
+            ReviewStatus::Pending => "Review pending",
+            ReviewStatus::None => "No reviews",
+        }
+    }
+}
+
+/// One Pull Request (GitHub) or Merge Request (GitLab).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub state: PrState,
+    pub draft: bool,
+    pub author: String,
+    pub head_branch: String,
+    /// Full `owner/repo` of the source branch when known (especially for forks).
+    pub head_repo: Option<String>,
+    pub head_sha: Option<String>,
+    pub base_branch: String,
+    pub web_url: String,
+    pub updated_at: Option<String>,
+    pub review_status: ReviewStatus,
+    pub comments_count: Option<u64>,
+    pub mergeable: Option<bool>,
+}
+
+/// Resolved target for listing PRs/MRs on a repository remote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrListTarget {
+    pub remote_name: String,
+    pub repo: RemoteRepoRef,
+    pub account: ForgeAccount,
+}
+
+/// Resolved source + target repositories for creating a PR/MR (supports forks).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrCreateTarget {
+    pub account: ForgeAccount,
+    pub base_remote: String,
+    pub base_repo: RemoteRepoRef,
+    pub head_remote: String,
+    pub head_repo: RemoteRepoRef,
+    pub head_branch: String,
+    pub is_fork: bool,
+}
+
+/// Why a PR/MR list or create target could not be resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrTargetError {
+    NoRemotes,
+    RemoteNotFound {
+        remote: String,
+    },
+    NotOnForge {
+        remote: String,
+    },
+    NoAccount {
+        remote: String,
+        host: String,
+    },
+    ChooseAccount {
+        remote: String,
+        accounts: Vec<ForgeAccount>,
+    },
+    InvalidRepoPath {
+        remote: String,
+    },
+    /// Creating a PR/MR requires a checked-out branch.
+    NotOnBranch,
+    /// Creating a PR/MR requires the branch to be pushed (upstream configured).
+    NoUpstream {
+        branch: String,
+    },
+    /// Upstream tracking ref was deleted or never fetched.
+    UpstreamGone {
+        branch: String,
+    },
+    /// Selected base remote is on a different forge server than the head remote.
+    CrossHostMismatch,
+}
+
+/// Resolves which remote, repo path, and forge account to use for listing PRs/MRs.
+///
+/// When `preferred_remote` is `None`, prefers `upstream` (if it has a connected
+/// account), then `origin`, then the first remote with a valid path.
+pub fn resolve_remote_for_list(
+    remotes: &[ConfiguredRemote],
+    preferred_remote: Option<&str>,
+    book: &AccountBook,
+) -> Result<PrListTarget, PrTargetError> {
+    if remotes.is_empty() {
+        return Err(PrTargetError::NoRemotes);
+    }
+    let chosen = if let Some(name) = preferred_remote {
+        remotes
+            .iter()
+            .find(|r| r.name == name)
+            .ok_or_else(|| PrTargetError::RemoteNotFound {
+                remote: name.to_owned(),
+            })?
+    } else {
+        // Prefer `upstream` if it already resolves to a connected account;
+        // otherwise `origin`; otherwise the first configured remote.
+        let upstream_connected = remotes
+            .iter()
+            .find(|r| r.name == "upstream" && matches!(book.resolve(&r.url), Resolution::Use(_)));
+        upstream_connected
+            .or_else(|| remotes.iter().find(|r| r.name == "origin"))
+            .unwrap_or(&remotes[0])
+    };
+    resolve_one_remote(chosen, book)
+}
+
+fn resolve_one_remote(
+    remote: &ConfiguredRemote,
+    book: &AccountBook,
+) -> Result<PrListTarget, PrTargetError> {
+    let account = match book.resolve(&remote.url) {
+        Resolution::LocalPath => {
+            return Err(PrTargetError::NotOnForge {
+                remote: remote.name.clone(),
+            });
+        }
+        Resolution::NoAccount { host } => {
+            return Err(PrTargetError::NoAccount {
+                remote: remote.name.clone(),
+                host,
+            });
+        }
+        Resolution::Choose(accounts) => {
+            return Err(PrTargetError::ChooseAccount {
+                remote: remote.name.clone(),
+                accounts,
+            });
+        }
+        Resolution::Use(account) => account,
+    };
+    let repo = parse_remote_repo(&remote.url).ok_or_else(|| PrTargetError::InvalidRepoPath {
+        remote: remote.name.clone(),
+    })?;
+    if account.kind == ForgeKind::GitHub && repo.github_owner_repo().is_none() {
+        return Err(PrTargetError::InvalidRepoPath {
+            remote: remote.name.clone(),
+        });
+    }
+    Ok(PrListTarget {
+        remote_name: remote.name.clone(),
+        repo,
+        account,
+    })
+}
+
+fn split_tracking_ref(name: &RefName) -> Option<(String, String)> {
+    let rest = name.0.strip_prefix("refs/remotes/")?;
+    let (remote, branch) = rest.split_once('/')?;
+    if remote.is_empty() || branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    Some((remote.to_owned(), branch.to_owned()))
+}
+
+/// Resolves the head and base repos for creating a PR/MR from the currently
+/// checked-out branch. Refuses when detached/unborn, when the branch has no
+/// upstream, or when the upstream tracking ref is gone.
+///
+/// Fork support: when `base_remote` is `None` and an `upstream` remote exists
+/// on the same forge origin as the branch's upstream remote, targets `upstream`
+/// as the base repository while keeping the branch's remote as the head repo.
+pub fn resolve_create_target(
+    remotes: &[ConfiguredRemote],
+    disk: &DiskState,
+    base_remote: Option<&str>,
+    book: &AccountBook,
+) -> Result<PrCreateTarget, PrTargetError> {
+    let branch = match &disk.head {
+        Head::Branch { name, .. } => name,
+        Head::Detached(_) | Head::Unborn(_) => return Err(PrTargetError::NotOnBranch),
+    };
+    let upstream = disk
+        .refs
+        .upstreams
+        .get(branch)
+        .ok_or_else(|| PrTargetError::NoUpstream {
+            branch: branch.0.clone(),
+        })?;
+    if matches!(upstream.tracking, Tracking::Gone) {
+        return Err(PrTargetError::UpstreamGone {
+            branch: branch.0.clone(),
+        });
+    }
+    let (head_remote_name, head_branch) =
+        split_tracking_ref(&upstream.name).ok_or_else(|| PrTargetError::NoUpstream {
+            branch: branch.0.clone(),
+        })?;
+    let head_remote = remotes
+        .iter()
+        .find(|r| r.name == head_remote_name)
+        .ok_or_else(|| PrTargetError::RemoteNotFound {
+            remote: head_remote_name.clone(),
+        })?;
+    let head_resolved = resolve_one_remote(head_remote, book)?;
+
+    let base_resolved = if let Some(explicit) = base_remote {
+        if explicit == head_remote_name {
+            head_resolved.clone()
+        } else {
+            let remote = remotes
+                .iter()
+                .find(|r| r.name == explicit)
+                .ok_or_else(|| PrTargetError::RemoteNotFound {
+                    remote: explicit.to_owned(),
+                })?;
+            let resolved = resolve_one_remote(remote, book)?;
+            if resolved.account.kind != head_resolved.account.kind
+                || resolved.account.origin != head_resolved.account.origin
+            {
+                return Err(PrTargetError::CrossHostMismatch);
+            }
+            resolved
+        }
+    } else if head_remote_name != "upstream"
+        && let Some(up) = remotes.iter().find(|r| r.name == "upstream")
+        && let Ok(resolved) = resolve_one_remote(up, book)
+        && resolved.account.kind == head_resolved.account.kind
+        && resolved.account.origin == head_resolved.account.origin
+    {
+        resolved
+    } else {
+        head_resolved.clone()
+    };
+
+    let is_fork = !head_resolved
+        .repo
+        .path
+        .eq_ignore_ascii_case(&base_resolved.repo.path);
+    Ok(PrCreateTarget {
+        account: base_resolved.account,
+        base_remote: base_resolved.remote_name,
+        base_repo: base_resolved.repo,
+        head_remote: head_resolved.remote_name,
+        head_repo: head_resolved.repo,
+        head_branch,
+        is_fork,
+    })
+}
+
+/// Validated input for creating a Pull Request or Merge Request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatePrInput {
+    pub title: String,
+    pub body: String,
+    pub base_branch: String,
+    pub draft: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreatePrProblem {
+    EmptyTitle,
+    EmptyBaseBranch,
+    SameBranch,
+}
+
+/// Validates the user's PR/MR creation form against the resolved target.
+pub fn validate_create_pr(
+    title: &str,
+    body: &str,
+    base_branch: &str,
+    draft: bool,
+    target: &PrCreateTarget,
+) -> Result<CreatePrInput, CreatePrProblem> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(CreatePrProblem::EmptyTitle);
+    }
+    let base_branch = base_branch.trim();
+    if base_branch.is_empty() {
+        return Err(CreatePrProblem::EmptyBaseBranch);
+    }
+    if !target.is_fork && base_branch == target.head_branch {
+        return Err(CreatePrProblem::SameBranch);
+    }
+    Ok(CreatePrInput {
+        title: title.to_owned(),
+        body: body.trim_end().to_owned(),
+        base_branch: base_branch.to_owned(),
+        draft,
+    })
+}
+
+/// The remote ref to fetch for a PR/MR number (`refs/pull/<n>/head` on GitHub,
+/// `refs/merge-requests/<n>/head` on GitLab).
+pub fn pr_fetch_ref(kind: ForgeKind, number: u64) -> Option<RefName> {
+    if number == 0 {
+        return None;
+    }
+    Some(RefName(match kind {
+        ForgeKind::GitHub => format!("refs/pull/{number}/head"),
+        ForgeKind::GitLab => format!("refs/merge-requests/{number}/head"),
+    }))
+}
+
+/// Whether `remote_ref` is a valid GitHub PR or GitLab MR head ref.
+pub fn is_valid_pr_ref(remote_ref: &RefName) -> bool {
+    let rest = remote_ref
+        .0
+        .strip_prefix("refs/pull/")
+        .or_else(|| remote_ref.0.strip_prefix("refs/merge-requests/"));
+    let Some(num_str) = rest.and_then(|s| s.strip_suffix("/head")) else {
+        return false;
+    };
+    !num_str.is_empty()
+        && num_str.bytes().all(|b| b.is_ascii_digit())
+        && num_str.parse::<u64>().is_ok_and(|n| n > 0)
+}
+
+/// Default local branch name for checking out a PR (`pr/<n>`) or MR (`mr/<n>`).
+pub fn default_pr_branch(kind: ForgeKind, number: u64) -> Option<BranchName> {
+    if number == 0 {
+        return None;
+    }
+    let prefix = match kind {
+        ForgeKind::GitHub => "pr",
+        ForgeKind::GitLab => "mr",
+    };
+    BranchName::parse(&format!("{prefix}/{number}")).ok()
+}
+
+/// Filters pull/merge requests by query words across number, title, author,
+/// head branch, and base branch (case-insensitive).
+pub fn filter_prs(prs: &[PullRequest], query: &str) -> Vec<usize> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    prs.iter()
+        .enumerate()
+        .filter(|(_, pr)| {
+            let haystack = format!(
+                "#{} {} {} {} {}",
+                pr.number, pr.title, pr.author, pr.head_branch, pr.base_branch
+            )
+            .to_lowercase();
+            words.iter().all(|word| haystack.contains(word))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -1613,5 +2094,150 @@ mod tests {
             let narrow = filter_repos(&repos, &format!("{a} {b}"));
             prop_assert!(narrow.iter().all(|at| wide.contains(at)));
         }
+
+        #[test]
+        fn parse_remote_repo_never_panics_and_rejects_traversal(url in "\\PC{0,64}") {
+            if let Some(parsed) = parse_remote_repo(&url) {
+                prop_assert!(!parsed.path.is_empty());
+                prop_assert!(parsed.path.contains('/'));
+                prop_assert!(!parsed.path.contains(".."));
+            }
+        }
+
+        #[test]
+        fn valid_pr_ref_roundtrips_for_positive_numbers(n in 1u64..100_000) {
+            for kind in [ForgeKind::GitHub, ForgeKind::GitLab] {
+                let r = pr_fetch_ref(kind, n).unwrap();
+                prop_assert!(is_valid_pr_ref(&r));
+                let branch = default_pr_branch(kind, n).unwrap();
+                prop_assert!(!branch.0.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn parse_remote_repo_handles_https_ssh_scp_and_subgroups() {
+        let gh = parse_remote_repo("https://github.com/org/repo.git").unwrap();
+        assert_eq!(gh.path, "org/repo");
+        assert_eq!(gh.github_owner_repo(), Some(("org", "repo")));
+
+        let scp = parse_remote_repo("git@github.com:org/repo.git").unwrap();
+        assert_eq!(scp.path, "org/repo");
+        assert_eq!(scp.github_owner_repo(), Some(("org", "repo")));
+
+        let ssh_alt = parse_remote_repo("ssh://git@ssh.github.com:443/org/repo").unwrap();
+        assert_eq!(ssh_alt.path, "org/repo");
+
+        let gl = parse_remote_repo("https://gitlab.example.com/grp/sub/tool.git").unwrap();
+        assert_eq!(gl.path, "grp/sub/tool");
+        assert_eq!(gl.github_owner_repo(), None);
+
+        for bad in [
+            "",
+            "C:\\work\\repo",
+            "/local/repo.git",
+            "https://github.com/onlyone",
+            "https://github.com/org/../secret.git",
+            "https://github.com/org/repo?token=abc",
+            "https://github.com/org/repo#frag",
+            "git@github.com:org/repo with space",
+        ] {
+            assert!(parse_remote_repo(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pr_ref_validation_accepts_only_github_and_gitlab_head_refs() {
+        assert!(is_valid_pr_ref(&RefName("refs/pull/42/head".into())));
+        assert!(is_valid_pr_ref(&RefName("refs/merge-requests/7/head".into())));
+        for bad in [
+            "refs/pull/0/head",
+            "refs/pull/42/merge",
+            "refs/heads/main",
+            "refs/merge-requests/abc/head",
+            "--upload-pack=evil",
+            "refs/pull/1/head:refs/heads/main",
+            "",
+        ] {
+            assert!(!is_valid_pr_ref(&RefName(bad.into())), "{bad:?}");
+        }
+        assert_eq!(pr_fetch_ref(ForgeKind::GitHub, 0), None);
+        assert_eq!(default_pr_branch(ForgeKind::GitLab, 0), None);
+    }
+
+    #[test]
+    fn resolve_list_and_create_targets_support_same_repo_and_forks() {
+        use crate::ids::{IndexId, Oid};
+        use crate::state::{Phase, RefsSnapshot, StatusSnapshot, Upstream};
+
+        let mut book = AccountBook::default();
+        book.add(account(ForgeKind::GitHub, "github.com", "alice"));
+
+        let remotes = vec![
+            ConfiguredRemote {
+                name: "origin".into(),
+                url: "git@github.com:alice/tool.git".into(),
+            },
+            ConfiguredRemote {
+                name: "upstream".into(),
+                url: "https://github.com/org/tool.git".into(),
+            },
+        ];
+
+        // List prefers upstream when connected.
+        let list = resolve_remote_for_list(&remotes, None, &book).unwrap();
+        assert_eq!(list.remote_name, "upstream");
+        assert_eq!(list.repo.path, "org/tool");
+
+        let mut refs = RefsSnapshot::default();
+        refs.upstreams.insert(
+            BranchName("feat".into()),
+            Upstream {
+                name: RefName("refs/remotes/origin/feat".into()),
+                tracking: Tracking::Apart { ahead: 0, behind: 0 },
+            },
+        );
+        let disk = DiskState {
+            head: Head::Branch {
+                name: BranchName("feat".into()),
+                oid: Oid::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            },
+            phase: Phase::Clean,
+            index: IndexId::Absent,
+            status: StatusSnapshot::default(),
+            refs,
+            stashes: Vec::new(),
+            lock: crate::state::LockState::Free,
+            advanced: crate::advanced::AdvancedSnapshot::default(),
+        };
+
+        // Fork create target: head=origin (alice/tool), base=upstream (org/tool).
+        let create = resolve_create_target(&remotes, &disk, None, &book).unwrap();
+        assert!(create.is_fork);
+        assert_eq!(create.head_remote, "origin");
+        assert_eq!(create.head_repo.path, "alice/tool");
+        assert_eq!(create.base_remote, "upstream");
+        assert_eq!(create.base_repo.path, "org/tool");
+        assert_eq!(create.head_branch, "feat");
+
+        // Same-repo create when base_remote is explicitly origin.
+        let same = resolve_create_target(&remotes, &disk, Some("origin"), &book).unwrap();
+        assert!(!same.is_fork);
+        assert_eq!(same.base_repo.path, "alice/tool");
+        assert_eq!(
+            validate_create_pr("Add feat", "", "feat", false, &same),
+            Err(CreatePrProblem::SameBranch)
+        );
+        assert!(validate_create_pr("Add feat", "", "feat", false, &create).is_ok());
+
+        // Missing upstream is refused.
+        let mut no_up = disk.clone();
+        no_up.refs.upstreams.clear();
+        assert_eq!(
+            resolve_create_target(&remotes, &no_up, None, &book),
+            Err(PrTargetError::NoUpstream {
+                branch: "feat".into()
+            })
+        );
     }
 }

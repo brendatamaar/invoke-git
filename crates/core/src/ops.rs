@@ -158,6 +158,13 @@ pub enum WriteRequest {
     LfsPull {
         path: Option<RepoPath>,
     },
+    // P9: fetch a PR/MR ref and switch to a new local branch without moving
+    // any existing branch (law 9).
+    CheckoutPr {
+        remote: String,
+        remote_ref: RefName,
+        local_branch: BranchName,
+    },
 }
 
 impl WriteRequest {
@@ -180,6 +187,7 @@ impl WriteRequest {
                 | WriteRequest::WorktreeRemove { .. }
                 | WriteRequest::Submodule { .. }
                 | WriteRequest::LfsPull { .. }
+                | WriteRequest::CheckoutPr { .. }
         )
     }
 }
@@ -390,6 +398,13 @@ pub enum GitArgs {
     LfsPull {
         path: Option<RepoPath>,
     },
+    // P9: fetch a PR/MR ref and switch to a new local branch without moving
+    // any existing branch (law 9).
+    CheckoutPr {
+        remote: String,
+        remote_ref: RefName,
+        local_branch: BranchName,
+    },
 }
 
 impl GitArgs {
@@ -466,6 +481,7 @@ impl GitArgs {
             GitArgs::WorktreeRemove { .. }
             | GitArgs::Submodule { .. }
             | GitArgs::LfsPull { .. } => Vec::new(),
+            GitArgs::CheckoutPr { local_branch, .. } => vec![at(local_branch, None)],
         }
     }
 
@@ -499,6 +515,7 @@ impl GitArgs {
                     ..
                 }
                 | GitArgs::LfsPull { .. }
+                | GitArgs::CheckoutPr { .. }
         )
     }
 }
