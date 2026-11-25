@@ -1043,3 +1043,70 @@ fn whole_file_unstage_ignores_what_the_worktree_holds_above_the_path() {
     assert_ne!(driver.last_outcome(), Some(OpOutcome::Succeeded));
     assert_eq!(repo.index_entries(), before);
 }
+
+#[test]
+#[cfg(windows)]
+fn whole_file_stage_refuses_a_junction_leaf() {
+    use invoke_core::{Failure, FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("entry", "base\n");
+    repo.commit_all("base");
+    let before = fs::read(repo.paths.git_dir.join("index")).unwrap();
+    let target = repo.root.join("outside");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("inside"), b"kept\n").unwrap();
+    let entry = repo.paths.workdir.join("entry");
+    fs::remove_file(&entry).unwrap();
+    let made = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&entry)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let mut driver = Driver::open(&repo);
+    let based_on = shell::precondition::current(&repo.paths).unwrap().index;
+    driver.deliver(Event::FileRequested(FileRequest {
+        path: RepoPath("entry".into()),
+        action: FileAction::Stage,
+        based_on,
+    }));
+    assert!(
+        matches!(driver.last_outcome(), Some(OpOutcome::Failed(Failure {
+            class: ErrorClass::PreconditionChanged, ref details
+        })) if details.contains("junction")),
+        "{:?}; index entries:\n{}",
+        driver.last_outcome(),
+        repo.index_entries()
+    );
+    assert_eq!(fs::read(repo.paths.git_dir.join("index")).unwrap(), before);
+    assert_eq!(fs::read(entry.join("inside")).unwrap(), b"kept\n");
+}
+
+#[test]
+fn whole_file_stage_and_undo_keep_a_deleted_path_deleted() {
+    use invoke_core::{FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("dir/entry", "base\n");
+    repo.write("other", "other\n");
+    repo.commit_all("base");
+    let before = repo.index_entries();
+    fs::remove_file(repo.paths.workdir.join("dir/entry")).unwrap();
+    fs::remove_dir(repo.paths.workdir.join("dir")).unwrap();
+    let mut driver = Driver::open(&repo);
+    let based_on = shell::precondition::current(&repo.paths).unwrap().index;
+    driver.deliver(Event::FileRequested(FileRequest {
+        path: RepoPath("dir/entry".into()),
+        action: FileAction::Stage,
+        based_on,
+    }));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert!(repo.index_bytes("dir/entry").is_none());
+    assert_eq!(repo.index_bytes("other").unwrap(), b"other\n");
+    driver.deliver(Event::UndoRequested);
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(repo.index_entries(), before);
+    assert!(!repo.paths.workdir.join("dir").exists());
+}

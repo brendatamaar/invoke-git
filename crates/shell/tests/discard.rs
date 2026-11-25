@@ -487,7 +487,8 @@ fn whole_file_discard_and_undo_restore_mode() {
 fn whole_file_discard_and_undo_keep_git_symlink_emulation() {
     // Git for Windows uses a plain file containing the link target when
     // symlink creation is disabled. This fixture needs no extra privilege.
-    let repo = TempRepo::new();
+    let mut repo = TempRepo::new();
+    repo.env.push(("MSYS".into(), "".into()));
     repo.git(&["config", "core.symlinks", "false"]);
     repo.write("target", "first");
     repo.commit_all("base");
@@ -500,19 +501,24 @@ fn whole_file_discard_and_undo_keep_git_symlink_emulation() {
         "target",
     ]);
     repo.git(&["commit", "-qm", "record symlink"]);
-    repo.write("target", "second");
-    let mut driver = Driver::open(&repo);
-    driver.deliver(whole_file_request(&repo, "target"));
-    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
-    assert_eq!(
-        repo.worktree_bytes("target").as_deref(),
-        Some(&b"first"[..])
-    );
-    driver.undo();
-    assert_eq!(
-        repo.worktree_bytes("target").as_deref(),
-        Some(&b"second"[..])
-    );
+    for explicit in [true, false] {
+        if !explicit {
+            repo.git(&["config", "--unset", "core.symlinks"]);
+        }
+        repo.write("target", "second");
+        let mut driver = Driver::open(&repo);
+        driver.deliver(whole_file_request(&repo, "target"));
+        assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+        assert_eq!(
+            repo.worktree_bytes("target").as_deref(),
+            Some(&b"first"[..])
+        );
+        driver.undo();
+        assert_eq!(
+            repo.worktree_bytes("target").as_deref(),
+            Some(&b"second"[..])
+        );
+    }
 }
 
 /// Reads the sides, diffs them and builds the request, like the UI will.
@@ -1500,11 +1506,9 @@ fn whole_file_discard_and_undo_replace_a_read_only_file() {
     );
 }
 
-/// Cross review: a directory link (here a junction, which needs no
-/// privilege) where a tracked file belongs is replaced by the file.
 #[test]
 #[cfg(windows)]
-fn whole_file_discard_replaces_a_directory_link() {
+fn whole_file_discard_refuses_a_junction_it_cannot_restore() {
     let repo = TempRepo::new();
     repo.write("dir/inside", "kept\n");
     repo.write("entry", "file\n");
@@ -1512,31 +1516,22 @@ fn whole_file_discard_replaces_a_directory_link() {
     let entry = repo.paths.workdir.join("entry");
     fs::remove_file(&entry).unwrap();
     let made = Command::new("cmd")
-        .arg("/C")
-        .arg("mklink")
-        .arg("/J")
+        .args(["/C", "mklink", "/J"])
         .arg(&entry)
         .arg(repo.paths.workdir.join("dir"))
         .output()
         .unwrap();
     assert!(made.status.success(), "{made:?}");
-    let mut driver = Driver::open(&repo);
-    driver.deliver(whole_file_request(&repo, "entry"));
-    assert_eq!(
-        driver.last_outcome(),
-        Some(OpOutcome::Succeeded),
+    let before = fs::read_link(&entry).unwrap();
+    let result = shell::discard::file_inputs(&repo.paths, &RepoPath("entry".into()));
+    assert!(
+        matches!(result, Err(ref details) if details.contains("junction")),
         "{:?}",
-        driver.state.notice
+        result.err()
     );
-    assert!(fs::symlink_metadata(&entry).unwrap().is_file());
-    assert_eq!(
-        repo.worktree_bytes("entry").as_deref(),
-        Some(&b"file\n"[..])
-    );
-    assert_eq!(
-        repo.worktree_bytes("dir/inside").as_deref(),
-        Some(&b"kept\n"[..])
-    );
+    assert_eq!(fs::read_link(&entry).unwrap(), before);
+    assert_eq!(fs::read(entry.join("inside")).unwrap(), b"kept\n");
+    assert!(repo.undo_refs().is_empty());
 }
 
 /// Native symlinks on Windows need Developer Mode or an elevated shell
@@ -1791,6 +1786,58 @@ fn a_case_mismatch_on_the_way_or_at_the_leaf_is_a_changed_precondition() {
         repo.worktree_bytes("Bar.txt").as_deref(),
         Some(&b"a\nB\n"[..])
     );
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_discard_does_not_ask_git_to_create_a_native_symlink() {
+    let mut repo = TempRepo::new();
+    let trace = repo.root.join("trace.json");
+    repo.env
+        .push(("GIT_TRACE2_EVENT".into(), trace.clone().into_os_string()));
+    repo.git(&["config", "core.symlinks", "true"]);
+    let target = repo.root.join("outside");
+    fs::create_dir(&target).unwrap();
+    repo.write("target", &target.to_string_lossy());
+    let blob = repo.git(&["hash-object", "-w", "target"]);
+    repo.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "120000",
+        &blob,
+        "target",
+    ]);
+    repo.git(&["commit", "-qm", "record symlink"]);
+    repo.write("target", "changed");
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "target"));
+    let trace = fs::read_to_string(trace).unwrap();
+    assert!(trace.contains(r#""event":"start""#), "{trace}");
+    for invocation in trace
+        .lines()
+        .filter(|line| line.contains(r#""event":"start""#))
+    {
+        if invocation.contains(r#""checkout-index""#) {
+            assert!(
+                invocation.contains(r#""core.symlinks=false""#),
+                "{invocation}"
+            );
+        }
+    }
+    if let Some(OpOutcome::Failed(failure)) = driver.last_outcome() {
+        // The trace assertion still runs on hosts without symlink rights.
+        assert!(failure.details.contains("1314"), "{failure:?}");
+    } else {
+        assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+        use std::os::windows::fs::FileTypeExt;
+        assert!(
+            fs::symlink_metadata(repo.paths.workdir.join("target"))
+                .unwrap()
+                .file_type()
+                .is_symlink_file()
+        );
+    }
 }
 
 #[test]

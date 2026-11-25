@@ -67,17 +67,9 @@ impl StagingRunner {
             details: format!("stage {}: {error}", path.0),
         };
         let lock = precondition::IndexLock::acquire(&self.paths, expect)?;
-        // `git add` reads the worktree, so the way there must be plain
-        // folders; an unstage only writes the index, and a worktree folder
-        // that became a file must not stop it.
-        if matches!(args, GitArgs::AddPath(_)) {
-            let full = crate::discard::worktree_path(&self.paths.workdir, path).map_err(invalid)?;
-            crate::discard::check_leaf(&full, path).map_err(invalid)?;
-        } else {
-            crate::discard::check_repo_path(path).map_err(invalid)?;
-        }
+        crate::discard::check_repo_path(path).map_err(invalid)?;
         let repo = precondition::open_with_worktree(&self.paths).map_err(invalid)?;
-        crate::discard::index_entry(&repo, path).map_err(invalid)?;
+        let entry = crate::discard::index_entry(&repo, path).map_err(invalid)?;
         let source = match &expect.head {
             Head::Branch { oid, .. } | Head::Detached(oid)
                 if matches!(args, GitArgs::RestoreStagedPath(_)) =>
@@ -123,8 +115,35 @@ impl StagingRunner {
                 .and_then(|file| file.set_modified(modified))
                 .map_err(environment)?;
         }
+        // An unstage only writes the index. For add, validate the path
+        // immediately before reading it, including while Git runs on Windows.
+        let add = matches!(args, GitArgs::AddPath(_));
+        #[cfg(not(windows))]
+        if add {
+            let full = crate::discard::worktree_path(&self.paths.workdir, path).map_err(invalid)?;
+            crate::discard::check_leaf(&full, path).map_err(invalid)?;
+        }
+        #[cfg(windows)]
+        let (_guards, missing) = if add {
+            crate::discard::stage_path_guard(&self.paths.workdir, path).map_err(invalid)?
+        } else {
+            (Vec::new(), None)
+        };
+        #[cfg(windows)]
+        let remove_missing = missing.is_some();
+        #[cfg(not(windows))]
+        let remove_missing = false;
+
+        if remove_missing && entry.is_none() {
+            return Err(invalid(format!("{} no longer exists", path.0)));
+        }
         let mut command = self.git.command(&self.paths.workdir);
-        if matches!(args, GitArgs::RestoreStagedPath(_)) && matches!(expect.head, Head::Unborn(_)) {
+        if remove_missing
+            || (matches!(args, GitArgs::RestoreStagedPath(_))
+                && matches!(expect.head, Head::Unborn(_)))
+        {
+            // A missing component cannot be pinned. Remove only the exact
+            // indexed path without traversing the worktree in this case.
             command
                 .args(GLOBAL_ARGS)
                 .args(["update-index", "--force-remove", "--", &path.0]);
@@ -145,6 +164,15 @@ impl StagingRunner {
                 class: ErrorClass::PreconditionChanged,
                 details: done.output,
             });
+        }
+        #[cfg(windows)]
+        if let Some(missing) = missing {
+            // Ancestors of the first absent component are still pinned.
+            match fs::symlink_metadata(&missing) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(environment(error)),
+                Ok(_) => return Err(invalid(format!("{} reappeared during staging", path.0))),
+            }
         }
         let bytes = fs::read(&copy).map_err(environment)?;
         lock.verify(&self.paths, expect)?;

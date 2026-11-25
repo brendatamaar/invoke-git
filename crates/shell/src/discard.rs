@@ -136,6 +136,7 @@ impl DiscardRunner {
         // Prepare checkout using Git's smudge / EOL conversion. Record the
         // resulting bytes and mode for undo before replacing the real file.
         let scratch = tracked
+            .is_some()
             .then(|| precondition::ScratchDir::for_worktree(&self.paths))
             .transpose()
             .map_err(environment)?;
@@ -151,6 +152,17 @@ impl DiscardRunner {
             // checkout uses it.
             run.args
                 .splice(0..0, ["-c", "core.longpaths=true"].map(OsString::from));
+            #[cfg(windows)]
+            let indexed_link = tracked
+                .as_ref()
+                .is_some_and(|entry| entry.mode == gix::index::entry::Mode::SYMLINK);
+            #[cfg(windows)]
+            if indexed_link {
+                // Git for Windows opens the link target to infer its type.
+                // Check out the raw target text and create the link ourselves.
+                run.args
+                    .splice(0..0, ["-c", "core.symlinks=false"].map(OsString::from));
+            }
             let mut command = self.git.command(&self.paths.workdir);
             command
                 .args(run.args)
@@ -164,7 +176,39 @@ impl DiscardRunner {
                 });
             }
             let staged = scratch.0.join(&path.0);
-            fix_link_kind(&staged, &self.paths.workdir, path).map_err(environment)?;
+            #[cfg(windows)]
+            if indexed_link {
+                // Git for Windows defaults to emulation except when MSYS
+                // requests native symlinks. Explicit Git config still wins.
+                let msys = self
+                    .env
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("MSYS"))
+                    .map(|(_, value)| value.clone())
+                    .or_else(|| std::env::var_os("MSYS"));
+                let default = if msys.is_some_and(|value| {
+                    value.to_string_lossy().contains("winsymlinks:nativestrict")
+                }) {
+                    "--default=true"
+                } else {
+                    "--default=false"
+                };
+                let symlinks = self
+                    .undo
+                    .run(
+                        &["config", "--type=bool", default, "--get", "core.symlinks"],
+                        &[],
+                        None,
+                    )
+                    .map_err(|details| Failure {
+                        class: ErrorClass::Environment,
+                        details,
+                    })?;
+                if symlinks.trim() == "true" {
+                    materialize_link(&staged, &self.paths.workdir, path).map_err(environment)?;
+                }
+            }
             Some(staged)
         } else {
             None
@@ -321,7 +365,7 @@ pub fn file_inputs(paths: &RepoPaths, path: &RepoPath) -> Result<FileInputs, Str
             .map_err(|error| format!("read index: {error}"))
     };
     let based_on = id()?;
-    let tracked = checkout_entry(&repo, path)?;
+    let tracked = checkout_entry(&repo, path)?.is_some();
     let file = file_version(&full, path, hash)?;
     if id()? != based_on {
         return Err("The index changed while reading the file. Try again.".into());
@@ -364,8 +408,11 @@ pub(crate) fn index_entry(
     Ok(entry.cloned())
 }
 
-fn checkout_entry(repo: &gix::Repository, path: &RepoPath) -> Result<bool, String> {
-    Ok(index_entry(repo, path)?.is_some_and(|entry| {
+fn checkout_entry(
+    repo: &gix::Repository,
+    path: &RepoPath,
+) -> Result<Option<gix::index::Entry>, String> {
+    Ok(index_entry(repo, path)?.filter(|entry| {
         !entry
             .flags
             .contains(gix::index::entry::Flags::INTENT_TO_ADD)
@@ -451,8 +498,7 @@ pub(crate) fn check_leaf(full: &Path, path: &RepoPath) -> Result<Option<fs::Meta
 /// (`Environment`).
 fn leaf(full: &Path, path: &RepoPath) -> Result<Option<fs::Metadata>, Failure> {
     let fail = |class, details| Failure { class, details };
-    // Symlinks and junctions (name-surrogate reparse points on Windows) are
-    // links; a cloud placeholder or dedup stub is the file it stands for.
+    // A cloud placeholder or dedup stub is the file it stands for.
     match fs::symlink_metadata(full) {
         Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
             same_name_on_disk(full, path)?;
@@ -470,17 +516,80 @@ fn leaf(full: &Path, path: &RepoPath) -> Result<Option<fs::Metadata>, Failure> {
     }
 }
 
+/// Pins each existing component while Git reads a Windows worktree path.
+#[cfg(windows)]
+pub(crate) fn stage_path_guard(
+    workdir: &Path,
+    path: &RepoPath,
+) -> Result<(Vec<fs::File>, Option<PathBuf>), String> {
+    let mut full = workdir.to_path_buf();
+    let mut guards = Vec::new();
+    let mut parts = path.0.split('/').peekable();
+    while let Some(part) = parts.next() {
+        full.push(part);
+        let guard = match open_guarded(&full) {
+            Ok(guard) => guard,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok((guards, Some(full)));
+            }
+            Err(error) => return Err(format!("{}: {error}", path.0)),
+        };
+        if parts.peek().is_some() {
+            let metadata = guard
+                .metadata()
+                .map_err(|error| format!("{}: {error}", path.0))?;
+            if !metadata.is_dir() {
+                return Err(outside(path));
+            }
+            same_name_on_disk(&full, path).map_err(|failure| failure.details)?;
+        } else {
+            check_leaf(&full, path)?;
+        }
+        guards.push(guard);
+    }
+    Ok((guards, None))
+}
+
+#[cfg(windows)]
+fn open_guarded(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    // Inspect links themselves and prevent rename or reparse changes while
+    // the handle is held. Access to read only attributes would not enforce
+    // the sharing restrictions on Windows.
+    let mut wide = precondition::verbatim_path(path)?;
+    wide.pop();
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(OsString::from_wide(&wide))
+}
+
 /// On a case-insensitive filesystem `foo.txt` also finds `Foo.txt`. Only
 /// the entry Git names is hashed or replaced: a name that differs on disk
 /// is refused.
 #[cfg(windows)]
 fn same_name_on_disk(full: &Path, path: &RepoPath) -> Result<(), Failure> {
-    let found = disk_name(full).map_err(|error| Failure {
+    let (found, reparse_tag) = disk_entry(full).map_err(|error| Failure {
         class: ErrorClass::Environment,
         details: format!("{}: {error}", path.0),
     })?;
     let expected = full.file_name().unwrap_or_default();
     if found.as_os_str() == expected {
+        // Rust reports junctions as directory symlinks. Git can traverse
+        // them during add, and the undo format cannot restore their type.
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+        if reparse_tag == IO_REPARSE_TAG_MOUNT_POINT {
+            return Err(Failure {
+                class: ErrorClass::PreconditionChanged,
+                details: format!("{} is a Windows junction", path.0),
+            });
+        }
         return Ok(());
     }
     let what = if expected == std::ffi::OsStr::new(&path.0) {
@@ -502,14 +611,16 @@ fn same_name_on_disk(_: &Path, _: &RepoPath) -> Result<(), Failure> {
     Ok(())
 }
 
-/// The name of the directory entry `full` resolves to, as stored on disk.
+/// The on-disk name and reparse tag of the directory entry.
 /// `FindFirstFileW` reads the parent's entry and does not open the file, so
 /// a cloud placeholder is not downloaded.
 #[cfg(windows)]
-fn disk_name(full: &Path) -> io::Result<OsString> {
+fn disk_entry(full: &Path) -> io::Result<(OsString, u32)> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FindClose, FindFirstFileW, WIN32_FIND_DATAW,
+    };
 
     let wide = precondition::verbatim_path(full)?;
     // SAFETY: `wide` is NUL-terminated, `data` is a plain struct written by
@@ -528,7 +639,12 @@ fn disk_name(full: &Path) -> io::Result<OsString> {
         .iter()
         .position(|unit| *unit == 0)
         .unwrap_or(name.len());
-    Ok(OsString::from_wide(&name[..end]))
+    let tag = if data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        data.dwReserved0
+    } else {
+        0
+    };
+    Ok((OsString::from_wide(&name[..end]), tag))
 }
 
 pub(crate) fn read_file(full: &Path, path: &RepoPath) -> Result<Option<OnDisk>, String> {
@@ -801,33 +917,22 @@ impl UndoRunner {
     }
 }
 
-/// Git for Windows picks a symlink's kind (file or directory) from what its
-/// target is when it creates the link. In the scratch folder the target is
-/// missing, so a link to a directory came out as a file link: make it again
-/// with the kind the target has from where the link will live.
+/// Materialize Git's emulated link in private scratch. Only the bounded
+/// worktree lookup below can influence the kind of native link created.
 #[cfg(windows)]
-fn fix_link_kind(staged: &Path, workdir: &Path, path: &RepoPath) -> io::Result<()> {
-    use std::os::windows::fs::{FileTypeExt, symlink_dir, symlink_file};
-    let metadata = fs::symlink_metadata(staged)?;
-    if !metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    let target = fs::read_link(staged)?;
-    let directory = wants_dir_link(workdir, path, &target);
-    if metadata.file_type().is_symlink_dir() == directory {
-        return Ok(());
-    }
-    remove_leaf(staged)?;
-    if directory {
-        symlink_dir(&target, staged)
-    } else {
-        symlink_file(&target, staged)
-    }
-}
+fn materialize_link(staged: &Path, workdir: &Path, path: &RepoPath) -> io::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
 
-#[cfg(not(windows))]
-fn fix_link_kind(_: &Path, _: &Path, _: &RepoPath) -> io::Result<()> {
-    Ok(())
+    let bytes = fs::read(staged)?;
+    let text = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+    let target = text.replace('/', "\\");
+    let target = Path::new(&target);
+    fs::remove_file(staged)?;
+    if wants_dir_link(workdir, path, target) {
+        symlink_dir(target, staged)
+    } else {
+        symlink_file(target, staged)
+    }
 }
 
 /// Whether a link at `link` to `target` is a directory link, decided only
@@ -843,7 +948,15 @@ fn wants_dir_link(workdir: &Path, link: &RepoPath, target: &Path) -> bool {
     parts.pop();
     for component in target.components() {
         match component {
-            Component::Normal(part) => parts.push(part),
+            Component::Normal(part) => {
+                if part
+                    .to_str()
+                    .is_none_or(|part| part.contains([':', '\0']) || part.ends_with(['.', ' ']))
+                {
+                    return false;
+                }
+                parts.push(part);
+            }
             Component::CurDir => {}
             Component::ParentDir => {
                 if parts.pop().is_none() {
@@ -854,10 +967,18 @@ fn wants_dir_link(workdir: &Path, link: &RepoPath, target: &Path) -> bool {
         }
     }
     let mut full = workdir.to_path_buf();
-    parts.iter().all(|part| {
+    let mut guards = Vec::new();
+    for part in parts {
         full.push(part);
-        fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.is_dir())
-    })
+        let Ok(guard) = open_guarded(&full) else {
+            return false;
+        };
+        if !guard.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+            return false;
+        }
+        guards.push(guard);
+    }
+    true
 }
 
 fn write_file(temporary: &Path, bytes: &[u8], mode: WorktreeMode) -> io::Result<()> {
@@ -1227,6 +1348,21 @@ mod windows_tests {
         assert!(!left, "the scratch folder was left behind");
     }
 
+    #[test]
+    fn stage_guard_pins_the_file_and_its_parent_until_git_finishes() {
+        let root = precondition::ScratchDir::create(&std::env::temp_dir()).unwrap();
+        let dir = root.0.join("dir");
+        let target = dir.join("file");
+        fs::create_dir(&dir).unwrap();
+        fs::write(&target, b"staged").unwrap();
+        let (guards, missing) = stage_path_guard(&root.0, &RepoPath("dir/file".into())).unwrap();
+        assert!(missing.is_none());
+        assert!(fs::rename(&dir, root.0.join("moved")).is_err());
+        assert!(fs::rename(&target, dir.join("moved")).is_err());
+        drop(guards);
+        fs::rename(&dir, root.0.join("moved")).unwrap();
+    }
+
     /// Re-check: the link kind is decided only for relative targets that
     /// stay inside the worktree through real folders. Anything else (an
     /// absolute or UNC path, `..` out of the repo, a junction) keeps Git's
@@ -1260,6 +1396,8 @@ mod windows_tests {
             ("link", PathBuf::from(r"\\localhost\C$"), false),
             ("link", PathBuf::from(r"\outside"), false),
             ("link", PathBuf::from("junction"), false),
+            ("link", PathBuf::from("dir/C:relative"), false),
+            ("link", PathBuf::from("junction./folder"), false),
         ];
         let found: Vec<bool> = cases
             .iter()
