@@ -28,9 +28,7 @@ use invoke_core::{
     RefName, Refusal, RepoId, open, step,
 };
 use shell::forge::json::Json;
-use shell::forge::{
-    ClientIds, ForgeError, ForgeService, GitHubUrls, MemoryStore, ServiceConfig,
-};
+use shell::forge::{ClientIds, ForgeError, ForgeService, GitHubUrls, MemoryStore, ServiceConfig};
 use shell::git::Git;
 use shell::precondition::RepoPaths;
 use shell::read::{self, read_remotes, read_state};
@@ -239,9 +237,13 @@ fn service_for_gitlab(server: &Server) -> ForgeService {
 fn github_list_detail_reviews_and_create_pr_same_repo_and_fork() {
     let server = Server::start(|req| match (req.method.as_str(), req.target.as_str()) {
         ("GET", "/user") => Reply::json(r#"{"login":"alice"}"#),
-        ("GET", t) if t.starts_with("/repos/org/tool/pulls?state=open") && !t.contains("page=2") => {
-            let next = format!("<http://{}/repos/org/tool/pulls?state=open&page=2>; rel=\"next\"",
-                req.header("host").unwrap_or("127.0.0.1"));
+        ("GET", t)
+            if t.starts_with("/repos/org/tool/pulls?state=open") && !t.contains("page=2") =>
+        {
+            let next = format!(
+                "<http://{}/repos/org/tool/pulls?state=open&page=2>; rel=\"next\"",
+                req.header("host").unwrap_or("127.0.0.1")
+            );
             Reply::json(
                 r#"[{
                     "number": 42,
@@ -339,7 +341,9 @@ fn github_list_detail_reviews_and_create_pr_same_repo_and_fork() {
     assert!(listing.more.is_none());
 
     // 2. Detail + review status aggregation (Carol's APPROVED supersedes CHANGES_REQUESTED)
-    let detail = service.get_pr_detail(&account.key(), "org/tool", 42).unwrap();
+    let detail = service
+        .get_pr_detail(&account.key(), "org/tool", 42)
+        .unwrap();
     assert_eq!(detail.review_status, ReviewStatus::Approved);
     assert_eq!(detail.comments_count, Some(5));
     assert_eq!(detail.mergeable, Some(true));
@@ -374,6 +378,7 @@ fn github_list_detail_reviews_and_create_pr_same_repo_and_fork() {
     );
     let sent = Json::parse(&post_req.body).unwrap();
     assert_eq!(sent.str_field("head"), Some("alice:feat-x"));
+    assert_eq!(sent.str_field("head_repo"), Some("alice/tool"));
     assert_eq!(sent.str_field("base"), Some("main"));
     assert_eq!(sent.get("draft").and_then(Json::as_bool), Some(true));
 }
@@ -386,7 +391,9 @@ fn github_list_detail_reviews_and_create_pr_same_repo_and_fork() {
 fn gitlab_list_detail_approvals_and_create_fork_mr() {
     let server = Server::start(|req| match (req.method.as_str(), req.target.as_str()) {
         ("GET", "/api/v4/user") => Reply::json(r#"{"username":"alice"}"#),
-        ("GET", t) if t.starts_with("/api/v4/projects/grp%2Fsub%2Ftool/merge_requests?state=opened") => {
+        ("GET", t)
+            if t.starts_with("/api/v4/projects/grp%2Fsub%2Ftool/merge_requests?state=opened") =>
+        {
             Reply::json(
                 r#"[{
                     "iid": 7,
@@ -503,7 +510,10 @@ fn gitlab_list_detail_approvals_and_create_fork_mr() {
     assert_eq!(sent.str_field("title"), Some("Draft: Add GitLab MR"));
     assert_eq!(sent.str_field("source_branch"), Some("feat-gl"));
     assert_eq!(sent.str_field("target_branch"), Some("main"));
-    assert_eq!(sent.get("target_project_id").and_then(Json::as_u64), Some(777));
+    assert_eq!(
+        sent.get("target_project_id").and_then(Json::as_u64),
+        Some(777)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -635,10 +645,8 @@ impl TempDir {
         use std::sync::atomic::AtomicU64;
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "invoke-git-p9-{tag}-{}-{n}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("invoke-git-p9-{tag}-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -689,10 +697,16 @@ fn setup_pr_git_fixture() -> (TempDir, RepoPaths, String, String) {
     run_git(&seed, &["add", "."]);
     run_git(&seed, &["commit", "-m", "MR 7 change"]);
     let mr7_oid = run_git(&seed, &["rev-parse", "HEAD"]);
-    run_git(&seed, &["push", "origin", "HEAD:refs/merge-requests/7/head"]);
+    run_git(
+        &seed,
+        &["push", "origin", "HEAD:refs/merge-requests/7/head"],
+    );
 
     // Clone into local workdir and add an unrelated local branch `other`.
-    run_git(dir.path(), &["clone", bare.to_str().unwrap(), work.to_str().unwrap()]);
+    run_git(
+        dir.path(),
+        &["clone", bare.to_str().unwrap(), work.to_str().unwrap()],
+    );
     run_git(&work, &["config", "core.autocrlf", "false"]);
     run_git(&work, &["branch", "other"]);
 
@@ -785,8 +799,18 @@ fn checkout_github_pr_and_gitlab_mr_preserves_other_branches_and_updates_state()
     assert_eq!(remotes[0].name, "origin");
 
     let before = read_state(&paths).unwrap();
-    let main_before = before.refs.refs.get(&RefName("refs/heads/main".into())).unwrap().clone();
-    let other_before = before.refs.refs.get(&RefName("refs/heads/other".into())).unwrap().clone();
+    let main_before = before
+        .refs
+        .refs
+        .get(&RefName("refs/heads/main".into()))
+        .unwrap()
+        .clone();
+    let other_before = before
+        .refs
+        .refs
+        .get(&RefName("refs/heads/other".into()))
+        .unwrap()
+        .clone();
 
     // 1. Checkout GitHub PR #42 -> `pr/42`
     let gh_ref = pr_fetch_ref(ForgeKind::GitHub, 42).unwrap();
@@ -814,8 +838,14 @@ fn checkout_github_pr_and_gitlab_mr_preserves_other_branches_and_updates_state()
     );
     assert!(paths.workdir.join("pr42.txt").is_file());
     // Law 9: `main` and `other` did not move
-    assert_eq!(disk.refs.refs.get(&RefName("refs/heads/main".into())), Some(&main_before));
-    assert_eq!(disk.refs.refs.get(&RefName("refs/heads/other".into())), Some(&other_before));
+    assert_eq!(
+        disk.refs.refs.get(&RefName("refs/heads/main".into())),
+        Some(&main_before)
+    );
+    assert_eq!(
+        disk.refs.refs.get(&RefName("refs/heads/other".into())),
+        Some(&other_before)
+    );
 
     // 2. Checkout GitLab MR #7 -> `mr/7`
     let gl_ref = pr_fetch_ref(ForgeKind::GitLab, 7).unwrap();
@@ -838,8 +868,14 @@ fn checkout_github_pr_and_gitlab_mr_preserves_other_branches_and_updates_state()
     );
     assert!(paths.workdir.join("mr7.txt").is_file());
     // Law 9: `main`, `other`, and `pr/42` all untouched
-    assert_eq!(disk.refs.refs.get(&RefName("refs/heads/main".into())), Some(&main_before));
-    assert_eq!(disk.refs.refs.get(&RefName("refs/heads/other".into())), Some(&other_before));
+    assert_eq!(
+        disk.refs.refs.get(&RefName("refs/heads/main".into())),
+        Some(&main_before)
+    );
+    assert_eq!(
+        disk.refs.refs.get(&RefName("refs/heads/other".into())),
+        Some(&other_before)
+    );
     assert_eq!(
         disk.refs.refs.get(&RefName("refs/heads/pr/42".into())),
         Some(&invoke_core::Oid::from_hex(&pr42_oid).unwrap())
@@ -912,13 +948,203 @@ fn checkout_pr_refuses_dirty_worktree_and_index_lock() {
     }
 }
 
+#[test]
+fn checkout_pr_ignores_custom_fetch_refmap_preserves_ignored_files_and_cleans_temp_ref() {
+    let (_dir, paths, pr42_oid, _mr7_oid) = setup_pr_git_fixture();
+
+    // Configure a hostile fetch refmap that would move `refs/heads/other` if
+    // `--refmap=` were not passed to `git fetch`.
+    run_git(
+        &paths.workdir,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/pull/42/head:refs/heads/other",
+        ],
+    );
+    let other_before = run_git(&paths.workdir, &["rev-parse", "refs/heads/other"]);
+
+    // Place an ignored file at `pr42.txt` (via .git/info/exclude so status is clean).
+    let exclude = paths.git_dir.join("info").join("exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, "pr42.txt\n").unwrap();
+    fs::write(paths.workdir.join("pr42.txt"), "precious ignored data\n").unwrap();
+
+    // 1. Checkout MUST refuse to overwrite the ignored file (`--no-overwrite-ignore`).
+    let state = drive_checkout_pr(
+        &paths,
+        "origin",
+        pr_fetch_ref(ForgeKind::GitHub, 42).unwrap(),
+        "pr/42",
+    );
+    assert!(
+        matches!(
+            state.notice,
+            Some(Notice::OpEnded {
+                outcome: OpOutcome::Failed(_),
+                ..
+            })
+        ),
+        "expected failure when ignored file collides, got {:?}",
+        state.notice
+    );
+    assert_eq!(
+        fs::read_to_string(paths.workdir.join("pr42.txt")).unwrap(),
+        "precious ignored data\n"
+    );
+    // Law 9: `other` was NOT moved by the custom `remote.origin.fetch` refmap!
+    assert_eq!(
+        run_git(&paths.workdir, &["rev-parse", "refs/heads/other"]),
+        other_before
+    );
+    // Temp ref was cleaned up even on failure.
+    let temp_refs = run_git(
+        &paths.workdir,
+        &["for-each-ref", "refs/invoke-git/pr-checkout"],
+    );
+    assert!(temp_refs.is_empty(), "temp ref leaked: {temp_refs}");
+
+    // 2. Remove ignored file -> checkout succeeds, `other` still untouched, temp ref cleaned.
+    fs::remove_file(paths.workdir.join("pr42.txt")).unwrap();
+    let state = drive_checkout_pr(
+        &paths,
+        "origin",
+        pr_fetch_ref(ForgeKind::GitHub, 42).unwrap(),
+        "pr/42",
+    );
+    assert!(matches!(
+        state.notice,
+        Some(Notice::OpEnded {
+            outcome: OpOutcome::Succeeded,
+            ..
+        })
+    ));
+    assert_eq!(
+        run_git(&paths.workdir, &["rev-parse", "refs/heads/pr/42"]),
+        pr42_oid
+    );
+    assert_eq!(
+        run_git(&paths.workdir, &["rev-parse", "refs/heads/other"]),
+        other_before
+    );
+    let temp_refs = run_git(
+        &paths.workdir,
+        &["for-each-ref", "refs/invoke-git/pr-checkout"],
+    );
+    assert!(temp_refs.is_empty(), "temp ref leaked: {temp_refs}");
+}
+
+#[test]
+fn review_pagination_gitlab_partial_approval_and_encoded_secret_scrubbing() {
+    let server = Server::start(|req| match (req.method.as_str(), req.target.as_str()) {
+        ("GET", "/user") => Reply::json(r#"{"login":"alice"}"#),
+        ("GET", "/api/v4/user") => Reply::json(r#"{"username":"alice"}"#),
+        // GitHub paginated reviews: page 1 APPROVED, page 2 CHANGES_REQUESTED
+        ("GET", "/repos/org/tool/pulls/10") => Reply::json(
+            r#"{
+                "number": 10,
+                "title": "Big PR",
+                "body": "",
+                "state": "open",
+                "html_url": "https://github.com/org/tool/pull/10",
+                "user": {"login": "bob"},
+                "head": {"ref": "big"},
+                "base": {"ref": "main"}
+            }"#,
+        ),
+        ("GET", "/repos/org/tool/pulls/10/reviews?per_page=100") => {
+            let next = format!(
+                "<http://{}/repos/org/tool/pulls/10/reviews?per_page=100&page=2>; rel=\"next\"",
+                req.header("host").unwrap_or("127.0.0.1")
+            );
+            Reply::json(r#"[{"user":{"login":"carol"},"state":"APPROVED"}]"#).with("Link", next)
+        }
+        ("GET", "/repos/org/tool/pulls/10/reviews?per_page=100&page=2") => {
+            Reply::json(r#"[{"user":{"login":"carol"},"state":"CHANGES_REQUESTED"}]"#)
+        }
+        // GitHub list with percent-encoded token in web_url and raw token in Link next
+        ("GET", t) if t.starts_with("/repos/org/tool/pulls?state=open") => {
+            let evil_next = format!(
+                "<http://{}/repos/org/tool/pulls?state=open&tok=ghp_ENC_SECRET>; rel=\"next\"",
+                req.header("host").unwrap_or("127.0.0.1")
+            );
+            Reply::json(
+                r#"[{
+                    "number": 11,
+                    "title": "Encoded secret link",
+                    "body": "",
+                    "state": "open",
+                    "html_url": "https://github.com/org/tool/pull/11?x=ghp%5FENC%5FSECRET",
+                    "user": {"login": "bob"},
+                    "head": {"ref": "x"},
+                    "base": {"ref": "main"}
+                }]"#,
+            )
+            .with("Link", evil_next)
+        }
+        // GitLab MR with approved: false despite 1 of 2 approvers in approved_by
+        ("GET", "/api/v4/projects/grp%2Ftool/merge_requests/5") => Reply::json(
+            r#"{
+                "iid": 5,
+                "title": "Needs two approvals",
+                "description": "",
+                "state": "opened",
+                "web_url": "https://gitlab.example.com/grp/tool/-/merge_requests/5",
+                "author": {"username": "bob"},
+                "source_branch": "feat",
+                "target_branch": "main"
+            }"#,
+        ),
+        ("GET", "/api/v4/projects/grp%2Ftool/merge_requests/5/approvals") => {
+            Reply::json(r#"{"approved": false, "approved_by": [{"user": {"username": "carol"}}]}"#)
+        }
+        _ => Reply::status(404, "{}"),
+    });
+
+    // 1. GitHub paginated review aggregation + percent-encoded secret & Link scrubbing
+    let gh_service = service_for_github(&server);
+    let gh_acc = gh_service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ENC_SECRET")
+        .unwrap();
+    let detail = gh_service
+        .get_pr_detail(&gh_acc.key(), "org/tool", 10)
+        .unwrap();
+    assert_eq!(detail.review_status, ReviewStatus::ChangesRequested);
+
+    let page = gh_service
+        .list_prs_page(&gh_acc.key(), "org/tool", PrFilter::Open, None)
+        .unwrap();
+    assert!(
+        page.prs.is_empty(),
+        "percent-encoded token URL must be dropped"
+    );
+    assert!(
+        page.next.is_none(),
+        "next cursor carrying token must be dropped"
+    );
+
+    // 2. GitLab `approved: false` is respected even when `approved_by` is non-empty
+    let gl_service = service_for_gitlab(&server);
+    let gl_acc = gl_service
+        .connect_with_token(ForgeKind::GitLab, &server.url(), "glpat_tok_1")
+        .unwrap();
+    let mr = gl_service
+        .get_pr_detail(&gl_acc.key(), "grp/tool", 5)
+        .unwrap();
+    assert_ne!(mr.review_status, ReviewStatus::Approved);
+}
+
 fn fake_disk_with_upstream(branch: &str, upstream_ref: &str) -> invoke_core::DiskState {
     let mut refs = invoke_core::RefsSnapshot::default();
     refs.upstreams.insert(
         BranchName(branch.into()),
         invoke_core::Upstream {
             name: RefName(upstream_ref.into()),
-            tracking: invoke_core::Tracking::Apart { ahead: 0, behind: 0 },
+            tracking: invoke_core::Tracking::Apart {
+                ahead: 0,
+                behind: 0,
+            },
         },
     );
     invoke_core::DiskState {

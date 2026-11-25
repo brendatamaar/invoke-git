@@ -170,10 +170,23 @@ fn api_post_json(
     }
 }
 
-/// A web URL returned by a forge (e.g. a PR page): must be https or loopback,
-/// with no userinfo, whitespace or control characters.
-fn web_url_ok(url: &str) -> bool {
-    !url.starts_with('-') && origin_of_url(url).is_some_and(|o| o.is_secure())
+/// A web URL returned by a forge (e.g. a PR page): must be secure and bound to
+/// `expected_origin` (so a hostile server cannot point "Open in browser" to an
+/// unrelated host).
+fn web_url_ok(url: &str, expected_origin: Option<&Origin>) -> bool {
+    if url.starts_with('-') {
+        return false;
+    }
+    let Some(origin) = origin_of_url(url) else {
+        return false;
+    };
+    if !origin.is_secure() {
+        return false;
+    }
+    match expected_origin {
+        Some(expected) => origin == *expected,
+        None => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +349,18 @@ pub mod github {
         })
     }
 
+    /// The expected web origin for GitHub PR links (`https://github.com`, or
+    /// unrestricted to loopback when `api` is a local mock server).
+    fn expected_web_origin(api: &str) -> Option<Origin> {
+        let github_web = Origin::parse("https://github.com").ok()?;
+        if let Some(api_origin) = origin_of_url(api)
+            && !api_origin.is_https()
+        {
+            return None;
+        }
+        Some(github_web)
+    }
+
     pub fn list_prs_page(
         http: &Http,
         api: &str,
@@ -360,8 +385,12 @@ pub mod github {
         let items = json
             .as_array()
             .ok_or(ForgeError::BadResponse("not a list"))?;
+        let web_origin = expected_web_origin(api);
         Ok(PrPage {
-            prs: items.iter().filter_map(parse_pr).collect(),
+            prs: items
+                .iter()
+                .filter_map(|item| parse_pr(item, web_origin.as_ref()))
+                .collect(),
             next: next_page(&response, api),
         })
     }
@@ -381,11 +410,13 @@ pub mod github {
         );
         let response = api_get(http, &url, token, ACCEPT, &GITHUB_HEADERS)?;
         let json = parse_json(&response)?;
-        parse_pr(&json).ok_or(ForgeError::BadResponse("invalid pull request"))
+        let web_origin = expected_web_origin(api);
+        parse_pr(&json, web_origin.as_ref()).ok_or(ForgeError::BadResponse("invalid pull request"))
     }
 
-    /// Aggregates GitHub PR reviews by taking each reviewer's latest decisive
-    /// state (`CHANGES_REQUESTED` > `APPROVED` > `COMMENTED` > `PENDING`).
+    /// Aggregates GitHub PR reviews across all pages (up to 10 pages) by taking
+    /// each reviewer's latest decisive state (`CHANGES_REQUESTED` > `APPROVED` >
+    /// `COMMENTED` > `PENDING`).
     pub fn list_pr_reviews(
         http: &Http,
         api: &str,
@@ -394,19 +425,28 @@ pub mod github {
         repo: &str,
         number: u64,
     ) -> Result<ReviewStatus, ForgeError> {
-        let url = format!(
+        let mut all_items = Vec::new();
+        let mut next_url = Some(format!(
             "{api}/repos/{}/{}/pulls/{number}/reviews?per_page=100",
             pct_encode(owner),
             pct_encode(repo)
-        );
-        let response = api_get(http, &url, token, ACCEPT, &GITHUB_HEADERS)?;
-        let json = parse_json(&response)?;
-        let items = json
-            .as_array()
-            .ok_or(ForgeError::BadResponse("not a list"))?;
-        Ok(summarize_github_reviews(items))
+        ));
+        for _ in 0..10 {
+            let Some(url) = next_url.take() else {
+                break;
+            };
+            let response = api_get(http, &url, token, ACCEPT, &GITHUB_HEADERS)?;
+            let json = parse_json(&response)?;
+            let items = json
+                .as_array()
+                .ok_or(ForgeError::BadResponse("not a list"))?;
+            all_items.extend(items.iter().cloned());
+            next_url = next_page(&response, api);
+        }
+        Ok(summarize_github_reviews(&all_items))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_pr(
         http: &Http,
         api: &str,
@@ -414,6 +454,7 @@ pub mod github {
         owner: &str,
         repo: &str,
         head: &str,
+        head_repo: Option<&str>,
         input: &CreatePrInput,
     ) -> Result<PullRequest, ForgeError> {
         let url = format!(
@@ -421,23 +462,31 @@ pub mod github {
             pct_encode(owner),
             pct_encode(repo)
         );
-        let payload = Json::Object(vec![
+        let mut fields = vec![
             ("title".into(), Json::Str(input.title.clone())),
             ("body".into(), Json::Str(input.body.clone())),
             ("head".into(), Json::Str(head.to_owned())),
             ("base".into(), Json::Str(input.base_branch.clone())),
             ("draft".into(), Json::Bool(input.draft)),
-        ]);
+        ];
+        if let Some(head_repo) = head_repo {
+            fields.push(("head_repo".into(), Json::Str(head_repo.to_owned())));
+        }
+        let payload = Json::Object(fields);
         let response = api_post_json(http, &url, &payload, token, ACCEPT, &GITHUB_HEADERS)?;
         let json = parse_json(&response)?;
-        parse_pr(&json).ok_or(ForgeError::BadResponse("invalid pull request"))
+        let web_origin = expected_web_origin(api);
+        parse_pr(&json, web_origin.as_ref()).ok_or(ForgeError::BadResponse("invalid pull request"))
     }
 
-    pub(super) fn parse_pr(item: &Json) -> Option<PullRequest> {
-        let number = item.get("number").and_then(Json::as_u64).filter(|n| *n > 0)?;
+    pub(super) fn parse_pr(item: &Json, expected_origin: Option<&Origin>) -> Option<PullRequest> {
+        let number = item
+            .get("number")
+            .and_then(Json::as_u64)
+            .filter(|n| *n > 0)?;
         let title = item.str_field("title")?.to_owned();
         let web_url = item.str_field("html_url")?.to_owned();
-        if title.is_empty() || !web_url_ok(&web_url) {
+        if title.is_empty() || !web_url_ok(&web_url, expected_origin) {
             return None;
         }
         let merged = item
@@ -681,6 +730,14 @@ pub mod gitlab {
         })
     }
 
+    fn expected_web_origin(origin: &Origin) -> Option<Origin> {
+        if !origin.is_https() {
+            // Local mock server in tests.
+            return None;
+        }
+        Some(origin.clone())
+    }
+
     pub fn list_mrs_page(
         http: &Http,
         origin: &Origin,
@@ -704,8 +761,12 @@ pub mod gitlab {
         let items = json
             .as_array()
             .ok_or(ForgeError::BadResponse("not a list"))?;
+        let web_origin = expected_web_origin(origin);
         Ok(PrPage {
-            prs: items.iter().filter_map(parse_mr).collect(),
+            prs: items
+                .iter()
+                .filter_map(|item| parse_mr(item, web_origin.as_ref()))
+                .collect(),
             next: next_page(&response, origin.as_str()),
         })
     }
@@ -724,7 +785,8 @@ pub mod gitlab {
         );
         let response = api_get(http, &url, token, ACCEPT, &[])?;
         let json = parse_json(&response)?;
-        parse_mr(&json).ok_or(ForgeError::BadResponse("invalid merge request"))
+        let web_origin = expected_web_origin(origin);
+        parse_mr(&json, web_origin.as_ref()).ok_or(ForgeError::BadResponse("invalid merge request"))
     }
 
     pub fn get_mr_approvals(
@@ -741,11 +803,15 @@ pub mod gitlab {
         );
         let response = api_get(http, &url, token, ACCEPT, &[])?;
         let json = parse_json(&response)?;
-        let approved = json.get("approved").and_then(Json::as_bool) == Some(true)
-            || json
+        // Prefer the server's explicit aggregate `approved` boolean; never
+        // override `approved: false` when only 1 of N required approvers signed.
+        let approved = match json.get("approved").and_then(Json::as_bool) {
+            Some(flag) => flag,
+            None => json
                 .get("approved_by")
                 .and_then(Json::as_array)
-                .is_some_and(|a| !a.is_empty());
+                .is_some_and(|a| !a.is_empty()),
+        };
         if approved {
             Ok(ReviewStatus::Approved)
         } else {
@@ -802,14 +868,15 @@ pub mod gitlab {
         let payload = Json::Object(fields);
         let response = api_post_json(http, &url, &payload, token, ACCEPT, &[])?;
         let json = parse_json(&response)?;
-        parse_mr(&json).ok_or(ForgeError::BadResponse("invalid merge request"))
+        let web_origin = expected_web_origin(origin);
+        parse_mr(&json, web_origin.as_ref()).ok_or(ForgeError::BadResponse("invalid merge request"))
     }
 
-    pub(super) fn parse_mr(item: &Json) -> Option<PullRequest> {
+    pub(super) fn parse_mr(item: &Json, expected_origin: Option<&Origin>) -> Option<PullRequest> {
         let number = item.get("iid").and_then(Json::as_u64).filter(|n| *n > 0)?;
         let title = item.str_field("title")?.to_owned();
         let web_url = item.str_field("web_url")?.to_owned();
-        if title.is_empty() || !web_url_ok(&web_url) {
+        if title.is_empty() || !web_url_ok(&web_url, expected_origin) {
             return None;
         }
         let state = match item.str_field("state") {

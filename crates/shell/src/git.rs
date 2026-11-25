@@ -526,13 +526,24 @@ pub fn invocation(args: &GitArgs) -> Invocation {
             }
             plain(argv)
         }
-        // P9: fetch the PR/MR ref into FETCH_HEAD without moving any local branch.
-        // The companion `git switch -c <local_branch> --no-track FETCH_HEAD` is
-        // emitted as the second step by `invocations`.
+        // P9: executed by `runner::Job::run_checkout_pr` using an isolated
+        // operation-owned temp ref (`--no-tags --no-prune --no-write-fetch-head
+        // --refmap=`) followed by `git switch --no-track --no-overwrite-ignore`.
         GitArgs::CheckoutPr {
             remote, remote_ref, ..
         } => {
-            argv.extend(["fetch", "--progress", "--no-tags", "--"].map(OsString::from));
+            argv.extend(
+                [
+                    "fetch",
+                    "--progress",
+                    "--no-tags",
+                    "--no-prune",
+                    "--no-write-fetch-head",
+                    "--refmap=",
+                    "--",
+                ]
+                .map(OsString::from),
+            );
             argv.push(remote.into());
             argv.push((&remote_ref.0).into());
             plain(argv)
@@ -543,20 +554,11 @@ pub fn invocation(args: &GitArgs) -> Invocation {
 /// Task 23: every git run of one request, in order; the request stops at the
 /// first one that fails. Almost every request is one run. Taking a side
 /// whole is two: write the side's file, then stage it.
-/// P9: checking out a PR/MR is two: fetch the PR ref into `FETCH_HEAD`, then
-/// create and switch to the new local branch at `FETCH_HEAD`.
 pub fn invocations(args: &GitArgs) -> Vec<Invocation> {
     match args {
         GitArgs::ResolveTakeSide { path, .. } => {
             let argv = GLOBAL_ARGS.iter().map(OsString::from).collect();
             vec![invocation(args), stage_path(argv, path)]
-        }
-        GitArgs::CheckoutPr { local_branch, .. } => {
-            let mut switch: Vec<OsString> = GLOBAL_ARGS.iter().map(OsString::from).collect();
-            switch.extend(["switch", "--no-track", "-c"].map(OsString::from));
-            switch.push((&local_branch.0).into());
-            switch.push("FETCH_HEAD".into());
-            vec![invocation(args), plain(switch)]
         }
         _ => vec![invocation(args)],
     }

@@ -888,6 +888,15 @@ pub struct ConfiguredRemote {
     pub url: String,
 }
 
+/// Configured upstream remote and remote branch name for a local branch, read
+/// directly from `branch.<name>.remote` and `branch.<name>.merge` (handles
+/// remote names containing `/` and custom fetch refspecs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchUpstream {
+    pub remote: String,
+    pub branch: String,
+}
+
 /// The forge host and repository path parsed from a git remote URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteRepoRef {
@@ -1110,12 +1119,19 @@ pub fn resolve_remote_for_list(
                 remote: name.to_owned(),
             })?
     } else {
-        // Prefer `upstream` if it already resolves to a connected account;
-        // otherwise `origin`; otherwise the first configured remote.
-        let upstream_connected = remotes
+        // Prefer `upstream` if fully resolvable, then `origin` if fully
+        // resolvable, then the first fully resolvable remote; otherwise fall
+        // back to `origin` or the first remote to surface an actionable error.
+        let upstream_ok = remotes
             .iter()
-            .find(|r| r.name == "upstream" && matches!(book.resolve(&r.url), Resolution::Use(_)));
-        upstream_connected
+            .find(|r| r.name == "upstream" && resolve_one_remote(r, book).is_ok());
+        let origin_ok = remotes
+            .iter()
+            .find(|r| r.name == "origin" && resolve_one_remote(r, book).is_ok());
+        let any_ok = remotes.iter().find(|r| resolve_one_remote(r, book).is_ok());
+        upstream_ok
+            .or(origin_ok)
+            .or(any_ok)
             .or_else(|| remotes.iter().find(|r| r.name == "origin"))
             .unwrap_or(&remotes[0])
     };
@@ -1183,6 +1199,19 @@ pub fn resolve_create_target(
     base_remote: Option<&str>,
     book: &AccountBook,
 ) -> Result<PrCreateTarget, PrTargetError> {
+    resolve_create_target_with_config(remotes, disk, None, base_remote, book)
+}
+
+/// Like [`resolve_create_target`], but accepts an explicit `configured_upstream`
+/// read from `branch.<name>.remote` and `branch.<name>.merge` so remotes whose
+/// names contain `/` or custom fetch refspecs resolve accurately.
+pub fn resolve_create_target_with_config(
+    remotes: &[ConfiguredRemote],
+    disk: &DiskState,
+    configured_upstream: Option<&BranchUpstream>,
+    base_remote: Option<&str>,
+    book: &AccountBook,
+) -> Result<PrCreateTarget, PrTargetError> {
     let branch = match &disk.head {
         Head::Branch { name, .. } => name,
         Head::Detached(_) | Head::Unborn(_) => return Err(PrTargetError::NotOnBranch),
@@ -1199,10 +1228,14 @@ pub fn resolve_create_target(
             branch: branch.0.clone(),
         });
     }
-    let (head_remote_name, head_branch) =
-        split_tracking_ref(&upstream.name).ok_or_else(|| PrTargetError::NoUpstream {
+    let (head_remote_name, head_branch) = match configured_upstream {
+        Some(cfg) if !cfg.remote.is_empty() && !cfg.branch.is_empty() => {
+            (cfg.remote.clone(), cfg.branch.clone())
+        }
+        _ => split_tracking_ref(&upstream.name).ok_or_else(|| PrTargetError::NoUpstream {
             branch: branch.0.clone(),
-        })?;
+        })?,
+    };
     let head_remote = remotes
         .iter()
         .find(|r| r.name == head_remote_name)
@@ -1215,12 +1248,11 @@ pub fn resolve_create_target(
         if explicit == head_remote_name {
             head_resolved.clone()
         } else {
-            let remote = remotes
-                .iter()
-                .find(|r| r.name == explicit)
-                .ok_or_else(|| PrTargetError::RemoteNotFound {
+            let remote = remotes.iter().find(|r| r.name == explicit).ok_or_else(|| {
+                PrTargetError::RemoteNotFound {
                     remote: explicit.to_owned(),
-                })?;
+                }
+            })?;
             let resolved = resolve_one_remote(remote, book)?;
             if resolved.account.kind != head_resolved.account.kind
                 || resolved.account.origin != head_resolved.account.origin
@@ -2149,7 +2181,9 @@ mod tests {
     #[test]
     fn pr_ref_validation_accepts_only_github_and_gitlab_head_refs() {
         assert!(is_valid_pr_ref(&RefName("refs/pull/42/head".into())));
-        assert!(is_valid_pr_ref(&RefName("refs/merge-requests/7/head".into())));
+        assert!(is_valid_pr_ref(&RefName(
+            "refs/merge-requests/7/head".into()
+        )));
         for bad in [
             "refs/pull/0/head",
             "refs/pull/42/merge",
@@ -2194,7 +2228,10 @@ mod tests {
             BranchName("feat".into()),
             Upstream {
                 name: RefName("refs/remotes/origin/feat".into()),
-                tracking: Tracking::Apart { ahead: 0, behind: 0 },
+                tracking: Tracking::Apart {
+                    ahead: 0,
+                    behind: 0,
+                },
             },
         );
         let disk = DiskState {

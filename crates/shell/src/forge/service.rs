@@ -837,8 +837,14 @@ impl ForgeService {
                     cursor,
                 ),
             }?;
-            page.prs
-                .retain(|pr| !pr_contains_secret(pr, credential));
+            page.prs.retain(|pr| !pr_contains_secret(pr, credential));
+            if page
+                .next
+                .as_deref()
+                .is_some_and(|next| text_contains_secret(next, credential))
+            {
+                page.next = None;
+            }
             Ok(page)
         })
     }
@@ -940,11 +946,14 @@ impl ForgeService {
             let pr = match account.kind {
                 ForgeKind::GitHub => {
                     let (base_owner, base_repo) = split_github_path(&target.base_repo.path)?;
-                    let head = if target.is_fork {
+                    let (head, head_repo) = if target.is_fork {
                         let (head_owner, _) = split_github_path(&target.head_repo.path)?;
-                        format!("{head_owner}:{}", target.head_branch)
+                        (
+                            format!("{head_owner}:{}", target.head_branch),
+                            Some(target.head_repo.path.as_str()),
+                        )
                     } else {
-                        target.head_branch.clone()
+                        (target.head_branch.clone(), None)
                     };
                     api::github::create_pr(
                         &self.inner.http,
@@ -953,6 +962,7 @@ impl ForgeService {
                         base_owner,
                         base_repo,
                         &head,
+                        head_repo,
                         input,
                     )?
                 }
@@ -996,11 +1006,25 @@ fn split_github_path(path: &str) -> Result<(&str, &str), ForgeError> {
     Ok((owner, repo))
 }
 
-fn pr_contains_secret(pr: &PullRequest, credential: &Credential) -> bool {
+fn text_contains_secret(text: &str, credential: &Credential) -> bool {
     let secrets: Vec<String> = std::iter::once(&credential.access)
         .chain(credential.refresh.as_ref())
         .map(|s| s.expose().to_ascii_lowercase())
         .collect();
+    let lower = text.to_ascii_lowercase();
+    if secrets.iter().any(|secret| lower.contains(secret)) {
+        return true;
+    }
+    if let Some(decoded) = super::codec::pct_decode(text) {
+        let decoded_lower = decoded.to_ascii_lowercase();
+        if secrets.iter().any(|secret| decoded_lower.contains(secret)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn pr_contains_secret(pr: &PullRequest, credential: &Credential) -> bool {
     let fields = [
         Some(pr.title.as_str()),
         Some(pr.body.as_str()),
@@ -1012,10 +1036,10 @@ fn pr_contains_secret(pr: &PullRequest, credential: &Credential) -> bool {
         Some(pr.web_url.as_str()),
         pr.updated_at.as_deref(),
     ];
-    fields.into_iter().flatten().any(|field| {
-        let lower = field.to_ascii_lowercase();
-        secrets.iter().any(|secret| lower.contains(secret))
-    })
+    fields
+        .into_iter()
+        .flatten()
+        .any(|field| text_contains_secret(field, credential))
 }
 
 /// The working list held for a change. Fields drop in order: the lock file

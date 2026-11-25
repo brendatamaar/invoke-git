@@ -15,13 +15,13 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 use invoke_core::forge::{
-    ConfiguredRemote, CreatePrProblem, ForgeKind, PrCreateTarget, PrFilter, PrListTarget,
-    PrTargetError, PullRequest, default_pr_branch, filter_prs, pr_fetch_ref, resolve_create_target,
-    resolve_remote_for_list, validate_create_pr,
+    BranchUpstream, ConfiguredRemote, CreatePrProblem, ForgeKind, PrCreateTarget, PrFilter,
+    PrListTarget, PrTargetError, PullRequest, default_pr_branch, filter_prs, pr_fetch_ref,
+    resolve_create_target_with_config, resolve_remote_for_list, validate_create_pr,
 };
 use invoke_core::{Event, Head, Snapshot};
 use shell::forge::{ForgeError, ForgeService};
-use shell::read::read_remotes;
+use shell::read::{read_branch_upstream, read_remotes};
 use tokens::{
     DIALOG, RADIUS_MD, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM,
     TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL, TEXT_TITLE,
@@ -68,16 +68,20 @@ enum CreateState {
     Idle,
     Submitting,
     Created(Box<PullRequest>),
-    Failed(String),
+    Failed { message: String, reconnect: bool },
 }
 
 pub struct PrPane {
     session: Entity<RepoSession>,
     service: Option<ForgeService>,
-    service_error: Option<String>,
     accounts_view: Option<Entity<AccountsView>>,
     mode: Mode,
+    /// Which screen to return to when closing Accounts (Browse or Create).
+    return_mode: Mode,
     remotes: Vec<ConfiguredRemote>,
+    /// Configured `branch.<name>.remote` + `branch.<name>.merge` for the
+    /// current branch, read off the UI thread.
+    configured_upstream: Option<BranchUpstream>,
     preferred_remote: Option<String>,
     filter: PrFilter,
     search: Entity<TextEditor>,
@@ -87,6 +91,8 @@ pub struct PrPane {
     list_gen: u64,
     /// Bumped on every detail load so stale detail responses are dropped.
     detail_gen: u64,
+    /// Bumped on every create submission so stale responses never clobber newer state.
+    create_gen: u64,
     // Create PR/MR form state
     create_base_remote: Option<String>,
     create_title: Entity<TextEditor>,
@@ -116,10 +122,11 @@ impl PrPane {
         Self {
             session,
             service: None,
-            service_error: None,
             accounts_view: None,
             mode: Mode::Browse,
+            return_mode: Mode::Browse,
             remotes: Vec::new(),
+            configured_upstream: None,
             preferred_remote: None,
             filter: PrFilter::Open,
             search,
@@ -127,6 +134,7 @@ impl PrPane {
             active: false,
             list_gen: 0,
             detail_gen: 0,
+            create_gen: 0,
             create_base_remote: None,
             create_title,
             create_base,
@@ -146,7 +154,11 @@ impl PrPane {
     pub fn open_create(&mut self, cx: &mut Context<Self>) {
         self.active = true;
         self.mode = Mode::Create;
-        self.create_state = CreateState::Idle;
+        // Preserve an in-flight submission so reopening Create never permits
+        // a duplicate POST or drops the pending result.
+        if !matches!(self.create_state, CreateState::Submitting) {
+            self.create_state = CreateState::Idle;
+        }
         self.prefill_create_form(cx);
         self.ensure_service_and_reload(cx);
     }
@@ -157,35 +169,45 @@ impl PrPane {
         self.detail_gen += 1;
     }
 
-    fn ensure_service(&mut self) -> Option<ForgeService> {
-        if let Some(service) = &self.service {
-            return Some(service.clone());
+    fn open_accounts(&mut self, cx: &mut Context<Self>) {
+        if self.mode != Mode::Accounts {
+            self.return_mode = self.mode;
         }
-        match open_service() {
-            Ok(service) => {
-                self.service = Some(service.clone());
-                self.service_error = None;
-                Some(service)
-            }
-            Err(error) => {
-                self.service_error = Some(error.user_message());
-                None
-            }
+        if let Some(service) = self.service.clone() {
+            self.show_accounts_view(service, cx);
+            return;
         }
+        self.mode = Mode::Accounts;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let opened = cx
+                .background_executor()
+                .spawn(async move { open_service() })
+                .await;
+            this.update(cx, |this, cx| match opened {
+                Ok(service) => {
+                    this.service = Some(service.clone());
+                    this.show_accounts_view(service, cx);
+                }
+                Err(error) => {
+                    this.mode = this.return_mode;
+                    this.phase = LoadPhase::Unavailable(error.user_message());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
-    fn open_accounts(&mut self, cx: &mut Context<Self>) {
-        let Some(service) = self.ensure_service() else {
-            cx.notify();
-            return;
-        };
+    fn show_accounts_view(&mut self, service: ForgeService, cx: &mut Context<Self>) {
         let view = cx.new(|cx| AccountsView::new(service, cx));
         let sub = cx.subscribe(&view, |this, _, event: &AccountsEvent, cx| match event {
             AccountsEvent::Changed => {
                 this.ensure_service_and_reload(cx);
             }
             AccountsEvent::Closed => {
-                this.mode = Mode::Browse;
+                this.mode = this.return_mode;
                 this.accounts_view = None;
                 this.ensure_service_and_reload(cx);
             }
@@ -197,46 +219,69 @@ impl PrPane {
     }
 
     fn ensure_service_and_reload(&mut self, cx: &mut Context<Self>) {
-        let Some(service) = self.ensure_service() else {
-            let msg = self
-                .service_error
-                .clone()
-                .unwrap_or_else(|| "Forge service is unavailable.".into());
-            self.phase = LoadPhase::Unavailable(msg);
-            cx.notify();
-            return;
-        };
         self.list_gen += 1;
         self.detail_gen += 1;
         let generation = self.list_gen;
-        let paths = self.session.read(cx).discovered.paths.clone();
+        let existing_service = self.service.clone();
+        let (paths, current_branch) = {
+            let session = self.session.read(cx);
+            let branch = session.state.snapshot.disk().and_then(|d| match &d.head {
+                Head::Branch { name, .. } => Some(name.0.clone()),
+                _ => None,
+            });
+            (session.discovered.paths.clone(), branch)
+        };
         let preferred = self.preferred_remote.clone();
         let filter = self.filter;
         self.phase = LoadPhase::Loading;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let loaded = cx
-                .background_executor()
-                .spawn(async move {
-                    service.reload();
-                    let remotes = read_remotes(&paths).map_err(LoadErr::Unavailable)?;
-                    let book = service.book();
-                    let target = resolve_remote_for_list(&remotes, preferred.as_deref(), &book)
-                        .map_err(|e| LoadErr::Target(remotes.clone(), e))?;
-                    let listing = service
-                        .list_prs(&target.account.key(), &target.repo.path, filter, 1)
-                        .map_err(|e| LoadErr::Api(remotes.clone(), e))?;
-                    Ok::<_, LoadErr>((remotes, target, listing))
-                })
-                .await;
+            let loaded =
+                cx.background_executor()
+                    .spawn(async move {
+                        let service = match existing_service {
+                            Some(s) => s,
+                            None => open_service()
+                                .map_err(|e| LoadErr::Unavailable(e.user_message()))?,
+                        };
+                        service.reload();
+                        let remotes = read_remotes(&paths).map_err(LoadErr::Unavailable)?;
+                        let configured_upstream = current_branch
+                            .as_deref()
+                            .and_then(|b| read_branch_upstream(&paths, b));
+                        let book = service.book();
+                        let target = resolve_remote_for_list(&remotes, preferred.as_deref(), &book)
+                            .map_err(|e| {
+                                LoadErr::Target(
+                                    service.clone(),
+                                    remotes.clone(),
+                                    configured_upstream.clone(),
+                                    e,
+                                )
+                            })?;
+                        let listing = service
+                            .list_prs(&target.account.key(), &target.repo.path, filter, 1)
+                            .map_err(|e| {
+                                LoadErr::Api(
+                                    service.clone(),
+                                    remotes.clone(),
+                                    configured_upstream.clone(),
+                                    e,
+                                )
+                            })?;
+                        Ok::<_, LoadErr>((service, remotes, configured_upstream, target, listing))
+                    })
+                    .await;
             this.update(cx, |this, cx| {
                 if this.list_gen != generation {
                     return;
                 }
                 match loaded {
-                    Ok((remotes, target, listing)) => {
+                    Ok((service, remotes, configured_upstream, target, listing)) => {
+                        this.service = Some(service);
                         this.remotes = remotes;
+                        this.configured_upstream = configured_upstream;
                         let first = listing.prs.first().map(|p| p.number);
                         this.phase = LoadPhase::Ready(Box::new(ReadyState {
                             target,
@@ -254,8 +299,10 @@ impl PrPane {
                     Err(LoadErr::Unavailable(msg)) => {
                         this.phase = LoadPhase::Unavailable(msg);
                     }
-                    Err(LoadErr::Target(remotes, err)) => {
+                    Err(LoadErr::Target(service, remotes, configured_upstream, err)) => {
+                        this.service = Some(service);
                         this.remotes = remotes;
+                        this.configured_upstream = configured_upstream;
                         match err {
                             PrTargetError::NoAccount { .. }
                             | PrTargetError::ChooseAccount { .. } => {
@@ -268,8 +315,10 @@ impl PrPane {
                             }
                         }
                     }
-                    Err(LoadErr::Api(remotes, err)) => {
+                    Err(LoadErr::Api(service, remotes, configured_upstream, err)) => {
+                        this.service = Some(service);
                         this.remotes = remotes;
+                        this.configured_upstream = configured_upstream;
                         this.phase = LoadPhase::Failed {
                             reconnect: err.needs_reconnect(),
                             message: err.user_message(),
@@ -419,9 +468,10 @@ impl PrPane {
             return Err(PrTargetError::NotOnBranch);
         };
         let book = service.book();
-        resolve_create_target(
+        resolve_create_target_with_config(
             &self.remotes,
             disk,
+            self.configured_upstream.as_ref(),
             self.create_base_remote.as_deref(),
             &book,
         )
@@ -437,7 +487,13 @@ impl PrPane {
         let target = match self.current_create_target(cx) {
             Ok(t) => t,
             Err(err) => {
-                self.create_state = CreateState::Failed(target_error_text(&err));
+                self.create_state = CreateState::Failed {
+                    message: target_error_text(&err),
+                    reconnect: matches!(
+                        err,
+                        PrTargetError::NoAccount { .. } | PrTargetError::ChooseAccount { .. }
+                    ),
+                };
                 cx.notify();
                 return;
             }
@@ -448,11 +504,17 @@ impl PrPane {
         let input = match validate_create_pr(&title, &body, &base, self.create_draft, &target) {
             Ok(i) => i,
             Err(problem) => {
-                self.create_state = CreateState::Failed(create_problem_text(&problem).into());
+                self.create_state = CreateState::Failed {
+                    message: create_problem_text(&problem).into(),
+                    reconnect: false,
+                };
                 cx.notify();
                 return;
             }
         };
+        self.create_gen += 1;
+        let generation = self.create_gen;
+        let kind = target.account.kind;
         self.create_state = CreateState::Submitting;
         cx.notify();
 
@@ -462,6 +524,9 @@ impl PrPane {
                 .spawn(async move { service.create_pr(&target, &input) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.create_gen != generation {
+                    return;
+                }
                 match result {
                     Ok(pr) => {
                         this.create_title.update(cx, |ed, cx| ed.set_text("", cx));
@@ -471,7 +536,17 @@ impl PrPane {
                         this.ensure_service_and_reload(cx);
                     }
                     Err(err) => {
-                        this.create_state = CreateState::Failed(err.user_message());
+                        let (message, reconnect) =
+                            if kind == ForgeKind::GitLab && err == ForgeError::Forbidden {
+                                (
+                                    "GitLab refused merge request creation (HTTP 403). If this account was connected with `read_api`, reconnect it so it has the `api` scope."
+                                        .into(),
+                                    true,
+                                )
+                            } else {
+                                (err.user_message(), err.needs_reconnect())
+                            };
+                        this.create_state = CreateState::Failed { message, reconnect };
                     }
                 }
                 cx.notify();
@@ -484,8 +559,18 @@ impl PrPane {
 
 enum LoadErr {
     Unavailable(String),
-    Target(Vec<ConfiguredRemote>, PrTargetError),
-    Api(Vec<ConfiguredRemote>, ForgeError),
+    Target(
+        ForgeService,
+        Vec<ConfiguredRemote>,
+        Option<BranchUpstream>,
+        PrTargetError,
+    ),
+    Api(
+        ForgeService,
+        Vec<ConfiguredRemote>,
+        Option<BranchUpstream>,
+        ForgeError,
+    ),
 }
 
 fn guess_default_base(snapshot: &Snapshot) -> &'static str {
@@ -633,6 +718,7 @@ impl Render for PrPane {
         let create_entity = cx.entity();
         let mut toolbar = div()
             .flex()
+            .flex_wrap()
             .flex_none()
             .items_center()
             .gap(px(SPACE_2))
@@ -642,7 +728,13 @@ impl Render for PrPane {
             .border_b_1()
             .border_color(hsla(p.line))
             .child(filter_switch)
-            .child(div().w(px(220.)).child(self.search.clone()));
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(SIDEBAR - SPACE_4 * 2.0))
+                    .max_w(px(SIDEBAR))
+                    .child(self.search.clone()),
+            );
 
         if self.remotes.len() > 1 {
             let labels: Vec<SharedString> =
@@ -1133,42 +1225,6 @@ impl PrPane {
                         .text_color(hsla(p.ink_muted))
                         .child(format!("Source: {route} · Account: {}", t.account.label())),
                 );
-                if self.remotes.len() > 1 {
-                    let labels: Vec<SharedString> =
-                        self.remotes.iter().map(|r| r.name.clone().into()).collect();
-                    let active = self
-                        .remotes
-                        .iter()
-                        .position(|r| r.name == t.base_remote)
-                        .unwrap_or(0);
-                    let names: Vec<String> = self.remotes.iter().map(|r| r.name.clone()).collect();
-                    let rem_entity = cx.entity();
-                    card = card.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_2))
-                            .child(
-                                div()
-                                    .text_style(&TEXT_SMALL, cx)
-                                    .text_color(hsla(p.ink_muted))
-                                    .child("Target remote:"),
-                            )
-                            .child(Segmented::new(
-                                "pr-create-remote",
-                                labels,
-                                active,
-                                move |idx, _, cx| {
-                                    if let Some(name) = names.get(idx).cloned() {
-                                        rem_entity.update(cx, |pane, cx| {
-                                            pane.create_base_remote = Some(name);
-                                            cx.notify();
-                                        });
-                                    }
-                                },
-                            )),
-                    );
-                }
             }
             Err(err) => {
                 let mut banner = Banner::new(BannerKind::Warning, target_error_text(err));
@@ -1176,16 +1232,66 @@ impl PrPane {
                     err,
                     PrTargetError::NoAccount { .. } | PrTargetError::ChooseAccount { .. }
                 ) {
+                    let acc_btn = acc_entity.clone();
                     banner = banner.action(Button::new("pr-create-connect", "Accounts…").on_click(
-                        move |_, _, cx| acc_entity.update(cx, |pane, cx| pane.open_accounts(cx)),
+                        move |_, _, cx| acc_btn.update(cx, |pane, cx| pane.open_accounts(cx)),
                     ));
                 }
                 card = card.child(banner);
             }
         }
 
-        if let CreateState::Failed(msg) = &self.create_state {
-            card = card.child(Banner::new(BannerKind::Error, msg.clone()));
+        // Always keep the target remote selector visible when multiple remotes
+        // exist so the user can recover from a CrossHostMismatch selection.
+        if self.remotes.len() > 1 {
+            let labels: Vec<SharedString> =
+                self.remotes.iter().map(|r| r.name.clone().into()).collect();
+            let active_name = match &target {
+                Ok(t) => Some(t.base_remote.as_str()),
+                Err(_) => self.create_base_remote.as_deref(),
+            };
+            let active = active_name
+                .and_then(|name| self.remotes.iter().position(|r| r.name == name))
+                .unwrap_or(0);
+            let names: Vec<String> = self.remotes.iter().map(|r| r.name.clone()).collect();
+            let rem_entity = cx.entity();
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(SPACE_2))
+                    .child(
+                        div()
+                            .text_style(&TEXT_SMALL, cx)
+                            .text_color(hsla(p.ink_muted))
+                            .child("Target remote:"),
+                    )
+                    .child(Segmented::new(
+                        "pr-create-remote",
+                        labels,
+                        active,
+                        move |idx, _, cx| {
+                            if let Some(name) = names.get(idx).cloned() {
+                                rem_entity.update(cx, |pane, cx| {
+                                    pane.create_base_remote = Some(name);
+                                    cx.notify();
+                                });
+                            }
+                        },
+                    )),
+            );
+        }
+
+        if let CreateState::Failed { message, reconnect } = &self.create_state {
+            let mut banner = Banner::new(BannerKind::Error, message.clone());
+            if *reconnect {
+                let acc_btn = acc_entity.clone();
+                banner = banner.action(Button::new("pr-create-reconnect", "Reconnect…").on_click(
+                    move |_, _, cx| acc_btn.update(cx, |pane, cx| pane.open_accounts(cx)),
+                ));
+            }
+            card = card.child(banner);
         }
         if let CreateState::Created(pr) = &self.create_state {
             let url = pr.web_url.clone();
