@@ -620,7 +620,7 @@ fn the_gitlab_browser_flow_uses_pkce_and_checks_the_state() {
         assert_eq!(get("client_id"), "gl-client");
         assert_eq!(get("response_type"), "code");
         assert_eq!(get("code_challenge_method"), "S256");
-        assert_eq!(get("scope"), "read_api");
+        assert_eq!(get("scope"), "api");
         let redirect = get("redirect_uri");
         let local = redirect
             .strip_prefix("http://")
