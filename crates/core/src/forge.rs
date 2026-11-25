@@ -295,13 +295,24 @@ impl ForgeAccount {
     }
 }
 
-/// Where a remote address points: the host, and for web addresses
-/// (`http`/`https`) the port the request goes to. An `ssh://` or scp-style
-/// address has no web port: its port is the SSH server's, not the forge's.
+/// Where a remote address points: the host, and how git reaches it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteTarget {
     pub host: String,
-    pub web: Option<WebEndpoint>,
+    pub transport: Transport,
+}
+
+/// How git reaches a remote. Only SSH may go through a forge's alternate
+/// SSH host (`ssh.github.com`); every other transport names its server
+/// exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// `http` or `https`: the scheme and port count.
+    Web(WebEndpoint),
+    /// `ssh://` or scp-style `git@host:path`; the port is the SSH server's.
+    Ssh,
+    /// `git://` and anything else with a host.
+    Other,
 }
 
 /// The scheme and port a web request to a remote goes to.
@@ -363,7 +374,8 @@ pub fn remote_target(url: &str) -> Option<RemoteTarget> {
     if !host.is_ascii() || host.is_empty() {
         return None;
     }
-    let web = match scheme.as_deref() {
+    let transport = match scheme.as_deref() {
+        None | Some("ssh" | "git+ssh" | "ssh+git") => Transport::Ssh,
         Some(scheme @ ("http" | "https")) => {
             let https = scheme == "https";
             let port = match port_text {
@@ -377,11 +389,11 @@ pub fn remote_target(url: &str) -> Option<RemoteTarget> {
                 // An unreadable port matches no account.
                 Some(text) => text.parse::<u16>().unwrap_or(0),
             };
-            Some(WebEndpoint { https, port })
+            Transport::Web(WebEndpoint { https, port })
         }
-        _ => None,
+        Some(_) => Transport::Other,
     };
-    Some(RemoteTarget { host, web })
+    Some(RemoteTarget { host, transport })
 }
 
 /// The host of a remote address, lower case and without port or user, or
@@ -472,22 +484,24 @@ impl AccountBook {
 
     /// The account that serves `remote_url`.
     pub fn resolve(&self, remote_url: &str) -> Resolution {
-        let Some(RemoteTarget { host, web }) = remote_target(remote_url) else {
+        let Some(RemoteTarget { host, transport }) = remote_target(remote_url) else {
             return Resolution::LocalPath;
         };
         let matching: Vec<&ForgeAccount> = self
             .accounts
             .iter()
             .filter(|account| {
-                match web {
+                match transport {
                     // A web address names the server itself: no aliases.
-                    Some(web) => {
+                    Transport::Web(web) => {
                         account.host() == host
                             && web.https == account.origin.is_https()
                             && web.port == account.origin.port()
                     }
                     // The SSH-over-443 hosts are doors to the same forge.
-                    None => same_forge(account.host(), &host),
+                    Transport::Ssh => same_forge(account.host(), &host),
+                    // Any other transport names its server exactly.
+                    Transport::Other => account.host() == host,
                 }
             })
             .collect();
@@ -1077,6 +1091,30 @@ mod tests {
             "https://ssh.github.com/o/r.git",
             "https://ssh.github.com:443/o/r.git",
             "https://altssh.gitlab.com/o/r.git",
+        ] {
+            assert!(
+                matches!(book.resolve(url), Resolution::NoAccount { .. }),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_ssh_remotes_may_use_the_ssh_alias_hosts() {
+        let mut book = AccountBook::default();
+        book.add(account(ForgeKind::GitHub, "github.com", "ana"));
+        for url in [
+            "ssh://git@ssh.github.com:443/o/r.git",
+            "git+ssh://git@ssh.github.com/o/r.git",
+            "git@ssh.github.com:o/r.git",
+            "git://github.com/o/r.git",
+        ] {
+            assert!(matches!(book.resolve(url), Resolution::Use(_)), "{url}");
+        }
+        for url in [
+            "git://ssh.github.com/o/r.git",
+            "ftp://ssh.github.com/o/r.git",
+            "git://notgithub.com/o/r.git",
         ] {
             assert!(
                 matches!(book.resolve(url), Resolution::NoAccount { .. }),
