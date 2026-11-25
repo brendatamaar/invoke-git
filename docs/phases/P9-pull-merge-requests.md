@@ -7,8 +7,8 @@ Parallel-safe with: P4b, P5, P6, P7, P10, P11
 Memungkinkan user melihat daftar Pull Request (GitHub) dan Merge Request (GitLab / self-hosted) pada repo yang terhubung, men-checkout PR/MR secara lokal, serta membuat PR/MR baru dari branch aktif (termasuk tautan dari layar pre-push review).
 
 ## Tasks
-- [ ] Tulis unit/integration test mock HTTP untuk list PR/MR, detail & status review, pembuatan PR/MR, dan resolusi remote/branch target (termasuk fork) di `crates/shell/tests/forge_pr.rs`.
-- [ ] Implementasikan endpoint list PR/MR, create PR/MR, dan fetch/checkout ref PR/MR (`refs/pull/<n>/head` / `refs/merge-requests/<n>/head`) melalui git CLI dengan expected-ref guard.
+- [x] Tulis unit/integration test mock HTTP untuk list PR/MR, detail & status review, pembuatan PR/MR, dan resolusi remote/branch target (termasuk fork) di `crates/shell/tests/forge_pr.rs`.
+- [x] Implementasikan endpoint list PR/MR, create PR/MR, dan fetch/checkout ref PR/MR (`refs/pull/<n>/head` / `refs/merge-requests/<n>/head`) melalui git CLI dengan expected-ref guard.
 - [ ] Bangun panel daftar PR/MR & dialog Create PR/MR di `crates/ui/` dan `crates/app/` (terintegrasi setelah push di `crates/app/src/review_view.rs`) + Windows checklist di Handoff notes.
 
 ## Definition of Done

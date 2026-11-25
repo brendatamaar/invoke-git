@@ -163,6 +163,32 @@ impl Http {
         }
         finish(request)
     }
+
+    /// A JSON POST. Enforces the same URL, proxy, redirect and size rules as
+    /// `get` and `post_form`.
+    pub fn post_json(
+        &self,
+        url: &str,
+        body: String,
+        bearer: Option<&Secret>,
+        accept: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<HttpResponse, ForgeError> {
+        check_url(url)?;
+        let mut request = self
+            .client_for(url)
+            .post(url)
+            .header("Accept", accept)
+            .header("Content-Type", "application/json")
+            .body(body);
+        for (name, value) in extra {
+            request = request.header(*name, *value);
+        }
+        if let Some(token) = bearer {
+            request = request.header("Authorization", format!("Bearer {}", token.expose()));
+        }
+        finish(request)
+    }
 }
 
 fn check_url(url: &str) -> Result<(), ForgeError> {

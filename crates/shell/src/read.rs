@@ -364,3 +364,34 @@ fn count_only_on(
     }
     Ok(count)
 }
+
+/// P9: configured git remotes (name + fetch URL), read through `gix` without
+/// touching `index.lock`. Sorted by name so the UI order is deterministic.
+pub fn read_remotes(
+    paths: &RepoPaths,
+) -> Result<Vec<invoke_core::forge::ConfiguredRemote>, String> {
+    let repo = precondition::open(paths)?;
+    let mut names: Vec<String> = repo
+        .remote_names()
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    let mut remotes = Vec::new();
+    for name in names {
+        let Ok(remote) = repo.find_remote(name.as_str()) else {
+            continue;
+        };
+        let url = remote
+            .url(gix::remote::Direction::Fetch)
+            .or_else(|| remote.url(gix::remote::Direction::Push))
+            .map(|u| u.to_bstring().to_string());
+        if let Some(url) = url
+            && !url.trim().is_empty()
+        {
+            remotes.push(invoke_core::forge::ConfiguredRemote { name, url });
+        }
+    }
+    Ok(remotes)
+}

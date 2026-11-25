@@ -14,10 +14,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use invoke_core::forge::{
-    AccountBook, AuthMethod, ForgeAccount, ForgeKind, Origin, RemoteRepo, Resolution,
+    AccountBook, AuthMethod, CreatePrInput, ForgeAccount, ForgeKind, Origin, PrCreateTarget,
+    PrFilter, PullRequest, RemoteRepo, Resolution, ReviewStatus,
 };
 
-use super::api::{self, GitHubUrls, RepoPage};
+use super::api::{self, GitHubUrls, PrPage, RepoPage};
 use super::error::ForgeError;
 use super::http::Http;
 use super::secrets::{Credential, Secret, TokenStore};
@@ -99,6 +100,14 @@ impl Default for ServiceConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listing {
     pub repos: Vec<RemoteRepo>,
+    /// `Some` when the page limit stopped the listing early.
+    pub more: Option<String>,
+}
+
+/// Pull/merge requests listed so far, and where the rest would start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrListing {
+    pub prs: Vec<PullRequest>,
     /// `Some` when the page limit stopped the listing early.
     pub more: Option<String>,
 }
@@ -776,6 +785,237 @@ impl ForgeService {
             more: cursor,
         })
     }
+
+    // -- pull requests & merge requests (P9) ----------------------------------
+
+    /// Runs an authenticated call, refreshing an expired/rejected GitLab OAuth
+    /// token once before giving up.
+    fn with_token<T>(
+        &self,
+        key: &str,
+        call: impl Fn(&ForgeAccount, &Credential) -> Result<T, ForgeError>,
+    ) -> Result<T, ForgeError> {
+        let account = self.account(key)?;
+        let credential = self.credential(&account)?;
+        match call(&account, &credential) {
+            Err(ForgeError::Unauthorized) if credential.refresh.is_some() => {
+                let fresh = self.refresh(&account, &credential)?;
+                call(&account, &fresh)
+            }
+            other => other,
+        }
+    }
+
+    /// One page of pull/merge requests for `repo_path`.
+    pub fn list_prs_page(
+        &self,
+        key: &str,
+        repo_path: &str,
+        filter: PrFilter,
+        cursor: Option<&str>,
+    ) -> Result<PrPage, ForgeError> {
+        self.with_token(key, |account, credential| {
+            let mut page = match account.kind {
+                ForgeKind::GitHub => {
+                    let (owner, repo) = split_github_path(repo_path)?;
+                    api::github::list_prs_page(
+                        &self.inner.http,
+                        &self.inner.config.github.api,
+                        &credential.access,
+                        owner,
+                        repo,
+                        filter,
+                        cursor,
+                    )
+                }
+                ForgeKind::GitLab => api::gitlab::list_mrs_page(
+                    &self.inner.http,
+                    &account.origin,
+                    &credential.access,
+                    repo_path,
+                    filter,
+                    cursor,
+                ),
+            }?;
+            page.prs
+                .retain(|pr| !pr_contains_secret(pr, credential));
+            Ok(page)
+        })
+    }
+
+    /// Up to `max_pages` pages of pull/merge requests for `repo_path`.
+    pub fn list_prs(
+        &self,
+        key: &str,
+        repo_path: &str,
+        filter: PrFilter,
+        max_pages: usize,
+    ) -> Result<PrListing, ForgeError> {
+        let mut prs = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..max_pages.max(1) {
+            let page = self.list_prs_page(key, repo_path, filter, cursor.as_deref())?;
+            prs.extend(page.prs);
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(PrListing { prs, more: cursor })
+    }
+
+    /// Reads full detail and review/approval status for one PR/MR.
+    pub fn get_pr_detail(
+        &self,
+        key: &str,
+        repo_path: &str,
+        number: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        self.with_token(key, |account, credential| {
+            let mut pr = match account.kind {
+                ForgeKind::GitHub => {
+                    let (owner, repo) = split_github_path(repo_path)?;
+                    let mut pr = api::github::get_pr(
+                        &self.inner.http,
+                        &self.inner.config.github.api,
+                        &credential.access,
+                        owner,
+                        repo,
+                        number,
+                    )?;
+                    if let Ok(status) = api::github::list_pr_reviews(
+                        &self.inner.http,
+                        &self.inner.config.github.api,
+                        &credential.access,
+                        owner,
+                        repo,
+                        number,
+                    ) && status != ReviewStatus::None
+                    {
+                        pr.review_status = status;
+                    }
+                    pr
+                }
+                ForgeKind::GitLab => {
+                    let mut mr = api::gitlab::get_mr(
+                        &self.inner.http,
+                        &account.origin,
+                        &credential.access,
+                        repo_path,
+                        number,
+                    )?;
+                    if let Ok(status) = api::gitlab::get_mr_approvals(
+                        &self.inner.http,
+                        &account.origin,
+                        &credential.access,
+                        repo_path,
+                        number,
+                    ) && status == ReviewStatus::Approved
+                    {
+                        mr.review_status = status;
+                    }
+                    mr
+                }
+            };
+            if pr_contains_secret(&pr, credential) {
+                return Err(ForgeError::BadResponse("unusable pull request data"));
+            }
+            // Keep review_status consistent if draft.
+            if pr.draft && pr.review_status == ReviewStatus::None {
+                pr.review_status = ReviewStatus::Pending;
+            }
+            Ok(pr)
+        })
+    }
+
+    /// Creates a new Pull Request (GitHub) or Merge Request (GitLab), supporting
+    /// both same-repo and cross-repo (fork) targets.
+    pub fn create_pr(
+        &self,
+        target: &PrCreateTarget,
+        input: &CreatePrInput,
+    ) -> Result<PullRequest, ForgeError> {
+        let key = target.account.key();
+        self.with_token(&key, |account, credential| {
+            let pr = match account.kind {
+                ForgeKind::GitHub => {
+                    let (base_owner, base_repo) = split_github_path(&target.base_repo.path)?;
+                    let head = if target.is_fork {
+                        let (head_owner, _) = split_github_path(&target.head_repo.path)?;
+                        format!("{head_owner}:{}", target.head_branch)
+                    } else {
+                        target.head_branch.clone()
+                    };
+                    api::github::create_pr(
+                        &self.inner.http,
+                        &self.inner.config.github.api,
+                        &credential.access,
+                        base_owner,
+                        base_repo,
+                        &head,
+                        input,
+                    )?
+                }
+                ForgeKind::GitLab => {
+                    let target_project_id = if target.is_fork {
+                        Some(api::gitlab::get_project_id(
+                            &self.inner.http,
+                            &account.origin,
+                            &credential.access,
+                            &target.base_repo.path,
+                        )?)
+                    } else {
+                        None
+                    };
+                    api::gitlab::create_mr(
+                        &self.inner.http,
+                        &account.origin,
+                        &credential.access,
+                        &target.head_repo.path,
+                        &target.head_branch,
+                        input,
+                        target_project_id,
+                    )?
+                }
+            };
+            if pr_contains_secret(&pr, credential) {
+                return Err(ForgeError::BadResponse("unusable pull request data"));
+            }
+            Ok(pr)
+        })
+    }
+}
+
+fn split_github_path(path: &str) -> Result<(&str, &str), ForgeError> {
+    let mut parts = path.split('/');
+    let owner = parts.next().unwrap_or("");
+    let repo = parts.next().unwrap_or("");
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return Err(ForgeError::BadResponse("invalid repository path"));
+    }
+    Ok((owner, repo))
+}
+
+fn pr_contains_secret(pr: &PullRequest, credential: &Credential) -> bool {
+    let secrets: Vec<String> = std::iter::once(&credential.access)
+        .chain(credential.refresh.as_ref())
+        .map(|s| s.expose().to_ascii_lowercase())
+        .collect();
+    let fields = [
+        Some(pr.title.as_str()),
+        Some(pr.body.as_str()),
+        Some(pr.author.as_str()),
+        Some(pr.head_branch.as_str()),
+        pr.head_repo.as_deref(),
+        pr.head_sha.as_deref(),
+        Some(pr.base_branch.as_str()),
+        Some(pr.web_url.as_str()),
+        pr.updated_at.as_deref(),
+    ];
+    fields.into_iter().flatten().any(|field| {
+        let lower = field.to_ascii_lowercase();
+        secrets.iter().any(|secret| lower.contains(secret))
+    })
 }
 
 /// The working list held for a change. Fields drop in order: the lock file

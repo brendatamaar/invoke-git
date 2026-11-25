@@ -24,8 +24,10 @@ pub mod secrets;
 pub mod service;
 pub mod signin;
 
-pub use api::{GitHubUrls, RepoPage};
+pub use api::{GitHubUrls, PrPage, RepoPage};
 pub use error::ForgeError;
 pub use secrets::{Credential, KeyringStore, MemoryStore, Secret, TokenStore};
-pub use service::{ClientIds, ForgeService, GITLAB_LOOPBACK_PORT, Listing, ServiceConfig};
+pub use service::{
+    ClientIds, ForgeService, GITLAB_LOOPBACK_PORT, Listing, PrListing, ServiceConfig,
+};
 pub use signin::SignInRunner;

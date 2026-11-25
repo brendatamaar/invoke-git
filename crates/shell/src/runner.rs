@@ -397,12 +397,25 @@ impl Job {
                 return OpOutcome::Failed(failure);
             }
         }
-        // Task 23: a request is one git run, except taking a side whole,
-        // which is two; it stops at the first one that fails.
+        // Task 23: a request is one git run, except taking a side whole and
+        // P9 PR checkout, which are two; it stops at the first one that fails.
         let mut outcome = OpOutcome::Succeeded;
-        for run in invocations(&self.args) {
+        for (step_idx, run) in invocations(&self.args).into_iter().enumerate() {
             if self.cancelled() {
                 return OpOutcome::Cancelled;
+            }
+            // P9: after the network fetch of a PR/MR ref, re-verify HEAD,
+            // index, `index.lock`, and that `local_branch` still does not exist
+            // before creating and switching to it.
+            if step_idx > 0 && matches!(self.args, GitArgs::CheckoutPr { .. }) {
+                if let Err(failure) = precondition::check(&self.paths, &self.expect) {
+                    return OpOutcome::Failed(failure);
+                }
+                if let Err(failure) =
+                    precondition::check_refs(&self.paths, &self.args.expected_refs())
+                {
+                    return OpOutcome::Failed(failure);
+                }
             }
             outcome = self.run_one(run);
             if outcome != OpOutcome::Succeeded {

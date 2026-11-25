@@ -7,7 +7,9 @@
 //! particular, a clone address must be http(s): git would run a command for
 //! `ext::` addresses.
 
-use invoke_core::forge::{Origin, RemoteRepo, Visibility};
+use invoke_core::forge::{
+    CreatePrInput, Origin, PrFilter, PrState, PullRequest, RemoteRepo, ReviewStatus, Visibility,
+};
 
 use super::codec::{form_body, next_link, pct_encode};
 use super::error::{ForgeError, clean_code};
@@ -15,14 +17,16 @@ use super::http::{Http, HttpResponse, origin_of_url, status_error};
 use super::json::Json;
 use super::secrets::{Credential, Secret};
 
-/// What the app asks GitHub for: private repositories need `repo`.
+/// What the app asks GitHub for: private repositories and PRs need `repo`.
 pub const GITHUB_SCOPE: &str = "repo";
-/// What the app asks GitLab for: read access to the API (the repo list).
-/// Creating merge requests (P9) will need `api`.
-pub const GITLAB_SCOPE: &str = "read_api";
+/// What the app asks GitLab for: `api` covers listing projects, listing MRs,
+/// and creating MRs (upgraded from `read_api` in P9).
+pub const GITLAB_SCOPE: &str = "api";
 
 /// Repositories asked for per page (both forges cap at 100).
 const PAGE_SIZE: u32 = 100;
+/// Pull/merge requests asked for per page.
+const PR_PAGE_SIZE: u32 = 50;
 
 /// Where GitHub's pieces live. `Default` is github.com; tests aim it at a
 /// local server.
@@ -47,6 +51,14 @@ impl Default for GitHubUrls {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoPage {
     pub repos: Vec<RemoteRepo>,
+    /// An address on the same server, or `None` at the end.
+    pub next: Option<String>,
+}
+
+/// One page of pull/merge requests and where the next one is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrPage {
+    pub prs: Vec<PullRequest>,
     /// An address on the same server, or `None` at the end.
     pub next: Option<String>,
 }
@@ -141,6 +153,27 @@ fn api_get(
         Some(error) => Err(error),
         None => Ok(response),
     }
+}
+
+fn api_post_json(
+    http: &Http,
+    url: &str,
+    body: &Json,
+    token: &Secret,
+    accept: &str,
+    extra: &[(&str, &str)],
+) -> Result<HttpResponse, ForgeError> {
+    let response = http.post_json(url, body.encode(), Some(token), accept, extra)?;
+    match status_error(&response) {
+        Some(error) => Err(error),
+        None => Ok(response),
+    }
+}
+
+/// A web URL returned by a forge (e.g. a PR page): must be https or loopback,
+/// with no userinfo, whitespace or control characters.
+fn web_url_ok(url: &str) -> bool {
+    !url.starts_with('-') && origin_of_url(url).is_some_and(|o| o.is_secure())
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +335,215 @@ pub mod github {
                 .map(str::to_owned),
         })
     }
+
+    pub fn list_prs_page(
+        http: &Http,
+        api: &str,
+        token: &Secret,
+        owner: &str,
+        repo: &str,
+        filter: PrFilter,
+        cursor: Option<&str>,
+    ) -> Result<PrPage, ForgeError> {
+        let url = match cursor {
+            Some(cursor) if same_origin(cursor, api) => cursor.to_owned(),
+            Some(_) => return Err(ForgeError::InsecureUrl),
+            None => format!(
+                "{api}/repos/{}/{}/pulls?state={}&sort=updated&direction=desc&per_page={PR_PAGE_SIZE}",
+                pct_encode(owner),
+                pct_encode(repo),
+                filter.github_param()
+            ),
+        };
+        let response = api_get(http, &url, token, ACCEPT, &GITHUB_HEADERS)?;
+        let json = parse_json(&response)?;
+        let items = json
+            .as_array()
+            .ok_or(ForgeError::BadResponse("not a list"))?;
+        Ok(PrPage {
+            prs: items.iter().filter_map(parse_pr).collect(),
+            next: next_page(&response, api),
+        })
+    }
+
+    pub fn get_pr(
+        http: &Http,
+        api: &str,
+        token: &Secret,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        let url = format!(
+            "{api}/repos/{}/{}/pulls/{number}",
+            pct_encode(owner),
+            pct_encode(repo)
+        );
+        let response = api_get(http, &url, token, ACCEPT, &GITHUB_HEADERS)?;
+        let json = parse_json(&response)?;
+        parse_pr(&json).ok_or(ForgeError::BadResponse("invalid pull request"))
+    }
+
+    /// Aggregates GitHub PR reviews by taking each reviewer's latest decisive
+    /// state (`CHANGES_REQUESTED` > `APPROVED` > `COMMENTED` > `PENDING`).
+    pub fn list_pr_reviews(
+        http: &Http,
+        api: &str,
+        token: &Secret,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<ReviewStatus, ForgeError> {
+        let url = format!(
+            "{api}/repos/{}/{}/pulls/{number}/reviews?per_page=100",
+            pct_encode(owner),
+            pct_encode(repo)
+        );
+        let response = api_get(http, &url, token, ACCEPT, &GITHUB_HEADERS)?;
+        let json = parse_json(&response)?;
+        let items = json
+            .as_array()
+            .ok_or(ForgeError::BadResponse("not a list"))?;
+        Ok(summarize_github_reviews(items))
+    }
+
+    pub fn create_pr(
+        http: &Http,
+        api: &str,
+        token: &Secret,
+        owner: &str,
+        repo: &str,
+        head: &str,
+        input: &CreatePrInput,
+    ) -> Result<PullRequest, ForgeError> {
+        let url = format!(
+            "{api}/repos/{}/{}/pulls",
+            pct_encode(owner),
+            pct_encode(repo)
+        );
+        let payload = Json::Object(vec![
+            ("title".into(), Json::Str(input.title.clone())),
+            ("body".into(), Json::Str(input.body.clone())),
+            ("head".into(), Json::Str(head.to_owned())),
+            ("base".into(), Json::Str(input.base_branch.clone())),
+            ("draft".into(), Json::Bool(input.draft)),
+        ]);
+        let response = api_post_json(http, &url, &payload, token, ACCEPT, &GITHUB_HEADERS)?;
+        let json = parse_json(&response)?;
+        parse_pr(&json).ok_or(ForgeError::BadResponse("invalid pull request"))
+    }
+
+    pub(super) fn parse_pr(item: &Json) -> Option<PullRequest> {
+        let number = item.get("number").and_then(Json::as_u64).filter(|n| *n > 0)?;
+        let title = item.str_field("title")?.to_owned();
+        let web_url = item.str_field("html_url")?.to_owned();
+        if title.is_empty() || !web_url_ok(&web_url) {
+            return None;
+        }
+        let merged = item
+            .get("merged_at")
+            .and_then(Json::as_str)
+            .is_some_and(|s| !s.is_empty())
+            || item.get("merged").and_then(Json::as_bool) == Some(true);
+        let state = if merged {
+            PrState::Merged
+        } else {
+            match item.str_field("state") {
+                Some("open") => PrState::Open,
+                Some("closed") => PrState::Closed,
+                _ => return None,
+            }
+        };
+        let draft = item.get("draft").and_then(Json::as_bool).unwrap_or(false);
+        let author = item
+            .get("user")
+            .and_then(|u| u.str_field("login"))
+            .unwrap_or("unknown")
+            .to_owned();
+        let head = item.get("head")?;
+        let head_branch = head.str_field("ref")?.to_owned();
+        let head_repo = head
+            .get("repo")
+            .and_then(|r| r.str_field("full_name"))
+            .map(str::to_owned);
+        let head_sha = head.str_field("sha").map(str::to_owned);
+        let base_branch = item.get("base")?.str_field("ref")?.to_owned();
+        let comments_count = match (
+            item.get("comments").and_then(Json::as_u64),
+            item.get("review_comments").and_then(Json::as_u64),
+        ) {
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let mergeable = item.get("mergeable").and_then(Json::as_bool);
+        let review_status = if item
+            .get("requested_reviewers")
+            .and_then(Json::as_array)
+            .is_some_and(|r| !r.is_empty())
+        {
+            ReviewStatus::Pending
+        } else {
+            ReviewStatus::None
+        };
+        Some(PullRequest {
+            number,
+            title,
+            body: item.str_field("body").unwrap_or_default().to_owned(),
+            state,
+            draft,
+            author,
+            head_branch,
+            head_repo,
+            head_sha,
+            base_branch,
+            web_url,
+            updated_at: item.str_field("updated_at").map(str::to_owned),
+            review_status,
+            comments_count,
+            mergeable,
+        })
+    }
+
+    pub(super) fn summarize_github_reviews(items: &[Json]) -> ReviewStatus {
+        use std::collections::BTreeMap;
+        let mut latest_by_user: BTreeMap<String, &str> = BTreeMap::new();
+        let mut any_comment = false;
+        let mut any_pending = false;
+        for item in items {
+            let Some(state) = item.str_field("state") else {
+                continue;
+            };
+            let user = item
+                .get("user")
+                .and_then(|u| u.str_field("login"))
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            match state {
+                "APPROVED" | "CHANGES_REQUESTED" => {
+                    latest_by_user.insert(user, state);
+                }
+                "DISMISSED" => {
+                    latest_by_user.remove(&user);
+                }
+                "COMMENTED" => any_comment = true,
+                "PENDING" => any_pending = true,
+                _ => {}
+            }
+        }
+        if latest_by_user.values().any(|s| *s == "CHANGES_REQUESTED") {
+            ReviewStatus::ChangesRequested
+        } else if latest_by_user.values().any(|s| *s == "APPROVED") {
+            ReviewStatus::Approved
+        } else if any_comment {
+            ReviewStatus::Commented
+        } else if any_pending {
+            ReviewStatus::Pending
+        } else {
+            ReviewStatus::None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +680,190 @@ pub mod gitlab {
             updated_at: item.str_field("last_activity_at").map(str::to_owned),
         })
     }
+
+    pub fn list_mrs_page(
+        http: &Http,
+        origin: &Origin,
+        token: &Secret,
+        project_path: &str,
+        filter: PrFilter,
+        cursor: Option<&str>,
+    ) -> Result<PrPage, ForgeError> {
+        let url = match cursor {
+            Some(cursor) if same_origin(cursor, origin.as_str()) => cursor.to_owned(),
+            Some(_) => return Err(ForgeError::InsecureUrl),
+            None => format!(
+                "{}/api/v4/projects/{}/merge_requests?state={}&order_by=updated_at&sort=desc&per_page={PR_PAGE_SIZE}",
+                origin.as_str(),
+                pct_encode(project_path),
+                filter.gitlab_param()
+            ),
+        };
+        let response = api_get(http, &url, token, ACCEPT, &[])?;
+        let json = parse_json(&response)?;
+        let items = json
+            .as_array()
+            .ok_or(ForgeError::BadResponse("not a list"))?;
+        Ok(PrPage {
+            prs: items.iter().filter_map(parse_mr).collect(),
+            next: next_page(&response, origin.as_str()),
+        })
+    }
+
+    pub fn get_mr(
+        http: &Http,
+        origin: &Origin,
+        token: &Secret,
+        project_path: &str,
+        iid: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        let url = format!(
+            "{}/api/v4/projects/{}/merge_requests/{iid}",
+            origin.as_str(),
+            pct_encode(project_path)
+        );
+        let response = api_get(http, &url, token, ACCEPT, &[])?;
+        let json = parse_json(&response)?;
+        parse_mr(&json).ok_or(ForgeError::BadResponse("invalid merge request"))
+    }
+
+    pub fn get_mr_approvals(
+        http: &Http,
+        origin: &Origin,
+        token: &Secret,
+        project_path: &str,
+        iid: u64,
+    ) -> Result<ReviewStatus, ForgeError> {
+        let url = format!(
+            "{}/api/v4/projects/{}/merge_requests/{iid}/approvals",
+            origin.as_str(),
+            pct_encode(project_path)
+        );
+        let response = api_get(http, &url, token, ACCEPT, &[])?;
+        let json = parse_json(&response)?;
+        let approved = json.get("approved").and_then(Json::as_bool) == Some(true)
+            || json
+                .get("approved_by")
+                .and_then(Json::as_array)
+                .is_some_and(|a| !a.is_empty());
+        if approved {
+            Ok(ReviewStatus::Approved)
+        } else {
+            Ok(ReviewStatus::Pending)
+        }
+    }
+
+    pub fn get_project_id(
+        http: &Http,
+        origin: &Origin,
+        token: &Secret,
+        project_path: &str,
+    ) -> Result<u64, ForgeError> {
+        let url = format!(
+            "{}/api/v4/projects/{}",
+            origin.as_str(),
+            pct_encode(project_path)
+        );
+        let response = api_get(http, &url, token, ACCEPT, &[])?;
+        let json = parse_json(&response)?;
+        json.get("id")
+            .and_then(Json::as_u64)
+            .ok_or(ForgeError::BadResponse("no project id"))
+    }
+
+    pub fn create_mr(
+        http: &Http,
+        origin: &Origin,
+        token: &Secret,
+        source_project_path: &str,
+        source_branch: &str,
+        input: &CreatePrInput,
+        target_project_id: Option<u64>,
+    ) -> Result<PullRequest, ForgeError> {
+        let url = format!(
+            "{}/api/v4/projects/{}/merge_requests",
+            origin.as_str(),
+            pct_encode(source_project_path)
+        );
+        let title = if input.draft && !input.title.starts_with("Draft:") {
+            format!("Draft: {}", input.title)
+        } else {
+            input.title.clone()
+        };
+        let mut fields = vec![
+            ("title".into(), Json::Str(title)),
+            ("description".into(), Json::Str(input.body.clone())),
+            ("source_branch".into(), Json::Str(source_branch.to_owned())),
+            ("target_branch".into(), Json::Str(input.base_branch.clone())),
+        ];
+        if let Some(id) = target_project_id {
+            fields.push(("target_project_id".into(), Json::Number(id as f64)));
+        }
+        let payload = Json::Object(fields);
+        let response = api_post_json(http, &url, &payload, token, ACCEPT, &[])?;
+        let json = parse_json(&response)?;
+        parse_mr(&json).ok_or(ForgeError::BadResponse("invalid merge request"))
+    }
+
+    pub(super) fn parse_mr(item: &Json) -> Option<PullRequest> {
+        let number = item.get("iid").and_then(Json::as_u64).filter(|n| *n > 0)?;
+        let title = item.str_field("title")?.to_owned();
+        let web_url = item.str_field("web_url")?.to_owned();
+        if title.is_empty() || !web_url_ok(&web_url) {
+            return None;
+        }
+        let state = match item.str_field("state") {
+            Some("opened") => PrState::Open,
+            Some("merged") => PrState::Merged,
+            Some("closed") => PrState::Closed,
+            _ => return None,
+        };
+        let draft = item.get("draft").and_then(Json::as_bool).unwrap_or(false)
+            || item
+                .get("work_in_progress")
+                .and_then(Json::as_bool)
+                .unwrap_or(false)
+            || title.starts_with("Draft:");
+        let author = item
+            .get("author")
+            .and_then(|a| a.str_field("username"))
+            .unwrap_or("unknown")
+            .to_owned();
+        let head_branch = item.str_field("source_branch")?.to_owned();
+        let base_branch = item.str_field("target_branch")?.to_owned();
+        let head_sha = item.str_field("sha").map(str::to_owned);
+        let comments_count = item.get("user_notes_count").and_then(Json::as_u64);
+        let mergeable = item
+            .get("has_conflicts")
+            .and_then(Json::as_bool)
+            .map(|conflicts| !conflicts);
+        let review_status = if item
+            .get("reviewers")
+            .and_then(Json::as_array)
+            .is_some_and(|r| !r.is_empty())
+        {
+            ReviewStatus::Pending
+        } else {
+            ReviewStatus::None
+        };
+        Some(PullRequest {
+            number,
+            title,
+            body: item.str_field("description").unwrap_or_default().to_owned(),
+            state,
+            draft,
+            author,
+            head_branch,
+            head_repo: None,
+            head_sha,
+            base_branch,
+            web_url,
+            updated_at: item.str_field("updated_at").map(str::to_owned),
+            review_status,
+            comments_count,
+            mergeable,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -530,7 +956,7 @@ mod tests {
             "state=st%26te",
             "code_challenge=chal",
             "code_challenge_method=S256",
-            "scope=read_api",
+            "scope=api",
         ] {
             assert!(url.contains(part), "{part} in {url}");
         }
