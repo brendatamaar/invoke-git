@@ -56,7 +56,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(restore: Saved, open: Vec<PathBuf>, cx: &mut Context<Self>) -> Self {
         let mut workspace = Self {
-            git: Git::detect("git"),
+            git: Git::detect_with_fallback(),
             tabs: Tabs::new(),
             active_repo: None,
             notice: None,
@@ -69,7 +69,7 @@ impl Workspace {
     }
 
     fn retry_setup(&mut self, cx: &mut Context<Self>) {
-        self.git = Git::detect("git");
+        self.git = Git::detect_with_fallback();
         cx.notify();
     }
 

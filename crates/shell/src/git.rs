@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::git_discovery::{self, GitSource};
 use invoke_core::{GitArgs, Operation, PullMode, RepoPath, ResetMode, Side};
 
 /// The oldest git Invoke Git supports (PRD → "Decisions").
@@ -28,6 +29,11 @@ pub enum SetupError {
     /// `git --version` printed something we do not understand.
     Unparseable(String),
     TooOld(GitVersion),
+    /// The system git is unusable and so is the bundled MinGit (P11).
+    FallbackFailed {
+        system: Box<SetupError>,
+        bundled: Box<SetupError>,
+    },
 }
 
 /// A usable system git.
@@ -35,6 +41,7 @@ pub enum SetupError {
 pub struct Git {
     program: PathBuf,
     version: GitVersion,
+    source: GitSource,
 }
 
 /// Parses `git --version` output, for example `git version 2.45.1.windows.1`
@@ -80,7 +87,52 @@ impl Git {
         if version < MIN_VERSION {
             return Err(SetupError::TooOld(version));
         }
-        Ok(Self { program, version })
+        Ok(Self {
+            program,
+            version,
+            source: GitSource::System,
+        })
+    }
+
+    /// The first system `git` on PATH that is new enough; otherwise the
+    /// MinGit bundled next to the app executable, if one is installed (P11).
+    /// A `git` inside the app's own folder never counts as system git.
+    pub fn detect_with_fallback() -> Result<Self, SetupError> {
+        let exe = std::env::current_exe().ok();
+        let app_dir = exe.as_deref().and_then(Path::parent);
+        let bundled = exe.as_deref().map(git_discovery::bundled_path);
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        let system =
+            git_discovery::system_candidates(&path_var, app_dir, cfg!(windows), &|p| p.is_file());
+        Self::resolve_with(&system, bundled.as_deref())
+    }
+
+    /// [`detect_with_fallback`](Self::detect_with_fallback) with the system
+    /// program and the bundled path given (tests use scripts).
+    pub fn detect_with_fallback_at(
+        system: &Path,
+        bundled: Option<&Path>,
+    ) -> Result<Self, SetupError> {
+        Self::resolve_with(&[system.to_path_buf()], bundled)
+    }
+
+    fn resolve_with(system: &[PathBuf], bundled: Option<&Path>) -> Result<Self, SetupError> {
+        let resolved = git_discovery::resolve(
+            system,
+            bundled,
+            &|program| Self::detect(program).map(|git| git.version),
+            &|path| path.is_file(),
+        )?;
+        Ok(Self {
+            program: resolved.program,
+            version: resolved.version,
+            source: resolved.source,
+        })
+    }
+
+    /// Whether this is the system git or the bundled fallback.
+    pub fn source(&self) -> GitSource {
+        self.source
     }
 
     pub fn version(&self) -> GitVersion {

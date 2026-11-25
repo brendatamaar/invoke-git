@@ -12,6 +12,7 @@ pub mod conflict;
 pub mod discard;
 pub mod discover;
 pub mod git;
+pub mod git_discovery;
 pub mod history;
 pub mod outgoing;
 pub mod precondition;
