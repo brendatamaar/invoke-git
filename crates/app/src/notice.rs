@@ -4,7 +4,8 @@
 
 use invoke_core::{
     Action, BranchRefusal, CommitRefusal, ConflictRefusal, ErrorClass, Failure, LfsRefusal, Notice,
-    OpOutcome, Refusal, SubmoduleRefusal, TagRefusal, UndoMoved, WorktreeRefusal,
+    OpOutcome, PrCheckoutRefusal, Refusal, SubmoduleRefusal, TagRefusal, UndoMoved,
+    WorktreeRefusal,
 };
 
 /// How to draw a notice.
@@ -57,6 +58,7 @@ fn action_name(action: Action) -> &'static str {
         Action::WorktreeRemove => "Remove worktree",
         Action::Submodule => "Submodule",
         Action::LfsPull => "Git LFS pull",
+        Action::CheckoutPr => "Checkout PR/MR",
         Action::RemoveLock => "Remove lock",
     }
 }
@@ -108,6 +110,26 @@ fn refusal_text(reason: &Refusal) -> String {
         Refusal::Worktree(problem) => worktree_text(problem),
         Refusal::Submodule(problem) => submodule_text(problem),
         Refusal::Lfs(problem) => lfs_text(problem),
+        Refusal::PrCheckout(problem) => pr_checkout_text(problem),
+    }
+}
+
+fn pr_checkout_text(problem: &PrCheckoutRefusal) -> String {
+    match problem {
+        PrCheckoutRefusal::InvalidRemote => "No valid remote was specified.".into(),
+        PrCheckoutRefusal::InvalidRef => "That is not a valid pull/merge request ref.".into(),
+        PrCheckoutRefusal::InvalidBranch(_) => "That is not a valid local branch name.".into(),
+        PrCheckoutRefusal::DirtyWorktree => {
+            "Commit, stash, or discard your local changes before checking out a pull/merge request."
+                .into()
+        }
+        PrCheckoutRefusal::BranchAlreadyExists(name) => format!(
+            "A local branch named {} already exists. Switch to or delete it first.",
+            name.0
+        ),
+        PrCheckoutRefusal::BranchNameConflict(name) => {
+            format!("{} conflicts with an existing branch name.", name.0)
+        }
     }
 }
 

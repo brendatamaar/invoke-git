@@ -31,6 +31,7 @@ use crate::discard::{self, Confirm, What};
 use crate::file_insights::{FileInsights, FileInsightsEvent, FileMode, FileVersion, file_actions};
 use crate::history_view::HistoryPane;
 use crate::notice::{self, Tone};
+use crate::pr_view::PrPane;
 use crate::rebase_view::{RebaseView, RebaseViewEvent, origin_label, paused_heading};
 use crate::reflog_pane::ReflogPane;
 use crate::review_view::{ReviewEvent, ReviewPane};
@@ -47,6 +48,8 @@ enum Page {
     Changes,
     History,
     Reflog,
+    /// Pull requests (GitHub) & merge requests (GitLab) (P9).
+    PullRequests,
     /// The pre-push review, opened by the Push button.
     Review,
     /// The resolver of a paused merge, rebase, cherry-pick or revert (task 23).
@@ -88,6 +91,7 @@ pub struct RepoView {
     tab_visible: bool,
     history: Entity<HistoryPane>,
     reflog: Entity<ReflogPane>,
+    pull_requests: Entity<PrPane>,
     file_insights: Entity<FileInsights>,
     commit: Entity<CommitBox>,
     branches: Entity<BranchPanel>,
@@ -150,6 +154,9 @@ impl RepoView {
         if self.page == Page::Review && page != Page::Review {
             self.review.update(cx, |review, _| review.close());
         }
+        if self.page == Page::PullRequests && page != Page::PullRequests {
+            self.pull_requests.update(cx, |prs, _| prs.close());
+        }
         if matches!(self.page, Page::FileInsights(_)) && !matches!(page, Page::FileInsights(_)) {
             self.file_insights
                 .update(cx, |insights, _| insights.close());
@@ -158,6 +165,9 @@ impl RepoView {
         self.sync_visibility(cx);
         if page == Page::Review {
             self.review.update(cx, |review, cx| review.open(cx));
+        }
+        if page == Page::PullRequests {
+            self.pull_requests.update(cx, |prs, cx| prs.open(cx));
         }
         if page == Page::History {
             self.history
@@ -184,6 +194,7 @@ impl RepoView {
         let diff = cx.new(|_| DiffView::new());
         let history = cx.new(|cx| HistoryPane::new(session.clone(), cx));
         let reflog = cx.new(|cx| ReflogPane::new(session.clone(), cx));
+        let pull_requests = cx.new(|cx| PrPane::new(session.clone(), cx));
         let reader = session.read(cx).blame.clone();
         let file_insights = cx.new(|_| FileInsights::new(reader));
         let commit = cx.new(|cx| CommitBox::new(session.clone(), cx));
@@ -195,6 +206,13 @@ impl RepoView {
         let rebase = cx.new(|cx| RebaseView::new(session.clone(), cx));
         cx.subscribe(&review, |this, _, event: &ReviewEvent, cx| match event {
             ReviewEvent::Back => this.show(Page::Changes, cx),
+            ReviewEvent::CreatePr => {
+                this.page = Page::PullRequests;
+                this.review.update(cx, |review, _| review.close());
+                this.sync_visibility(cx);
+                this.pull_requests.update(cx, |prs, cx| prs.open_create(cx));
+                cx.notify();
+            }
         })
         .detach();
         cx.subscribe(
@@ -262,6 +280,7 @@ impl RepoView {
             tab_visible: false,
             history,
             reflog,
+            pull_requests,
             file_insights,
             commit,
             branches,
@@ -796,6 +815,7 @@ impl Render for RepoView {
             ("Changes".into(), Page::Changes),
             ("History".into(), Page::History),
             ("Reflog".into(), Page::Reflog),
+            ("Pull Requests".into(), Page::PullRequests),
         ];
         if self.was_paused && !self.was_rebase_edit {
             page_tabs.push(("Conflicts".into(), Page::Conflicts));
@@ -954,6 +974,11 @@ impl Render for RepoView {
                 .flex_1()
                 .min_h(px(0.))
                 .child(self.reflog.clone()),
+            Page::PullRequests => div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .child(self.pull_requests.clone()),
             Page::FileInsights(_) => div()
                 .flex()
                 .flex_1()

@@ -42,6 +42,8 @@ const COUNTED_FILES: usize = 300;
 pub enum ReviewEvent {
     /// Leave the review for the Changes page.
     Back,
+    /// Open the Pull / Merge Request creation form for this branch (P9).
+    CreatePr,
 }
 
 struct Row {
@@ -748,10 +750,23 @@ impl Render for ReviewPane {
                 .and_then(sync::Plan::push_target)
                 .map(|target| sync::remote_text(&target))
                 .unwrap_or_else(|| "the remote".to_owned());
-            let button = back(cx).into_any_element();
+            let has_upstream = plan
+                .as_ref()
+                .is_some_and(|p| p.local.is_some() && p.upstream.is_some());
+            let pr_this = cx.entity();
+            let mut actions = div().flex().gap(px(SPACE_2)).child(back(cx));
+            if has_upstream {
+                actions = actions.child(
+                    Button::new("review-create-pr", "Create Pull / Merge Request")
+                        .primary()
+                        .on_click(move |_, _, cx| {
+                            pr_this.update(cx, |_, cx| cx.emit(ReviewEvent::CreatePr))
+                        }),
+                );
+            }
             return centered(
                 format!("Nothing to push. This branch has no commits that {target} lacks."),
-                Some(button),
+                Some(actions.into_any_element()),
                 cx,
             );
         }
