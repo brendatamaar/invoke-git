@@ -224,19 +224,13 @@ impl DiscardRunner {
         self.undo
             .save_entry(&discard_after_ref(op), path, after.as_ref())
             .map_err(bug)?;
+        let scratch = match scratch {
+            Some(scratch) => scratch,
+            None => precondition::ScratchDir::for_worktree(&self.paths).map_err(environment)?,
+        };
         lock.verify(&self.paths, expect)?;
-        if now()?.as_ref() != file {
-            return Err(changed());
-        }
-        if let (Some(staged), Some(scratch)) = (staged, scratch) {
-            install_or_keep(&staged, &full, scratch).map_err(|details| Failure {
-                class: ErrorClass::Environment,
-                details: format!("discard {}: {details}", path.0),
-            })?;
-        } else {
-            remove_leaf(&full).map_err(environment)?;
-        }
-        Ok(())
+        locate(&self.paths.workdir, path)?;
+        install_file(staged.as_deref(), &full, scratch, path, file, hash)
     }
 
     fn apply_outcome(
@@ -844,9 +838,8 @@ impl UndoRunner {
     }
 
     /// Undo of a discard: writes the saved content back, if the file still
-    /// holds what the discard left. All checks come before the first write.
+    /// holds what the discard left. Verify the moved entry before replacing it.
     pub(crate) fn restore_discard(&self, restore: &DiscardRestore) -> OpOutcome {
-        let stale = |details: String| failed(ErrorClass::PreconditionChanged, details);
         let path = &restore.path;
         let full = match worktree_path(&self.paths.workdir, path) {
             Ok(full) => full,
@@ -868,22 +861,27 @@ impl UndoRunner {
                 );
             }
         };
-        let check = || -> Result<(), String> {
-            worktree_path(&self.paths.workdir, path)?;
-            if file_version(&full, path, repo.object_hash())? != after {
-                return Err(format!(
-                    "{} changed after the discard. Undo requires the discarded version.",
-                    path.0
-                ));
+        let hash = repo.object_hash();
+        match version_on_disk(&full, path, hash) {
+            Ok(found) if found == after => {}
+            Ok(_) => {
+                return failed(
+                    ErrorClass::PreconditionChanged,
+                    format!(
+                        "{} changed after the discard. Undo requires the discarded version.",
+                        path.0
+                    ),
+                );
             }
-            Ok(())
-        };
-        if let Err(details) = check() {
-            return stale(details);
+            Err(failure) => return OpOutcome::Failed(failure),
         }
         let environment =
             |error: io::Error| failed(ErrorClass::Environment, format!("{}: {error}", path.0));
-        match saved {
+        let scratch = match precondition::ScratchDir::for_worktree(&self.paths) {
+            Ok(scratch) => scratch,
+            Err(error) => return environment(error),
+        };
+        let temporary = match saved {
             Some(file) => {
                 let object = match gix::ObjectId::from_hex(file.blob.as_hex().as_bytes())
                     .map_err(|error| error.to_string())
@@ -892,26 +890,29 @@ impl UndoRunner {
                     Ok(object) => object,
                     Err(details) => return failed(ErrorClass::Bug, details),
                 };
-                let scratch = match precondition::ScratchDir::for_worktree(&self.paths) {
-                    Ok(scratch) => scratch,
-                    Err(error) => return environment(error),
-                };
                 let temporary = scratch.0.join("file");
                 if let Err(error) = write_file(&temporary, &object.data, file.mode) {
                     return environment(error);
                 }
-                if let Err(details) = check() {
-                    return stale(details);
-                }
-                if let Err(details) = install_or_keep(&temporary, &full, scratch) {
-                    return failed(ErrorClass::Environment, format!("{}: {details}", path.0));
-                }
+                Some(temporary)
             }
-            None => {
-                if let Err(error) = remove_file_and_empty_dirs(&full, &self.paths.workdir) {
-                    return environment(error);
-                }
-            }
+            None => None,
+        };
+        if let Err(failure) = locate(&self.paths.workdir, path) {
+            return OpOutcome::Failed(failure);
+        }
+        if let Err(failure) = install_file(
+            temporary.as_deref(),
+            &full,
+            scratch,
+            path,
+            after.as_ref(),
+            hash,
+        ) {
+            return OpOutcome::Failed(failure);
+        }
+        if temporary.is_none() {
+            remove_empty_parents(&full, &self.paths.workdir);
         }
         OpOutcome::Succeeded
     }
@@ -1000,81 +1001,76 @@ fn write_file(temporary: &Path, bytes: &[u8], mode: WorktreeMode) -> io::Result<
     Ok(())
 }
 
-/// [`install_file`], keeping the scratch folder (and the user's previous
-/// file in it) when that file could not be put back.
-fn install_or_keep(
-    source: &Path,
+/// Move the current entry aside before inspecting its version. An atomic
+/// editor save before the move is verified, and one after it can create the
+/// path without being overwritten by checkout or rollback.
+fn install_file(
+    source: Option<&Path>,
     target: &Path,
     scratch: precondition::ScratchDir,
-) -> Result<(), String> {
-    match install_file(source, target, &scratch) {
-        Ok(()) => Ok(()),
-        Err(error @ InstallError::Stranded { .. }) => {
-            std::mem::forget(scratch);
-            Err(error.to_string())
-        }
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-/// Why `install_file` failed.
-#[derive(Debug)]
-enum InstallError {
-    /// Nothing changed at the target.
-    Failed(io::Error),
-    /// The target was moved aside and could not be put back: it is kept at
-    /// `kept`, and the scratch folder holding it must not be removed.
-    Stranded { error: io::Error, kept: PathBuf },
-}
-
-impl std::fmt::Display for InstallError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Failed(error) => write!(f, "{error}"),
-            Self::Stranded { error, kept } => write!(
-                f,
-                "{error}. The previous file could not be put back and is kept at {}",
-                kept.display()
-            ),
-        }
-    }
-}
-
-/// Moves `source` to `target`. Nothing is ever deleted here: Windows will
-/// not rename over a read-only file or a directory link, so such a target
-/// (and only such a one) is first moved aside into `scratch`, and moved back
-/// if the second rename fails too.
-fn install_file(
-    source: &Path,
-    target: &Path,
-    scratch: &precondition::ScratchDir,
-) -> Result<(), InstallError> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| InstallError::Failed(io::ErrorKind::InvalidInput.into()))?;
-    fs::create_dir_all(parent).map_err(InstallError::Failed)?;
-    let error = match fs::rename(source, target) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
+    path: &RepoPath,
+    expected: Option<&FileVersion>,
+    hash: gix::hash::Kind,
+) -> Result<(), Failure> {
+    let environment = |error: io::Error| Failure {
+        class: ErrorClass::Environment,
+        details: format!("{}: {error}", path.0),
     };
-    if !(error.kind() == io::ErrorKind::PermissionDenied && blocks_rename(target)) {
-        return Err(InstallError::Failed(error));
-    }
-    // The prepared checkout may itself be named "previous". A separate
-    // directory keeps the backup from replacing any checkout path.
-    let backup = precondition::ScratchDir::create(&scratch.0).map_err(InstallError::Failed)?;
-    let aside = backup.0.join("previous");
-    fs::rename(target, &aside).map_err(|_| InstallError::Failed(error))?;
-    match rename_into_vacant_path(source, target) {
-        Ok(()) => Ok(()),
-        Err(error) => match rename_into_vacant_path(&aside, target) {
-            Ok(()) => Err(InstallError::Failed(error)),
-            Err(_) => {
-                std::mem::forget(backup);
-                Err(InstallError::Stranded { error, kept: aside })
+    let changed = || Failure {
+        class: ErrorClass::PreconditionChanged,
+        details: format!("{} changed before replacement", path.0),
+    };
+    let install = |source| {
+        rename_into_vacant_path(source, target).map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists || fs::symlink_metadata(target).is_ok()
+            {
+                changed()
+            } else {
+                environment(error)
             }
-        },
+        })
+    };
+    if source.is_some() {
+        // The repository path was validated by the caller.
+        fs::create_dir_all(target.parent().expect("worktree file has a parent"))
+            .map_err(environment)?;
     }
+    let Some(expected) = expected else {
+        return match source {
+            Some(source) => install(source),
+            None if leaf(target, path)?.is_none() => Ok(()),
+            None => Err(changed()),
+        };
+    };
+
+    // A separate directory keeps the backup clear of every prepared path.
+    let backup = precondition::ScratchDir::create(&scratch.0).map_err(environment)?;
+    let aside = backup.0.join("previous");
+    rename_into_vacant_path(target, &aside).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            changed()
+        } else {
+            environment(error)
+        }
+    })?;
+    let result = match version_on_disk(&aside, path, hash) {
+        Ok(ref found) if found.as_ref() == Some(expected) => source.map_or(Ok(()), install),
+        Ok(_) => Err(changed()),
+        Err(failure) => Err(failure),
+    };
+    if let Err(mut failure) = result {
+        if let Err(error) = rename_into_vacant_path(&aside, target) {
+            // A newer file may already own the worktree path. Preserve both.
+            std::mem::forget(backup);
+            std::mem::forget(scratch);
+            failure.details.push_str(&format!(
+                ". The previous file is kept at {} because it could not be put back: {error}",
+                aside.display()
+            ));
+        }
+        return Err(failure);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1090,44 +1086,57 @@ fn rename_into_vacant_path(source: &Path, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rename_into_vacant_path(source: &Path, target: &Path) -> io::Result<()> {
-    fs::rename(source, target)
-}
-
-/// A target Windows refuses to be renamed over, though it may be moved: a
-/// read-only file, or a directory symlink or junction.
-#[cfg(windows)]
-fn blocks_rename(target: &Path) -> bool {
-    use std::os::windows::fs::FileTypeExt;
-    fs::symlink_metadata(target).is_ok_and(|metadata| {
-        metadata.file_type().is_symlink_dir()
-            || metadata.is_file() && metadata.permissions().readonly()
-    })
-}
-
-#[cfg(not(windows))]
-fn blocks_rename(_: &Path) -> bool {
-    false
-}
-
-fn remove_leaf(full: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileTypeExt;
-        if fs::symlink_metadata(full).is_ok_and(|m| m.file_type().is_symlink_dir()) {
-            return fs::remove_dir(full);
-        }
+    use std::ffi::{CString, c_char, c_int, c_uint};
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        #[cfg(target_os = "linux")]
+        fn renameat2(
+            old_dir: c_int,
+            old: *const c_char,
+            new_dir: c_int,
+            new: *const c_char,
+            flags: c_uint,
+        ) -> c_int;
+        #[cfg(target_os = "macos")]
+        fn renamex_np(old: *const c_char, new: *const c_char, flags: c_uint) -> c_int;
     }
-    match fs::remove_file(full) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        result => result,
+
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let target = CString::new(target.as_os_str().as_bytes())?;
+    // SAFETY: both paths are NUL-terminated and live through the call.
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        const AT_FDCWD: c_int = -100;
+        const RENAME_NOREPLACE: c_uint = 1;
+        renameat2(
+            AT_FDCWD,
+            source.as_ptr(),
+            AT_FDCWD,
+            target.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    // SAFETY: both paths are NUL-terminated and live through the call.
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        const RENAME_EXCL: c_uint = 4;
+        renamex_np(source.as_ptr(), target.as_ptr(), RENAME_EXCL)
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
-/// Removes the file, then the folders it leaves empty (up to the repo).
-fn remove_file_and_empty_dirs(full: &Path, workdir: &Path) -> io::Result<()> {
-    remove_leaf(full)?;
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn rename_into_vacant_path(_: &Path, _: &Path) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+fn remove_empty_parents(full: &Path, workdir: &Path) {
     let mut dir = full.parent();
     while let Some(current) = dir {
         if current == workdir || fs::remove_dir(current).is_err() {
@@ -1135,7 +1144,6 @@ fn remove_file_and_empty_dirs(full: &Path, workdir: &Path) -> io::Result<()> {
         }
         dir = current.parent();
     }
-    Ok(())
 }
 
 fn failed(class: ErrorClass, details: String) -> OpOutcome {
@@ -1297,10 +1305,20 @@ mod windows_tests {
                 set_read_only(&target, true);
             }
             let scratch = precondition::ScratchDir::create(&root).unwrap();
-            let result = install_file(&source, &target, &scratch);
+            let path = RepoPath(format!("target-{read_only}"));
+            let hash = gix::hash::Kind::Sha1;
+            let expected = file_version(&target, &path, hash).unwrap();
+            let result = install_file(
+                Some(&source),
+                &target,
+                scratch,
+                &path,
+                expected.as_ref(),
+                hash,
+            );
             outcomes.push((
                 read_only,
-                result.map_err(|error| error.to_string()),
+                result,
                 fs::read(&target).ok(),
                 fs::metadata(&target)
                     .map(|m| m.permissions().readonly())
@@ -1337,15 +1355,58 @@ mod windows_tests {
         let scratch = precondition::ScratchDir::create(&root).unwrap();
         let source = scratch.0.join("previous");
         fs::write(&source, b"new").unwrap();
-        let result = install_file(&source, &target, &scratch).map_err(|e| e.to_string());
+        let path = RepoPath("target".into());
+        let hash = gix::hash::Kind::Sha1;
+        let expected = file_version(&target, &path, hash).unwrap();
         let scratch_path = scratch.0.clone();
-        drop(scratch);
+        let result = install_file(
+            Some(&source),
+            &target,
+            scratch,
+            &path,
+            expected.as_ref(),
+            hash,
+        );
         let bytes = fs::read(&target).ok();
         let left = scratch_path.exists();
         let _ = fs::remove_dir_all(&root);
         assert_eq!(result, Ok(()));
         assert_eq!(bytes.as_deref(), Some(&b"new"[..]));
         assert!(!left, "the scratch folder was left behind");
+    }
+
+    #[test]
+    fn late_atomic_editor_save_survives_replacement_and_deletion() {
+        let root = temp_root("editor-save");
+        let target = root.join("target");
+        let path = RepoPath("target".into());
+        let hash = gix::hash::Kind::Sha1;
+        for replace in [true, false] {
+            let scratch = precondition::ScratchDir::create(&root).unwrap();
+            fs::write(&target, b"confirmed").unwrap();
+            let expected = file_version(&target, &path, hash).unwrap();
+            let editor = root.join("editor.tmp");
+            fs::write(&editor, b"new edit").unwrap();
+            fs::rename(&editor, &target).unwrap();
+            let source = scratch.0.join("checkout");
+            fs::write(&source, b"checkout").unwrap();
+            let failure = install_file(
+                replace.then_some(source.as_path()),
+                &target,
+                scratch,
+                &path,
+                expected.as_ref(),
+                hash,
+            )
+            .unwrap_err();
+            assert_eq!(failure.class, ErrorClass::PreconditionChanged);
+            assert_eq!(
+                fs::read(&target).ok().as_deref(),
+                Some(&b"new edit"[..]),
+                "replace={replace}, expected {expected:?}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
