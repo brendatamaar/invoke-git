@@ -13,7 +13,7 @@ use gpui::{
 };
 use invoke_core::forge::{ForgeAccount, RemoteRepo, Visibility, filter_repos};
 use shell::forge::{ForgeError, ForgeService};
-use tokens::{RADIUS_SM, ROW_LIST, SPACE_2, SPACE_3, TEXT_BODY, TEXT_SMALL};
+use tokens::{NAME_COLUMN, RADIUS_SM, ROW_LIST, SPACE_2, SPACE_3, TEXT_BODY, TEXT_SMALL};
 use ui::convert::hsla;
 use ui::{Banner, BannerKind, Button, EditorEvent, Segmented, TextEditor, TextStyleExt, ThemeExt};
 
@@ -301,7 +301,7 @@ impl Render for RepoPicker {
                             .child(
                                 div()
                                     .flex_none()
-                                    .max_w(px(260.))
+                                    .max_w(px(NAME_COLUMN))
                                     .truncate()
                                     .text_style(&TEXT_BODY, cx)
                                     .text_color(hsla(p.ink))
