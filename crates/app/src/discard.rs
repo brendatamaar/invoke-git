@@ -3,7 +3,9 @@
 //! for. Pure: the texts come from the diff as it is shown.
 
 use diff::{LineKind, TextDiff};
-use invoke_core::{Event, RepoPath};
+use invoke_core::{Event, FileAction, FileRequest, RepoPath};
+use shell::discard::FileInputs;
+use shell::precondition::RepoPaths;
 use ui::InputsMeta;
 
 use crate::staging::Part;
@@ -24,8 +26,8 @@ pub enum What {
     /// One request, already built from the diff on screen; the core refuses
     /// it if the index or the file changed meanwhile (rule 5).
     Request(Box<Event>),
-    /// Whole files, each read and requested in turn.
-    Files(Vec<RepoPath>),
+    /// Requests read before confirmation and delivered one at a time.
+    Files(Vec<Event>),
 }
 
 fn lines(count: usize) -> String {
@@ -33,6 +35,64 @@ fn lines(count: usize) -> String {
 }
 
 const UNDO: &str = "You can undo it.";
+
+fn whole_file(path: RepoPath, inputs: FileInputs) -> Confirm {
+    let (text, button) = match (inputs.tracked, inputs.file.is_some()) {
+        (false, _) => (format!("This deletes {}. {UNDO}", path.0), "Delete file"),
+        (true, false) => (
+            format!("This brings back {}, which you deleted. {UNDO}", path.0),
+            "Restore file",
+        ),
+        (true, true) => (
+            format!("This restores the staged version of {}. {UNDO}", path.0),
+            "Discard file",
+        ),
+    };
+    Confirm {
+        text,
+        button: button.into(),
+        what: What::Request(Box::new(file_event(path, inputs))),
+    }
+}
+
+fn file_event(path: RepoPath, inputs: FileInputs) -> Event {
+    Event::FileRequested(FileRequest {
+        path,
+        action: FileAction::Discard { file: inputs.file },
+        based_on: inputs.based_on,
+    })
+}
+
+pub fn prepare(paths: &RepoPaths, files: Vec<RepoPath>) -> Result<Confirm, String> {
+    let mut files = files
+        .into_iter()
+        .map(|path| {
+            let inputs = shell::discard::file_inputs(paths, &path)
+                .map_err(|error| format!("Cannot discard {}. {error}", path.0))?;
+            Ok((path, inputs))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if files
+        .windows(2)
+        .any(|pair| pair[0].1.based_on != pair[1].1.based_on)
+    {
+        return Err("The index changed while preparing the discard. Try again.".into());
+    }
+    if files.len() == 1 {
+        let (path, inputs) = files.remove(0);
+        return Ok(whole_file(path, inputs));
+    }
+    let (text, button) = describe_files(files.len());
+    let files = files
+        .into_iter()
+        .map(|(path, inputs)| file_event(path, inputs))
+        .collect();
+    Ok(Confirm {
+        text,
+        button,
+        what: What::Files(files),
+    })
+}
 
 /// The words for discarding `part` of `path`.
 pub fn describe(
@@ -98,12 +158,125 @@ pub fn describe_files(count: usize) -> (String, String) {
     )
 }
 
+/// The discard confirmation on screen, and the one being prepared off the
+/// main thread (the file list for Discard file / Discard all).
+///
+/// A preparation opens only if it is still the latest thing asked for: a
+/// newer preparation, a confirmation built on the spot, a cancel, or a new
+/// file on show (selection or clearing) all drop it. Diff reloads, which run
+/// on every watcher read, have their own count and never drop one.
+#[derive(Debug, Default)]
+pub struct Confirmation {
+    shown: Option<Confirm>,
+    ticket: u64,
+}
+
+impl Confirmation {
+    pub fn shown(&self) -> Option<&Confirm> {
+        self.shown.as_ref()
+    }
+
+    /// The user said yes: the confirmation leaves the screen.
+    pub fn take(&mut self) -> Option<Confirm> {
+        self.shown.take()
+    }
+
+    /// Shows a confirmation built now; nothing prepared earlier replaces it.
+    pub fn show(&mut self, confirm: Confirm) {
+        self.ticket += 1;
+        self.shown = Some(confirm);
+    }
+
+    /// Cancel, or the file on show changed: nothing stays on screen, and
+    /// nothing being prepared opens later for the wrong file.
+    pub fn clear(&mut self) {
+        self.ticket += 1;
+        self.shown = None;
+    }
+
+    /// A new preparation; its ticket goes back to [`Confirmation::finish`].
+    pub fn start(&mut self) -> u64 {
+        self.ticket += 1;
+        self.ticket
+    }
+
+    /// A preparation answered. `None` when it is no longer wanted (nothing
+    /// changes); otherwise the confirmation is shown, or the error is
+    /// handed back to report.
+    pub fn finish(
+        &mut self,
+        ticket: u64,
+        result: Result<Confirm, String>,
+    ) -> Option<Result<(), String>> {
+        if ticket != self.ticket {
+            return None;
+        }
+        Some(result.map(|confirm| self.shown = Some(confirm)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use diff::{DiffOptions, diff_text};
     use invoke_core::IndexId;
 
     use super::*;
+
+    fn confirm(button: &str) -> Confirm {
+        Confirm {
+            text: String::new(),
+            button: button.into(),
+            what: What::Files(Vec::new()),
+        }
+    }
+
+    fn button(confirmation: &Confirmation) -> Option<&str> {
+        confirmation.shown().map(|confirm| confirm.button.as_str())
+    }
+
+    /// Re-check: what the repo view does with a confirmation being
+    /// prepared, step by step: picking or clearing a file, a confirmation
+    /// built on the spot, a newer preparation and a cancel all drop it; a
+    /// diff reload (nothing happens here) does not.
+    #[test]
+    fn a_prepared_confirmation_opens_only_while_still_wanted() {
+        let mut view = Confirmation::default();
+        let ticket = view.start();
+        assert_eq!(view.finish(ticket, Ok(confirm("all"))), Some(Ok(())));
+        assert_eq!(button(&view), Some("all"));
+
+        // Another file is picked (or the list is cleared) while preparing.
+        let ticket = view.start();
+        view.clear();
+        assert_eq!(view.finish(ticket, Ok(confirm("stale"))), None);
+        assert_eq!(button(&view), None);
+        let ticket = view.start();
+        view.clear();
+        assert_eq!(view.finish(ticket, Err("stale error".into())), None);
+
+        // A hunk confirmation built on the spot wins over an older list.
+        let ticket = view.start();
+        view.show(confirm("hunk"));
+        assert_eq!(view.finish(ticket, Ok(confirm("stale"))), None);
+        assert_eq!(button(&view), Some("hunk"));
+
+        // Only the newest of two preparations opens.
+        let first = view.start();
+        let second = view.start();
+        assert_eq!(view.finish(first, Ok(confirm("first"))), None);
+        assert_eq!(
+            view.finish(second, Err("read failed".into())),
+            Some(Err("read failed".into()))
+        );
+        assert_eq!(button(&view), Some("hunk"));
+
+        // Yes takes it off the screen.
+        assert_eq!(
+            view.take().map(|confirm| confirm.button),
+            Some("hunk".into())
+        );
+        assert_eq!(button(&view), None);
+    }
 
     fn inputs(old: bool, new: bool) -> InputsMeta {
         InputsMeta {

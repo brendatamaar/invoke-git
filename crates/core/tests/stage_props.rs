@@ -234,6 +234,35 @@ fn a_failed_stage_leaves_no_undo_point() {
 }
 
 proptest! {
+    #[test]
+    fn whole_file_stage_and_unstage_are_guarded_and_snapshot_the_raw_index(
+        path in "[a-z]{1,12}",
+        current in any::<bool>(),
+        unstage in any::<bool>(),
+    ) {
+        let based_on = index('b');
+        let state = ready(disk(if current { based_on.clone() } else { index('c') }, LockState::Free));
+        let path = RepoPath(path);
+        let action = if unstage { FileAction::Unstage } else { FileAction::Stage };
+        let (_, commands) = step(state, Event::FileRequested(FileRequest {
+            action, path: path.clone(), based_on: based_on.clone(),
+        }));
+        if current {
+            let args = if unstage {
+                GitArgs::RestoreStagedPath(path)
+            } else {
+                GitArgs::AddPath(path)
+            };
+            let correct = matches!(commands.as_slice(),
+                [Command::SnapshotForUndo(point), Command::RunGit { args: actual, expect, .. }]
+                    if point.index == based_on && point.index_effect == IndexEffect::RestoreBytes
+                        && *actual == args && expect.index == based_on);
+            prop_assert!(correct, "{commands:?}");
+        } else {
+            prop_assert!(commands.is_empty());
+        }
+    }
+
     /// Whatever the disk looks like, a stage runs exactly when its diff
     /// was made against the index on disk, and then expects that index.
     #[test]

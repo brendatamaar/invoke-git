@@ -178,6 +178,20 @@ impl<'a> Driver<'a> {
                 expect_index,
             } => self.deliver(self.staging.apply(op, &patch, &expect_index)),
             Cmd::ReplayUndo(replay) => self.deliver(self.undo.replay(&replay)),
+            Cmd::RunGit { op, args, expect } => {
+                let runner =
+                    shell::GitRunner::new(Git::detect("git").unwrap(), self.repo.paths.clone())
+                        .with_env(self.repo.env.clone());
+                let (send, receive) = std::sync::mpsc::channel();
+                runner.run(op, args, expect, send);
+                while let Ok(event) = receive.recv() {
+                    let finished = matches!(event, Event::OpFinished(..));
+                    self.deliver(event);
+                    if finished {
+                        break;
+                    }
+                }
+            }
             Cmd::PruneUndo(ops) => self.undo.prune(&ops),
             other => panic!("unexpected command {other:?}"),
         }
@@ -581,6 +595,134 @@ fn binary_and_non_utf8_files_are_reported_not_diffed() {
     }
 }
 
+#[test]
+fn whole_file_stage_unstage_and_undo_keep_worktree_and_intent_to_add() {
+    use invoke_core::{FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("base", "base\n");
+    repo.commit_all("base");
+    for (name, bytes) in [("binary[1]", &b"x\0\x01"[..]), ("encoded", &b"\xffabc"[..])] {
+        fs::write(repo.paths.workdir.join(name), bytes).unwrap();
+        repo.git(&["--literal-pathspecs", "add", "-N", "--", name]);
+        let index_path = repo.paths.git_dir.join("index");
+        let before = fs::read(&index_path).unwrap();
+        let timestamp = index_path.metadata().unwrap().modified().unwrap();
+        let mut driver = Driver::open(&repo);
+        let path = RepoPath(name.into());
+        for action in [FileAction::Stage, FileAction::Unstage] {
+            let based_on = shell::precondition::current(&repo.paths).unwrap().index;
+            driver.deliver(Event::FileRequested(FileRequest {
+                path: path.clone(),
+                action: action.clone(),
+                based_on,
+            }));
+            assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+            assert_eq!(repo.worktree_bytes(name), bytes);
+            assert_eq!(
+                repo.index_bytes(name).as_deref(),
+                if action == FileAction::Stage {
+                    Some(bytes)
+                } else {
+                    None
+                },
+            );
+        }
+        for _ in 0..2 {
+            driver.deliver(Event::UndoRequested);
+            assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+        }
+        assert_eq!(fs::read(&index_path).unwrap(), before);
+        assert_eq!(
+            index_path.metadata().unwrap().modified().unwrap(),
+            timestamp
+        );
+        assert_eq!(repo.worktree_bytes(name), bytes);
+    }
+}
+
+#[test]
+fn whole_file_unstage_mode_only_and_undo_restore_exact_index() {
+    use invoke_core::{FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("script", "script\n");
+    repo.commit_all("base");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            repo.paths.workdir.join("script"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    #[cfg(not(unix))]
+    repo.git(&["update-index", "--chmod=+x", "script"]);
+    let mut driver = Driver::open(&repo);
+    let request = |action| {
+        Event::FileRequested(FileRequest {
+            path: RepoPath("script".into()),
+            action,
+            based_on: shell::precondition::current(&repo.paths).unwrap().index,
+        })
+    };
+    #[cfg(unix)]
+    {
+        driver.deliver(request(FileAction::Stage));
+        assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    }
+    assert!(repo.index_entries().starts_with("100755 "));
+    let before = fs::read(repo.paths.git_dir.join("index")).unwrap();
+    driver.deliver(request(FileAction::Unstage));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert!(repo.index_entries().starts_with("100644 "));
+    driver.deliver(Event::UndoRequested);
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(fs::read(repo.paths.git_dir.join("index")).unwrap(), before);
+    assert_eq!(repo.worktree_bytes("script"), b"script\n");
+}
+
+#[test]
+fn whole_file_undo_keeps_staged_blobs_and_split_index_reachable() {
+    use invoke_core::{FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("file", "base\n");
+    repo.commit_all("base");
+    fs::write(repo.paths.workdir.join("file"), b"staged\0").unwrap();
+    repo.git(&["add", "--", "file"]);
+    repo.git(&["update-index", "--split-index"]);
+    let shared = fs::read_dir(&repo.paths.git_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sharedindex.")
+        })
+        .unwrap();
+    let before = fs::read(repo.paths.git_dir.join("index")).unwrap();
+    repo.git(&["config", "core.splitIndex", "false"]);
+    let mut driver = Driver::open(&repo);
+    driver.deliver(Event::FileRequested(FileRequest {
+        path: RepoPath("file".into()),
+        action: FileAction::Unstage,
+        based_on: shell::precondition::current(&repo.paths).unwrap().index,
+    }));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    if shared.exists() {
+        fs::remove_file(&shared).unwrap();
+    }
+    repo.git(&["prune", "--expire=now"]);
+    driver.deliver(Event::UndoRequested);
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(fs::read(repo.paths.git_dir.join("index")).unwrap(), before);
+    assert_eq!(repo.index_bytes("file").as_deref(), Some(&b"staged\0"[..]));
+    assert!(shared.is_file());
+}
+
 // ---- the status read ----------------------------------------------------
 
 #[test]
@@ -863,4 +1005,108 @@ proptest! {
         }
         prop_assert_eq!(repo.worktree_bytes(path), worktree_before, "law 4");
     }
+}
+
+/// Cross review: unstaging only writes the index, so a worktree folder that
+/// became a file must not stop it (the path itself is still checked).
+#[test]
+fn whole_file_unstage_ignores_what_the_worktree_holds_above_the_path() {
+    use invoke_core::{FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("a/b", "base\n");
+    repo.commit_all("base");
+    repo.write("a/b", "staged\n");
+    repo.git(&["add", "--", "a/b"]);
+    fs::remove_dir_all(repo.paths.workdir.join("a")).unwrap();
+    repo.write("a", "now a file\n");
+    let mut driver = Driver::open(&repo);
+    let request = |path: &str| {
+        Event::FileRequested(FileRequest {
+            path: RepoPath(path.into()),
+            action: FileAction::Unstage,
+            based_on: shell::precondition::current(&repo.paths).unwrap().index,
+        })
+    };
+    driver.deliver(request("a/b"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert_eq!(repo.git(&["show", ":a/b"]), "base");
+    assert_eq!(repo.worktree_bytes("a"), b"now a file\n");
+    let before = repo.index_entries();
+    // Whatever the core makes of it, a path out of the repo never reaches git.
+    driver.deliver(request("a/../.git/config"));
+    assert_ne!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(repo.index_entries(), before);
+}
+
+#[test]
+#[cfg(windows)]
+fn whole_file_stage_refuses_a_junction_leaf() {
+    use invoke_core::{Failure, FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("entry", "base\n");
+    repo.commit_all("base");
+    let before = fs::read(repo.paths.git_dir.join("index")).unwrap();
+    let target = repo.root.join("outside");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("inside"), b"kept\n").unwrap();
+    let entry = repo.paths.workdir.join("entry");
+    fs::remove_file(&entry).unwrap();
+    let made = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&entry)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let mut driver = Driver::open(&repo);
+    let based_on = shell::precondition::current(&repo.paths).unwrap().index;
+    driver.deliver(Event::FileRequested(FileRequest {
+        path: RepoPath("entry".into()),
+        action: FileAction::Stage,
+        based_on,
+    }));
+    assert!(
+        matches!(driver.last_outcome(), Some(OpOutcome::Failed(Failure {
+            class: ErrorClass::PreconditionChanged, ref details
+        })) if details.contains("junction")),
+        "{:?}; index entries:\n{}",
+        driver.last_outcome(),
+        repo.index_entries()
+    );
+    assert_eq!(fs::read(repo.paths.git_dir.join("index")).unwrap(), before);
+    assert_eq!(fs::read(entry.join("inside")).unwrap(), b"kept\n");
+}
+
+#[test]
+fn whole_file_stage_and_undo_keep_a_deleted_path_deleted() {
+    use invoke_core::{FileAction, FileRequest};
+
+    let repo = TempRepo::new();
+    repo.write("dir/entry", "base\n");
+    repo.write("other", "other\n");
+    repo.commit_all("base");
+    let before = repo.index_entries();
+    fs::remove_file(repo.paths.workdir.join("dir/entry")).unwrap();
+    fs::remove_dir(repo.paths.workdir.join("dir")).unwrap();
+    let mut driver = Driver::open(&repo);
+    let based_on = shell::precondition::current(&repo.paths).unwrap().index;
+    driver.deliver(Event::FileRequested(FileRequest {
+        path: RepoPath("dir/entry".into()),
+        action: FileAction::Stage,
+        based_on,
+    }));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert!(repo.index_bytes("dir/entry").is_none());
+    assert_eq!(repo.index_bytes("other").unwrap(), b"other\n");
+    driver.deliver(Event::UndoRequested);
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(repo.index_entries(), before);
+    assert!(!repo.paths.workdir.join("dir").exists());
 }

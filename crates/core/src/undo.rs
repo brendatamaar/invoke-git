@@ -280,7 +280,7 @@ pub fn plan(undo: &UndoStack, disk: &DiskState, op: OpId) -> Result<UndoReplay, 
             restore: before.oid.clone(),
         });
     }
-    if entry.point.index_effect == IndexEffect::Rewrites && disk.index != entry.after_index {
+    if entry.point.index_effect != IndexEffect::Untouched && disk.index != entry.after_index {
         return Err(Refusal::Changed(UndoMoved::Index));
     }
     Ok(UndoReplay {

@@ -1,11 +1,11 @@
 //! What a write expects to find on disk, read fresh just before it runs
 //! (rule 5, law 12).
 
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::UNIX_EPOCH;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use invoke_core::{BranchName, ErrorClass, Expect, Failure, Head, IndexId, Oid, RefValue};
 
@@ -137,6 +137,14 @@ pub fn check(paths: &RepoPaths, expect: &Expect) -> Result<(), Failure> {
             lock.display()
         )));
     }
+    check_values(paths, expect)
+}
+
+fn check_values(paths: &RepoPaths, expect: &Expect) -> Result<(), Failure> {
+    let refuse = |details| Failure {
+        class: ErrorClass::PreconditionChanged,
+        details,
+    };
     let found = current(paths).map_err(|error| Failure {
         class: ErrorClass::Bug,
         details: error,
@@ -154,6 +162,215 @@ pub fn check(paths: &RepoPaths, expect: &Expect) -> Result<(), Failure> {
         )));
     }
     Ok(())
+}
+
+/// Hold Git's index lock across a guarded write. Git commands inside this
+/// guard must use a private index if they need to write it.
+pub(crate) struct IndexLock {
+    path: Option<PathBuf>,
+    file: Option<File>,
+}
+
+impl IndexLock {
+    pub(crate) fn acquire(paths: &RepoPaths, expect: &Expect) -> Result<Self, Failure> {
+        let path = paths.git_dir.join("index.lock");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| Failure {
+                class: if error.kind() == io::ErrorKind::AlreadyExists {
+                    ErrorClass::PreconditionChanged
+                } else {
+                    ErrorClass::Environment
+                },
+                details: format!("{}: {error}", path.display()),
+            })?;
+        let lock = Self {
+            path: Some(path),
+            file: Some(file),
+        };
+        check_values(paths, expect)?;
+        Ok(lock)
+    }
+
+    pub(crate) fn verify(&self, paths: &RepoPaths, expect: &Expect) -> Result<(), Failure> {
+        check_values(paths, expect)
+    }
+
+    /// Install an index using Git's lock-and-rename protocol. An empty
+    /// snapshot denotes an absent index.
+    pub(crate) fn replace(
+        mut self,
+        git_dir: &Path,
+        bytes: &[u8],
+        modified: Option<SystemTime>,
+    ) -> io::Result<()> {
+        let index = git_dir.join("index");
+        if bytes.is_empty() {
+            return match fs::remove_file(index) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            };
+        }
+        let mut file = self.file.take().expect("open lock file");
+        file.write_all(bytes)?;
+        if let Some(modified) = modified {
+            file.set_modified(modified)?;
+        }
+        file.sync_all()?;
+        drop(file);
+        fs::rename(self.path.as_ref().expect("owned lock"), index)?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for IndexLock {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Private scratch space on the same filesystem as a planned rename.
+pub(crate) struct ScratchDir(pub PathBuf);
+
+impl ScratchDir {
+    pub(crate) fn for_index(paths: &RepoPaths) -> io::Result<Self> {
+        Self::for_repo(paths, false)
+    }
+
+    pub(crate) fn for_worktree(paths: &RepoPaths) -> io::Result<Self> {
+        Self::for_repo(paths, true)
+    }
+
+    fn for_repo(paths: &RepoPaths, needs_rename: bool) -> io::Result<Self> {
+        let workdir = fs::canonicalize(&paths.workdir)?;
+        let git_dir = fs::canonicalize(&paths.git_dir)?;
+        let dot_git = paths.workdir.join(".git");
+        let ordinary_git_dir = fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_dir())
+            && fs::canonicalize(&dot_git).is_ok_and(|path| path == git_dir);
+        if (ordinary_git_dir || !git_dir.starts_with(&workdir))
+            && (!needs_rename || same_volume(&git_dir, &workdir)?)
+        {
+            return Self::create(&paths.git_dir);
+        }
+
+        // A separate git dir can be inside the worktree without being
+        // protected by Git. Use the system temp directory only if it is
+        // outside the worktree and meets the atomic rename requirement.
+        let temp = std::env::temp_dir();
+        let canonical_temp = fs::canonicalize(&temp)?;
+        if !canonical_temp.starts_with(&workdir)
+            && (!needs_rename || same_volume(&canonical_temp, &workdir)?)
+        {
+            return Self::create(&temp);
+        }
+
+        Err(io::Error::other(
+            "no safe scratch directory outside the worktree on the required volume",
+        ))
+    }
+
+    pub(crate) fn create(parent: &Path) -> io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Git children resolve paths from the worktree, including when temp is relative.
+        let parent = std::path::absolute(parent)?;
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            // The system temp root can be shared with other users.
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        loop {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".invoke-{}-{id}", std::process::id()));
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn same_volume(a: &Path, b: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata(a)?.dev() == fs::metadata(b)?.dev())
+}
+
+/// Both paths resolve to the same volume mount point. `GetVolumePathNameW`
+/// only reads path components, so nothing is opened.
+#[cfg(windows)]
+fn same_volume(a: &Path, b: &Path) -> io::Result<bool> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+    let volume = |path: &Path| -> io::Result<Vec<u16>> {
+        let wide = verbatim_path(path)?;
+        let mut buffer = vec![0u16; wide.len() + 1];
+        // SAFETY: `wide` is NUL-terminated and `buffer` holds as many units
+        // as the path itself plus one, which bounds the mount point's length.
+        let done =
+            unsafe { GetVolumePathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+        if done == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let end = buffer
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(buffer.len());
+        buffer.truncate(end);
+        Ok(String::from_utf16_lossy(&buffer)
+            .to_lowercase()
+            .encode_utf16()
+            .collect())
+    };
+    Ok(volume(a)? == volume(b)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_volume(_: &Path, _: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+/// A NUL-terminated Win32 path that also supports paths over MAX_PATH.
+#[cfg(windows)]
+pub(crate) fn verbatim_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let absolute: Vec<u16> = std::path::absolute(path)?
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| {
+            if unit == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                unit
+            }
+        })
+        .collect();
+    let units = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+    let mut wide = if absolute.starts_with(&units(r"\\?\")) {
+        absolute
+    } else if let Some(share) = absolute.strip_prefix(&units(r"\\")[..]) {
+        [units(r"\\?\UNC\"), share.to_vec()].concat()
+    } else {
+        [units(r"\\?\"), absolute].concat()
+    };
+    wide.push(0);
+    Ok(wide)
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Refuses a write when a ref it names is not where the core saw it (`None`:

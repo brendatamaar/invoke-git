@@ -346,6 +346,37 @@ fn a_running_discard_is_not_cancelled() {
 }
 
 proptest! {
+    #[test]
+    fn whole_file_discard_carries_the_index_and_file_version(
+        path in "[a-z]{1,12}",
+        current in any::<bool>(),
+        merging in any::<bool>(),
+        blob in proptest::option::of("[a-f]".prop_map(|s| hex(s.chars().next().unwrap()))),
+    ) {
+        let based_on = index('b');
+        let phase = if merging {
+            Phase::Merging { conflicts: Conflicts::default() }
+        } else {
+            Phase::Clean
+        };
+        let state = ready(disk(if current { based_on.clone() } else { index('c') }, LockState::Free, phase));
+        let file = blob.map(|blob| FileVersion { blob, mode: WorktreeMode::Regular });
+        let path = RepoPath(path);
+        let (_, commands) = step(state, Event::FileRequested(FileRequest {
+            action: FileAction::Discard { file: file.clone() }, path: path.clone(), based_on: based_on.clone(),
+        }));
+        if current && !merging {
+            let correct = matches!(commands.as_slice(),
+                [Command::SnapshotForUndo(point), Command::RunGit { args: GitArgs::DiscardPath { path: actual, file: version }, expect, .. }]
+                    if point.index_effect == IndexEffect::Untouched
+                        && point.reverse == Reversal::Discard { path: path.clone() }
+                        && *actual == path && *version == file && expect.index == based_on);
+            prop_assert!(correct, "{commands:?}");
+        } else {
+            prop_assert!(commands.is_empty());
+        }
+    }
+
     /// Whatever the disk looks like, a discard runs exactly when its diff
     /// was made against the index on disk and the repo is not mid-merge,
     /// and then it expects that index and the file the request names.

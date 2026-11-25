@@ -19,8 +19,8 @@ use diff::{
     DiffOptions, Direction, LineKind, Mode, PatchSpec, Pick, TextDiff, build_patch, diff_text,
 };
 use invoke_core::{
-    Action, ChangeSet, Command as Cmd, DiscardRequest, ErrorClass, Event, IndexId, Notice, OpId,
-    OpOutcome, Patch, Refusal, RepoId, RepoPath, RepoState, Selection, open, step,
+    Action, ChangeSet, Command as Cmd, DiscardRequest, ErrorClass, Event, Failure, IndexId, Notice,
+    OpId, OpOutcome, Patch, Refusal, RepoId, RepoPath, RepoState, Selection, open, step,
 };
 use proptest::prelude::*;
 use shell::precondition::RepoPaths;
@@ -246,6 +246,23 @@ impl<'a> Driver<'a> {
                 self.deliver(done);
             }
             Cmd::ReplayUndo(replay) => self.deliver(self.undo.replay(&replay)),
+            Cmd::RunGit { op, args, expect } => {
+                if self.skip.remove(&op) {
+                    return;
+                }
+                let runner =
+                    shell::GitRunner::new(Git::detect("git").unwrap(), self.repo.paths.clone())
+                        .with_env(self.repo.env.clone());
+                let (send, receive) = std::sync::mpsc::channel();
+                runner.run(op, args, expect, send);
+                while let Ok(event) = receive.recv() {
+                    let finished = matches!(event, Event::OpFinished(..));
+                    self.deliver(event);
+                    if finished {
+                        break;
+                    }
+                }
+            }
             Cmd::PruneUndo(ops) => self.undo.prune(&ops),
             other => panic!("unexpected command {other:?}"),
         }
@@ -298,6 +315,208 @@ impl<'a> Driver<'a> {
             Some(OpOutcome::Succeeded),
             "undo: {:?}",
             self.state.notice
+        );
+    }
+}
+
+fn whole_file_request(repo: &TempRepo, name: &str) -> Event {
+    use invoke_core::{FileAction, FileRequest};
+
+    let path = RepoPath(name.into());
+    let inputs = shell::discard::file_inputs(&repo.paths, &path).unwrap();
+    Event::FileRequested(FileRequest {
+        path,
+        action: FileAction::Discard { file: inputs.file },
+        based_on: inputs.based_on,
+    })
+}
+
+#[test]
+fn whole_file_discard_and_undo_preserve_exact_bytes_and_index() {
+    let repo = TempRepo::new();
+    repo.git(&["config", "core.autocrlf", "true"]);
+    let cases = [
+        ("binary", Some(&b"old\0\x01"[..]), &b"changed\0\x02"[..]),
+        ("non-utf8", Some(&b"old\xff"[..]), &b"changed\xff"[..]),
+        ("crlf", Some(&b"old\r\n"[..]), &b"changed\r\nmixed\n"[..]),
+        ("untracked[1]", None, &b"untracked\0\xff"[..]),
+        ("intent", None, &b"intent\0"[..]),
+    ];
+    for (name, old, _) in cases {
+        if let Some(old) = old {
+            repo.write_bytes(name, old);
+        }
+    }
+    repo.commit_all("base");
+    for (name, old, edited) in cases {
+        repo.write_bytes(name, edited);
+        if name == "intent" {
+            repo.git(&["add", "-N", "--", name]);
+        }
+        let index = repo.index_file_bytes();
+        let mut driver = Driver::open(&repo);
+        driver.deliver(whole_file_request(&repo, name));
+        assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded), "{name}");
+        assert_eq!(repo.worktree_bytes(name).as_deref(), old, "{name}");
+        assert_eq!(repo.index_file_bytes(), index);
+        driver.undo();
+        assert_eq!(repo.worktree_bytes(name).as_deref(), Some(edited));
+        assert_eq!(repo.index_file_bytes(), index);
+    }
+}
+
+#[test]
+fn whole_file_discard_refuses_a_changed_file_or_held_index_lock() {
+    let repo = TempRepo::new();
+    repo.write_bytes("target", b"base\0");
+    repo.commit_all("base");
+    repo.write_bytes("target", b"first\0");
+    let mut driver = Driver::open(&repo);
+    let request = whole_file_request(&repo, "target");
+    repo.write_bytes("target", b"later\0");
+    driver.deliver(request);
+    assert!(matches!(
+        driver.last_outcome(),
+        Some(OpOutcome::Failed(Failure {
+            class: ErrorClass::PreconditionChanged,
+            ..
+        }))
+    ));
+    assert_eq!(
+        repo.worktree_bytes("target").as_deref(),
+        Some(&b"later\0"[..])
+    );
+    assert!(driver.state.undo.entries.is_empty());
+
+    let request = whole_file_request(&repo, "target");
+    let path = repo.paths.git_dir.join("index.lock");
+    fs::write(&path, b"external lock").unwrap();
+    driver.deliver(request);
+    assert!(matches!(
+        driver.last_outcome(),
+        Some(OpOutcome::Failed(Failure {
+            class: ErrorClass::PreconditionChanged,
+            ..
+        }))
+    ));
+    assert_eq!(fs::read(path).unwrap(), b"external lock");
+    assert_eq!(
+        repo.worktree_bytes("target").as_deref(),
+        Some(&b"later\0"[..])
+    );
+}
+
+#[test]
+fn whole_file_actions_keep_symlink_targets_and_undo_restores_the_link() {
+    use invoke_core::{FileAction, FileRequest};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as symlink;
+
+    let repo = TempRepo::new();
+    let root = &repo.paths.workdir;
+    let link = root.join("link");
+    repo.git(&["config", "core.symlinks", "true"]);
+    repo.write("first", "untouched first");
+    repo.write("second", "untouched second");
+    let created = symlink("first", &link);
+    #[cfg(windows)]
+    if symlinks_unavailable(
+        &created,
+        "whole_file_actions_keep_symlink_targets_and_undo_restores_the_link",
+    ) {
+        return;
+    }
+    created.unwrap();
+    repo.commit_all("base");
+    fs::remove_file(&link).unwrap();
+    symlink("second", &link).unwrap();
+    let mut driver = Driver::open(&repo);
+    for (action, target) in [
+        (FileAction::Stage, "second"),
+        (FileAction::Unstage, "first"),
+    ] {
+        driver.deliver(Event::FileRequested(FileRequest {
+            path: RepoPath("link".into()),
+            action,
+            based_on: shell::precondition::current(&repo.paths).unwrap().index,
+        }));
+        assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+        assert_eq!(repo.git(&["show", ":link"]), target);
+        assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("second"));
+    }
+    driver.deliver(whole_file_request(&repo, "link"));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("first"));
+    driver.undo();
+    assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("second"));
+    assert_eq!(
+        repo.worktree_bytes("first").as_deref(),
+        Some(&b"untouched first"[..])
+    );
+    assert_eq!(
+        repo.worktree_bytes("second").as_deref(),
+        Some(&b"untouched second"[..])
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn whole_file_discard_and_undo_restore_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TempRepo::new();
+    let script = repo.paths.workdir.join("script");
+    repo.write("script", "script\n");
+    repo.commit_all("base");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "script"));
+    assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+    assert_eq!(script.metadata().unwrap().permissions().mode() & 0o111, 0);
+    driver.undo();
+    assert_eq!(
+        script.metadata().unwrap().permissions().mode() & 0o111,
+        0o111
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn whole_file_discard_and_undo_keep_git_symlink_emulation() {
+    // Git for Windows uses a plain file containing the link target when
+    // symlink creation is disabled. This fixture needs no extra privilege.
+    let mut repo = TempRepo::new();
+    repo.env.push(("MSYS".into(), "".into()));
+    repo.git(&["config", "core.symlinks", "false"]);
+    repo.write("target", "first");
+    repo.commit_all("base");
+    let blob = repo.git(&["rev-parse", "HEAD:target"]);
+    repo.git(&[
+        "update-index",
+        "--cacheinfo",
+        "120000",
+        blob.trim(),
+        "target",
+    ]);
+    repo.git(&["commit", "-qm", "record symlink"]);
+    for explicit in [true, false] {
+        if !explicit {
+            repo.git(&["config", "--unset", "core.symlinks"]);
+        }
+        repo.write("target", "second");
+        let mut driver = Driver::open(&repo);
+        driver.deliver(whole_file_request(&repo, "target"));
+        assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+        assert_eq!(
+            repo.worktree_bytes("target").as_deref(),
+            Some(&b"first"[..])
+        );
+        driver.undo();
+        assert_eq!(
+            repo.worktree_bytes("target").as_deref(),
+            Some(&b"second"[..])
         );
     }
 }
@@ -1196,4 +1415,455 @@ fn a_discard_under_autocrlf_keeps_the_crlf_worktree() {
     // The whole file, too.
     assert!(driver.discard("w.txt", &Choice::File));
     assert_eq!(repo.worktree_bytes("w.txt").unwrap(), base.as_bytes());
+}
+
+/// Cross review: a snapshot that finds a directory where the file was is a
+/// changed precondition, not a bug in the app.
+#[test]
+fn a_snapshot_of_a_file_replaced_by_a_directory_is_a_changed_precondition() {
+    let repo = TempRepo::new();
+    repo.write("f.txt", "a\n");
+    repo.commit_all("base");
+    fs::remove_file(repo.paths.workdir.join("f.txt")).unwrap();
+    repo.write("f.txt/inner", "now a folder\n");
+    let undo =
+        UndoRunner::new(Git::detect("git").unwrap(), repo.paths.clone()).with_env(repo.env.clone());
+    match undo.snapshot(&point_for(&repo, 5, "f.txt")) {
+        Snapshotted::Failed(Event::OpFinished(_, OpOutcome::Failed(failure))) => {
+            assert_eq!(
+                failure.class,
+                ErrorClass::PreconditionChanged,
+                "{failure:?}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Cross review: the scratch checkout must not double the path length, or a
+/// file Git can check out in place fails under Windows' `MAX_PATH`.
+#[test]
+fn whole_file_discard_and_undo_work_near_the_path_length_limit() {
+    let repo = TempRepo::new();
+    let base = repo.paths.workdir.to_string_lossy().len();
+    let mut name = String::new();
+    while base + name.len() + 12 < 235 {
+        name.push_str("segment789/");
+    }
+    name.push_str("leaf.bin");
+    repo.write_bytes(&name, b"old\0");
+    repo.commit_all("base");
+    repo.write_bytes(&name, b"changed\0");
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, &name));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert_eq!(repo.worktree_bytes(&name).as_deref(), Some(&b"old\0"[..]));
+    driver.undo();
+    assert_eq!(
+        repo.worktree_bytes(&name).as_deref(),
+        Some(&b"changed\0"[..])
+    );
+}
+
+/// Cross review: a read-only worktree file is replaced by discard and by
+/// its undo (Git itself checks out over one).
+#[test]
+#[cfg(windows)]
+fn whole_file_discard_and_undo_replace_a_read_only_file() {
+    let repo = TempRepo::new();
+    let full = repo.paths.workdir.join("locked.bin");
+    let read_only = |on: bool| {
+        let mut permissions = fs::metadata(&full).unwrap().permissions();
+        permissions.set_readonly(on);
+        fs::set_permissions(&full, permissions).unwrap();
+    };
+    repo.write_bytes("locked.bin", b"old\0");
+    repo.commit_all("base");
+    repo.write_bytes("locked.bin", b"changed\0");
+    read_only(true);
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "locked.bin"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert_eq!(
+        repo.worktree_bytes("locked.bin").as_deref(),
+        Some(&b"old\0"[..])
+    );
+    read_only(true);
+    driver.undo();
+    assert_eq!(
+        repo.worktree_bytes("locked.bin").as_deref(),
+        Some(&b"changed\0"[..])
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn whole_file_discard_refuses_a_junction_it_cannot_restore() {
+    let repo = TempRepo::new();
+    repo.write("dir/inside", "kept\n");
+    repo.write("entry", "file\n");
+    repo.commit_all("base");
+    let entry = repo.paths.workdir.join("entry");
+    fs::remove_file(&entry).unwrap();
+    let made = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&entry)
+        .arg(repo.paths.workdir.join("dir"))
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let before = fs::read_link(&entry).unwrap();
+    let result = shell::discard::file_inputs(&repo.paths, &RepoPath("entry".into()));
+    assert!(
+        matches!(result, Err(ref details) if details.contains("junction")),
+        "{:?}",
+        result.err()
+    );
+    assert_eq!(fs::read_link(&entry).unwrap(), before);
+    assert_eq!(fs::read(entry.join("inside")).unwrap(), b"kept\n");
+    assert!(repo.undo_refs().is_empty());
+}
+
+/// Native symlinks on Windows need Developer Mode or an elevated shell
+/// (error 1314 otherwise). A skip is written straight to stderr, past the
+/// test harness's capture, so it shows in every run; with
+/// `INVOKE_REQUIRE_SYMLINKS=1` it is a failure instead.
+#[cfg(windows)]
+fn symlinks_unavailable(created: &std::io::Result<()>, test: &str) -> bool {
+    use std::io::Write;
+    if !created
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(1314))
+    {
+        return false;
+    }
+    assert!(
+        std::env::var_os("INVOKE_REQUIRE_SYMLINKS").is_none_or(|value| value != "1"),
+        "{test}: INVOKE_REQUIRE_SYMLINKS=1, but creating a symlink failed with error 1314 \
+         (enable Developer Mode or run elevated)"
+    );
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "SKIPPED {test}: native symlinks need Developer Mode or an elevated shell (error 1314). \
+         Set INVOKE_REQUIRE_SYMLINKS=1 to make this a failure."
+    );
+    true
+}
+
+/// Re-check: a directory symlink where a tracked file belongs is replaced
+/// by the file, like the junction above.
+#[test]
+#[cfg(windows)]
+fn whole_file_discard_replaces_a_directory_symlink() {
+    use std::os::windows::fs::symlink_dir;
+
+    let repo = TempRepo::new();
+    repo.write("dir/inside", "kept\n");
+    repo.write("entry", "file\n");
+    repo.commit_all("base");
+    let entry = repo.paths.workdir.join("entry");
+    fs::remove_file(&entry).unwrap();
+    let created = symlink_dir("dir", &entry);
+    if symlinks_unavailable(&created, "whole_file_discard_replaces_a_directory_symlink") {
+        return;
+    }
+    created.unwrap();
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "entry"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert!(fs::symlink_metadata(&entry).unwrap().is_file());
+    assert_eq!(
+        repo.worktree_bytes("entry").as_deref(),
+        Some(&b"file\n"[..])
+    );
+    assert_eq!(
+        repo.worktree_bytes("dir/inside").as_deref(),
+        Some(&b"kept\n"[..])
+    );
+}
+
+/// Cross review: Git for Windows decides a symlink's kind from its target
+/// in the worktree, so the scratch checkout must not turn a directory link
+/// into a file link.
+#[test]
+#[cfg(windows)]
+fn whole_file_discard_restores_a_directory_symlink_as_one() {
+    use std::os::windows::fs::{FileTypeExt, symlink_dir};
+
+    let repo = TempRepo::new();
+    repo.git(&["config", "core.symlinks", "true"]);
+    repo.write("dir/inside", "kept\n");
+    let link = repo.paths.workdir.join("link");
+    let created = symlink_dir("dir", &link);
+    if symlinks_unavailable(
+        &created,
+        "whole_file_discard_restores_a_directory_symlink_as_one",
+    ) {
+        return;
+    }
+    created.unwrap();
+    repo.commit_all("base");
+    fs::remove_dir(&link).unwrap();
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "link"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    let metadata = fs::symlink_metadata(&link).unwrap();
+    assert!(metadata.file_type().is_symlink_dir(), "{metadata:?}");
+    assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("dir"));
+    driver.undo();
+    assert!(fs::symlink_metadata(&link).is_err());
+}
+
+/// Cross review: on a case-insensitive filesystem `foo.txt` finds
+/// `Foo.txt`. A file whose on-disk name differs only in case is refused,
+/// not hashed or overwritten in place of the one Git names.
+#[test]
+#[cfg(windows)]
+fn a_file_whose_disk_name_differs_in_case_is_refused() {
+    let repo = TempRepo::new();
+    repo.write("foo.txt", "tracked\n");
+    repo.commit_all("base");
+    fs::rename(
+        repo.paths.workdir.join("foo.txt"),
+        repo.paths.workdir.join("Foo.txt"),
+    )
+    .unwrap();
+    let error = shell::discard::file_inputs(&repo.paths, &RepoPath("foo.txt".into()))
+        .err()
+        .expect("a case-only match must be refused");
+    assert!(error.contains("Foo.txt"), "{error}");
+    let untracked = shell::discard::file_inputs(&repo.paths, &RepoPath("Foo.txt".into())).unwrap();
+    assert!(untracked.file.is_some());
+    assert_eq!(
+        repo.worktree_bytes("Foo.txt").as_deref(),
+        Some(&b"tracked\n"[..])
+    );
+}
+
+/// Re-check: the private checkout must not put a scratch folder in the
+/// working tree, where a concurrent status read would list it as untracked.
+/// A smudge filter, run during that checkout, records what it sees.
+#[test]
+fn whole_file_discard_keeps_its_scratch_out_of_the_worktree() {
+    let repo = TempRepo::new();
+    repo.git(&[
+        "config",
+        "filter.spy.smudge",
+        "for f in .invoke-*; do if [ -e \"$f\" ]; then echo \"$f\"; fi; done > .git/spy-listing; cat",
+    ]);
+    repo.write(".gitattributes", "tracked filter=spy\n");
+    repo.write("tracked", "base\n");
+    repo.commit_all("base");
+    repo.write("tracked", "changed\n");
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "tracked"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert_eq!(
+        repo.worktree_bytes("tracked").as_deref(),
+        Some(&b"base\n"[..])
+    );
+    let listing = fs::read_to_string(repo.paths.git_dir.join("spy-listing"))
+        .expect("the smudge filter ran during the checkout");
+    assert_eq!(listing.trim(), "", "scratch seen in the worktree");
+    driver.undo();
+    assert_eq!(
+        repo.worktree_bytes("tracked").as_deref(),
+        Some(&b"changed\n"[..])
+    );
+    let left: Vec<_> = fs::read_dir(&repo.paths.workdir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".invoke-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// Re-check: the read-only fallback moves the old file aside. A tracked file
+/// named like that backup must still be discarded and undone, not have its
+/// prepared checkout replaced by the old copy.
+#[test]
+#[cfg(windows)]
+fn a_read_only_file_named_like_the_backup_is_discarded_and_undone() {
+    let repo = TempRepo::new();
+    let read_only = |on: bool| {
+        let full = repo.paths.workdir.join("previous");
+        let mut permissions = fs::metadata(&full).unwrap().permissions();
+        permissions.set_readonly(on);
+        fs::set_permissions(&full, permissions).unwrap();
+    };
+    repo.write_bytes("previous", b"old\0");
+    repo.commit_all("base");
+    repo.write_bytes("previous", b"changed\0");
+    read_only(true);
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "previous"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    assert_eq!(
+        repo.worktree_bytes("previous").as_deref(),
+        Some(&b"old\0"[..])
+    );
+    read_only(true);
+    driver.undo();
+    assert_eq!(
+        repo.worktree_bytes("previous").as_deref(),
+        Some(&b"changed\0"[..])
+    );
+}
+
+/// Re-check: a case mismatch in a folder on the way is caught like one in
+/// the file name, and both are a changed precondition for the patch runner
+/// (not an environment error or a bug).
+#[test]
+#[cfg(windows)]
+fn a_case_mismatch_on_the_way_or_at_the_leaf_is_a_changed_precondition() {
+    let repo = TempRepo::new();
+    repo.write("Dir/foo.txt", "a\nb\n");
+    repo.write("bar.txt", "a\nb\n");
+    repo.commit_all("base");
+    repo.write("Dir/foo.txt", "a\nB\n");
+    repo.write("bar.txt", "a\nB\n");
+    let root = &repo.paths.workdir;
+    fs::rename(root.join("Dir"), root.join("dir")).unwrap();
+    fs::rename(root.join("bar.txt"), root.join("Bar.txt")).unwrap();
+    let error = shell::discard::file_inputs(&repo.paths, &RepoPath("Dir/foo.txt".into()))
+        .err()
+        .expect("a folder named in another case must be refused");
+    assert!(error.contains("dir"), "{error}");
+    let discard = DiscardRunner::new(Git::detect("git").unwrap(), repo.paths.clone())
+        .with_env(repo.env.clone());
+    let blob = shell::staging::blob_id(gix::hash::Kind::Sha1, b"a\nB\n").unwrap();
+    for name in ["Dir/foo.txt", "bar.txt"] {
+        let patch = Patch(format!(
+            "diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -1,2 +1,2 @@\n a\n-B\n+b\n"
+        ));
+        let index = shell::precondition::current(&repo.paths).unwrap().index;
+        match discard.apply(OpId(3), &patch, &RepoPath(name.into()), &index, Some(&blob)) {
+            Event::OpFinished(_, OpOutcome::Failed(failure)) => {
+                assert_eq!(
+                    failure.class,
+                    ErrorClass::PreconditionChanged,
+                    "{name}: {failure:?}"
+                );
+            }
+            other => panic!("{name}: expected a refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        repo.worktree_bytes("dir/foo.txt").as_deref(),
+        Some(&b"a\nB\n"[..])
+    );
+    assert_eq!(
+        repo.worktree_bytes("Bar.txt").as_deref(),
+        Some(&b"a\nB\n"[..])
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_discard_does_not_ask_git_to_create_a_native_symlink() {
+    let mut repo = TempRepo::new();
+    let trace = repo.root.join("trace.json");
+    repo.env
+        .push(("GIT_TRACE2_EVENT".into(), trace.clone().into_os_string()));
+    repo.git(&["config", "core.symlinks", "true"]);
+    let target = repo.root.join("outside");
+    fs::create_dir(&target).unwrap();
+    repo.write("target", &target.to_string_lossy());
+    let blob = repo.git(&["hash-object", "-w", "target"]);
+    repo.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "120000",
+        &blob,
+        "target",
+    ]);
+    repo.git(&["commit", "-qm", "record symlink"]);
+    repo.write("target", "changed");
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "target"));
+    let trace = fs::read_to_string(trace).unwrap();
+    assert!(trace.contains(r#""event":"start""#), "{trace}");
+    for invocation in trace
+        .lines()
+        .filter(|line| line.contains(r#""event":"start""#))
+    {
+        if invocation.contains(r#""checkout-index""#) {
+            assert!(
+                invocation.contains(r#""core.symlinks=false""#),
+                "{invocation}"
+            );
+        }
+    }
+    if let Some(OpOutcome::Failed(failure)) = driver.last_outcome() {
+        // The trace assertion still runs on hosts without symlink rights.
+        assert!(failure.details.contains("1314"), "{failure:?}");
+    } else {
+        assert_eq!(driver.last_outcome(), Some(OpOutcome::Succeeded));
+        use std::os::windows::fs::FileTypeExt;
+        assert!(
+            fs::symlink_metadata(repo.paths.workdir.join("target"))
+                .unwrap()
+                .file_type()
+                .is_symlink_file()
+        );
+    }
+}
+
+#[test]
+fn whole_file_discard_keeps_scratch_out_of_an_in_tree_separate_git_dir() {
+    let mut repo = TempRepo::new();
+    repo.git(&["init", "-q", "--separate-git-dir", "metadata"]);
+    repo.paths.git_dir = repo.paths.workdir.join("metadata");
+    repo.git(&["config", "filter.spy.smudge",
+        "for f in metadata/.invoke-*; do if [ -e \"$f\" ]; then echo \"$f\"; fi; done > metadata/spy-listing; cat",
+    ]);
+    repo.write(".gitattributes", "tracked filter=spy\n");
+    repo.write("tracked", "base\n");
+    repo.git(&["add", "--", "tracked", ".gitattributes"]);
+    repo.git(&["commit", "-qm", "base"]);
+    repo.write("tracked", "changed\n");
+    let mut driver = Driver::open(&repo);
+    driver.deliver(whole_file_request(&repo, "tracked"));
+    assert_eq!(
+        driver.last_outcome(),
+        Some(OpOutcome::Succeeded),
+        "{:?}",
+        driver.state.notice
+    );
+    let listing = fs::read_to_string(repo.paths.git_dir.join("spy-listing")).unwrap();
+    assert!(listing.is_empty(), "stageable scratch: {listing}");
+    assert_eq!(repo.worktree_bytes("tracked").unwrap(), b"base\n");
+    driver.undo();
+    assert_eq!(repo.worktree_bytes("tracked").unwrap(), b"changed\n");
 }

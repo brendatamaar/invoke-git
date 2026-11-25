@@ -1,16 +1,18 @@
 //! Reading the two sides of a file and diffing them, off the UI thread.
 
-use diff::{DiffOptions, diff_text};
-use invoke_core::{Event, RepoPath};
+use invoke_core::RepoPath;
 use shell::precondition::RepoPaths;
 use shell::{DiffInputs, InputsError, Source, load_inputs};
 use ui::{DiffData, InputsMeta, Section, StageMode, diff_view};
 
-use crate::staging::{self, Part};
-
 /// What the diff viewer shows for one file.
 pub enum Loaded {
     Diff(Box<DiffData>),
+    /// A file whose whole-file actions are available without a text diff.
+    FileMessage {
+        text: String,
+        mode: StageMode,
+    },
     /// Binary, not UTF-8, a symlink, a submodule: no text diff exists.
     Message(String),
 }
@@ -34,24 +36,23 @@ fn meta(inputs: &DiffInputs) -> InputsMeta {
 
 /// Reads the sides, retrying a few times when the index moves while they are
 /// read (a burst of changes ends quickly).
-fn read(paths: &RepoPaths, path: &RepoPath, section: Section) -> Result<DiffInputs, String> {
+fn read(paths: &RepoPaths, path: &RepoPath, section: Section) -> Result<DiffInputs, InputsError> {
     for _ in 0..3 {
         match load_inputs(paths, path, source_of(section)) {
             Ok(inputs) => return Ok(inputs),
             Err(InputsError::Moved) => continue,
-            Err(InputsError::NotText(reason)) => {
-                return Err(format!("{reason}. There is no text diff to show."));
-            }
-            Err(InputsError::Read(error)) => {
-                return Err(format!("Could not read {}: {error}", path.0));
-            }
+            Err(error) => return Err(error),
         }
     }
-    Err("The repository kept changing while the file was read. Try again.".into())
+    Err(InputsError::Moved)
 }
 
 /// Reads `path` for `section` and diffs it for the viewer.
 pub fn load(paths: &RepoPaths, path: &RepoPath, section: Section) -> Loaded {
+    let mode = match section {
+        Section::Unstaged => StageMode::Stage,
+        Section::Staged => StageMode::Unstage,
+    };
     match read(paths, path, section) {
         Ok(inputs) => {
             let mut data = diff_view::compute(
@@ -59,42 +60,16 @@ pub fn load(paths: &RepoPaths, path: &RepoPath, section: Section) -> Loaded {
                 inputs.old.as_deref().unwrap_or(""),
                 inputs.new.as_deref().unwrap_or(""),
             );
-            data.mode = match section {
-                Section::Unstaged => StageMode::Stage,
-                Section::Staged => StageMode::Unstage,
-            };
+            data.mode = mode;
             data.inputs = Some(meta(&inputs));
             Loaded::Diff(Box::new(data))
         }
-        Err(message) => Loaded::Message(message),
+        Err(InputsError::NotText(text)) => Loaded::FileMessage { text, mode },
+        Err(InputsError::Read(error)) => {
+            Loaded::Message(format!("Could not read {}: {error}", path.0))
+        }
+        Err(InputsError::Moved) => Loaded::Message(
+            "The repository kept changing while the file was read. Try again.".into(),
+        ),
     }
-}
-
-/// What to do with a whole file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verb {
-    /// Stage it (from the unstaged section) or unstage it (from the staged one).
-    Toggle,
-    /// Throw away its unstaged changes.
-    Discard,
-}
-
-/// The request for the whole file, built from a fresh read of its sides.
-/// `Ok(None)`: the file has nothing to do.
-pub fn file_request(
-    paths: &RepoPaths,
-    path: &RepoPath,
-    section: Section,
-    verb: Verb,
-) -> Result<Option<Event>, String> {
-    let inputs = read(paths, path, section)?;
-    let diff = diff_text(
-        inputs.old.clone().unwrap_or_default(),
-        inputs.new.clone().unwrap_or_default(),
-        &DiffOptions::default(),
-    );
-    Ok(match verb {
-        Verb::Toggle => staging::request(section, path, &diff, &meta(&inputs), &Part::File),
-        Verb::Discard => staging::discard_request(path, &diff, &meta(&inputs), &Part::File),
-    })
 }

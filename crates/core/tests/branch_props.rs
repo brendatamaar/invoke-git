@@ -383,7 +383,10 @@ impl Sim {
                 moved.insert(n.to_ref());
                 recorded_names = vec![n.to_ref()];
             }
-            GitArgs::Commit { .. }
+            GitArgs::AddPath(_)
+            | GitArgs::RestoreStagedPath(_)
+            | GitArgs::DiscardPath { .. }
+            | GitArgs::Commit { .. }
             | GitArgs::StashSave { .. }
             | GitArgs::StashApply { .. }
             | GitArgs::StashPop { .. }
@@ -410,7 +413,7 @@ impl Sim {
             | GitArgs::GuardedRebase { .. }
             // P7.
             | GitArgs::Reset { .. } => {
-                panic!("no commits, stashes or remotes in this simulation")
+                panic!("unexpected command in the branch simulation: {args:?}")
             }
         }
         if rewrites {

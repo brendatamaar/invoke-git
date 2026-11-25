@@ -168,6 +168,17 @@ pub struct Invocation {
 pub fn invocation(args: &GitArgs) -> Invocation {
     let mut argv: Vec<OsString> = GLOBAL_ARGS.iter().map(OsString::from).collect();
     match args {
+        GitArgs::AddPath(path) => stage_path(argv, path),
+        GitArgs::RestoreStagedPath(path) => {
+            argv.extend(["--literal-pathspecs", "restore", "--staged", "--"].map(OsString::from));
+            argv.push((&path.0).into());
+            plain(argv)
+        }
+        GitArgs::DiscardPath { path, .. } => {
+            argv.extend(["checkout-index", "--"].map(OsString::from));
+            argv.push((&path.0).into());
+            plain(argv)
+        }
         GitArgs::Commit { message, amend } => {
             // The message goes through stdin: no argv quoting or length limits
             // on Windows, and no message text can be mistaken for an option.

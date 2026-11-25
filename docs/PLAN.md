@@ -16,7 +16,7 @@
 |----|------|--------|------------|--------------------|
 | P0 | GPUI Spike | done | - | - |
 | P1 | v0.1 Daily Driver (Tasks 1–25) | done | P0 | - |
-| P1b | Non-Text Staging & Discard | in-progress | P1 | P3, P5, P6, P7, P8 |
+| P1b | Non-Text Staging & Discard | review | P1 | P3, P5, P6, P7, P8 |
 | P2 | Cherry-Pick & Revert | done | P1 | P3, P5, P6, P7, P8, P11 |
 | P3 | Tags (Create, Push, Delete) | done | P1 | P1b, P2, P4a, P4b, P5, P6, P7, P8, P11 |
 | P4a | Interactive Rebase Core & v0.2 Law Gate | done | P2 | P3, P5, P6, P7, P8, P11 |

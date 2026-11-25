@@ -40,9 +40,9 @@ pub use ids::{
 };
 pub use message::{CommitMessage, MessageProblem, SubjectHint, SubjectLevel};
 pub use ops::{
-    AuthAnswer, AuthKind, AuthPrompt, BranchStart, DiscardRequest, ErrorClass, Failure, GitArgs,
-    Lease, OpOutcome, Patch, Progress, PullMode, RemoteBranch, Selection, StageRequest,
-    WriteRequest,
+    AuthAnswer, AuthKind, AuthPrompt, BranchStart, DiscardRequest, ErrorClass, Failure, FileAction,
+    FileRequest, FileVersion, GitArgs, Lease, OpOutcome, Patch, Progress, PullMode, RemoteBranch,
+    Selection, StageRequest, WorktreeMode, WriteRequest,
 };
 pub use rebase::{PlanError, RebaseAction, RebaseOrigin, RebasePause, RebasePlan, RebaseState};
 pub use reflog::{ReflogEntry, ReflogTarget, ResetMode};

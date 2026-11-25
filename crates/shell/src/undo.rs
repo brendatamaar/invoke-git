@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use invoke_core::{
     ErrorClass, Event, Failure, Head, HeadRestore, HeadTarget, IndexEffect, Oid, OpId, OpOutcome,
@@ -117,6 +118,15 @@ impl UndoRunner {
             ));
         }
         let real = self.paths.git_dir.join("index");
+        if point.index_effect == IndexEffect::RestoreBytes {
+            let _lock = precondition::IndexLock::acquire(&self.paths, &current)?;
+            return self
+                .save_index_bytes(op, &real)
+                .map_err(|details| fail(ErrorClass::Bug, details));
+        }
+        let discard_lock = matches!(point.reverse, Reversal::Discard { .. })
+            .then(|| precondition::IndexLock::acquire(&self.paths, &current))
+            .transpose()?;
         let copy = self
             .paths
             .git_dir
@@ -133,7 +143,9 @@ impl UndoRunner {
         );
         let _ = fs::remove_file(&copy);
         let tree = written.map_err(|details| fail(ErrorClass::Bug, details))?;
-        if self.paths.git_dir.join("index.lock").exists() {
+        if let Some(lock) = &discard_lock {
+            lock.verify(&self.paths, &current)?;
+        } else if self.paths.git_dir.join("index.lock").exists() {
             return Err(fail(
                 ErrorClass::PreconditionChanged,
                 "index.lock is held".into(),
@@ -156,10 +168,58 @@ impl UndoRunner {
         // Task 13: a discard's undo needs the file as it is right now, and
         // the snapshot is the last moment before the patch runs.
         if let Reversal::Discard { path } = &point.reverse {
-            self.save_file(&discard_ref(op), path)
-                .map_err(|details| fail(ErrorClass::Bug, details))?;
+            self.save_file(&discard_ref(op), path)?;
         }
         Ok(tree)
+    }
+
+    fn save_index_bytes(&self, op: OpId, real: &std::path::Path) -> Result<Oid, String> {
+        let bytes = match fs::read(real) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(format!("read index: {error}")),
+        };
+        let hash_blob = |bytes: &[u8]| self.save_blob(bytes);
+        let index = hash_blob(&bytes)?;
+        let mut entries = format!("100644 blob {}\tindex\n", index.trim());
+        if !bytes.is_empty() {
+            let modified = real
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .map_err(|error| format!("read index timestamp: {error}"))?;
+            let (duration, sign) = match modified.duration_since(UNIX_EPOCH) {
+                Ok(duration) => (duration, 1),
+                Err(error) => (error.duration(), -1),
+            };
+            let timestamp = (sign * duration.as_nanos() as i128).to_le_bytes();
+            let blob = hash_blob(&timestamp)?;
+            entries.push_str(&format!("100644 blob {}\tindex-time\n", blob.trim()));
+        }
+        let repo = precondition::open(&self.paths)?;
+        if let Some(name) = shared_index_name(&bytes, repo.object_hash())? {
+            let shared = fs::read(self.paths.git_dir.join(&name))
+                .map_err(|error| format!("read {name}: {error}"))?;
+            let blob = hash_blob(&shared)?;
+            entries.push_str(&format!("100644 blob {}\t{name}\n", blob.trim()));
+        }
+        // Git's GC cannot see the staged object ids inside a raw index blob.
+        // Keep the index tree reachable alongside it.
+        let scratch = precondition::ScratchDir::for_index(&self.paths)
+            .map_err(|error| format!("prepare index snapshot: {error}"))?;
+        let copy = scratch.0.join("index");
+        if !bytes.is_empty() {
+            fs::write(&copy, &bytes).map_err(|error| format!("copy index: {error}"))?;
+        }
+        let staged = self.run(
+            &["write-tree"],
+            &[("GIT_INDEX_FILE", copy.as_os_str())],
+            None,
+        )?;
+        entries.push_str(&format!("040000 tree {}\tstaged\n", staged.trim()));
+        let tree = self.run(&["mktree"], &[], Some(entries.as_bytes()))?;
+        let id = Oid::from_hex(tree.trim()).map_err(|error| format!("save index: {error:?}"))?;
+        self.run(&["update-ref", &undo_ref(op), id.as_hex()], &[], None)?;
+        Ok(id)
     }
 
     /// Restores the recorded refs, atomically and only if each still holds
@@ -179,7 +239,14 @@ impl UndoRunner {
         // Task 13: a discard's undo writes one file back and touches no ref
         // and not the index.
         if let Some(restore) = &replay.discard {
+            let _lock = match precondition::IndexLock::acquire(&self.paths, &replay.expect) {
+                Ok(lock) => lock,
+                Err(failure) => return OpOutcome::Failed(failure),
+            };
             return self.restore_discard(restore);
+        }
+        if replay.index_effect == IndexEffect::RestoreBytes {
+            return self.restore_index_bytes(replay);
         }
         let zero = "0".repeat(replay.tree.as_hex().len());
         let transaction = |restore: bool| {
@@ -255,6 +322,58 @@ impl UndoRunner {
         OpOutcome::Succeeded
     }
 
+    fn restore_index_bytes(&self, replay: &UndoReplay) -> OpOutcome {
+        let lock = match precondition::IndexLock::acquire(&self.paths, &replay.expect) {
+            Ok(lock) => lock,
+            Err(failure) => return OpOutcome::Failed(failure),
+        };
+        let result = (|| {
+            let repo = precondition::open(&self.paths)?;
+            let id = gix::ObjectId::from_hex(replay.tree.as_hex().as_bytes())
+                .map_err(|error| error.to_string())?;
+            let tree = repo.find_tree(id).map_err(|error| error.to_string())?;
+            let read = |name: &str| -> Result<gix::Blob<'_>, String> {
+                let entry = tree
+                    .lookup_entry_by_path(name)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("index snapshot is missing {name}"))?;
+                repo.find_blob(entry.object_id())
+                    .map_err(|error| error.to_string())
+            };
+            let index = read("index")?;
+            let modified = if index.data.is_empty() {
+                None
+            } else {
+                Some(index_timestamp(&read("index-time")?.data)?)
+            };
+            if let Some(name) = shared_index_name(&index.data, repo.object_hash())? {
+                let base = read(&name)?;
+                let path = self.paths.git_dir.join(&name);
+                match fs::read(&path) {
+                    Ok(bytes) if bytes == base.data => {}
+                    Ok(_) => return Err(format!("{name} differs from the saved shared index")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let scratch = precondition::ScratchDir::for_index(&self.paths)
+                            .map_err(|error| format!("prepare shared index restore: {error}"))?;
+                        let copy = scratch.0.join(&name);
+                        fs::write(&copy, &base.data)
+                            .and_then(|()| fs::rename(&copy, &path))
+                            .map_err(|error| format!("restore {name}: {error}"))?;
+                    }
+                    Err(error) => return Err(format!("read {name}: {error}")),
+                }
+            }
+            Ok((index.data.clone(), modified))
+        })();
+        match result {
+            Ok((bytes, modified)) => match lock.replace(&self.paths.git_dir, &bytes, modified) {
+                Ok(()) => OpOutcome::Succeeded,
+                Err(error) => failed(ErrorClass::Environment, format!("restore index: {error}")),
+            },
+            Err(details) => failed(ErrorClass::Bug, details),
+        }
+    }
+
     /// Puts `HEAD` where the operation found it.
     fn move_head(&self, restore: &HeadRestore) -> Result<(), String> {
         match restore {
@@ -327,6 +446,18 @@ impl UndoRunner {
         }
     }
 
+    /// Saves `bytes` as a blob, as they are, and returns its id once it is
+    /// known to be the id of exactly these bytes.
+    pub(crate) fn save_blob(&self, bytes: &[u8]) -> Result<String, String> {
+        let hash = precondition::open(&self.paths)?.object_hash();
+        let found = self.run(
+            &["hash-object", "-w", "--no-filters", "--stdin"],
+            &[],
+            Some(bytes),
+        )?;
+        checked_blob(&found, bytes, hash)
+    }
+
     /// Runs git and returns stdout, or stderr (with the command) on failure.
     pub(crate) fn run(
         &self,
@@ -350,14 +481,35 @@ impl UndoRunner {
         let mut child = command
             .spawn()
             .map_err(|error| format!("start git: {error}"))?;
-        if let (Some(mut pipe), Some(bytes)) = (child.stdin.take(), stdin) {
-            // Small scripts only: the pipe buffer takes them whole.
-            let _ = pipe.write_all(bytes);
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("wait for git: {error}"))?;
+        // stdin is written on its own thread while `wait_with_output` drains
+        // stdout and stderr: git may write a lot (`GIT_TRACE`, a large
+        // index's errors) before it reads all of stdin, and a full pipe on
+        // each side would block both forever. Dropping the pipe at the end
+        // closes git's stdin. A write that fails means git saw only part of
+        // the input, so the run fails even when git exits 0.
+        let (output, written) = std::thread::scope(|scope| {
+            let writer = match (child.stdin.take(), stdin) {
+                (Some(mut pipe), Some(bytes)) => {
+                    Some(scope.spawn(move || pipe.write_all(bytes).and_then(|()| pipe.flush())))
+                }
+                _ => None,
+            };
+            let output = child.wait_with_output();
+            let written = writer.map_or(Ok(()), |writer| {
+                writer
+                    .join()
+                    .unwrap_or_else(|_| Err(std::io::Error::other("stdin writer panicked")))
+            });
+            (output, written)
+        });
+        let output = output.map_err(|error| format!("wait for git: {error}"))?;
         if output.status.success() {
+            if let Err(error) = written {
+                return Err(format!(
+                    "git {}: did not read all of its input: {error}",
+                    args.join(" ")
+                ));
+            }
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         } else {
             Err(format!(
@@ -367,6 +519,47 @@ impl UndoRunner {
             ))
         }
     }
+}
+
+/// The id `hash-object` printed, if it is the id of `bytes`.
+fn checked_blob(found: &str, bytes: &[u8], hash: gix::hash::Kind) -> Result<String, String> {
+    let want = crate::staging::blob_id(hash, bytes)?;
+    if found.trim() == want.as_hex() {
+        Ok(want.to_string())
+    } else {
+        Err(format!(
+            "git saved {:?} for {} bytes whose id is {want}",
+            found.trim(),
+            bytes.len()
+        ))
+    }
+}
+
+fn shared_index_name(bytes: &[u8], hash: gix::hash::Kind) -> Result<Option<String>, String> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let timestamp = gix::index::State::new(hash).timestamp();
+    let (index, _) = gix::index::State::from_bytes(bytes, timestamp, hash, Default::default())
+        .map_err(|error| format!("decode saved index: {error}"))?;
+    Ok(index
+        .link()
+        .filter(|link| !link.shared_index_checksum.is_null())
+        .map(|link| format!("sharedindex.{}", link.shared_index_checksum)))
+}
+
+fn index_timestamp(bytes: &[u8]) -> Result<SystemTime, String> {
+    let nanos = i128::from_le_bytes(bytes.try_into().map_err(|_| "invalid index timestamp")?);
+    let distance = nanos.unsigned_abs();
+    let seconds =
+        u64::try_from(distance / 1_000_000_000).map_err(|_| "index timestamp overflow")?;
+    let duration = Duration::new(seconds, (distance % 1_000_000_000) as u32);
+    let time = if nanos < 0 {
+        UNIX_EPOCH.checked_sub(duration)
+    } else {
+        UNIX_EPOCH.checked_add(duration)
+    };
+    time.ok_or_else(|| "index timestamp outside the supported range".into())
 }
 
 fn failed(class: ErrorClass, details: String) -> OpOutcome {
@@ -475,5 +668,108 @@ mod reconcile_tests {
                 prop_assert_eq!(op_of_ref(&name), Some(op));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    /// Cross review: git may write a lot to stderr (`GIT_TRACE`, hooks)
+    /// before it reads stdin. Writing all of stdin first would then block
+    /// both sides forever.
+    #[test]
+    fn big_stdin_and_chatty_stderr_do_not_deadlock() {
+        let dir = std::env::temp_dir().join(format!(
+            "invoke-git-undo-run-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let global = dir.join("gitconfig");
+        fs::write(&global, "").unwrap();
+        let runner = UndoRunner::new(
+            Git::detect("git").unwrap(),
+            RepoPaths {
+                git_dir: dir.join(".git"),
+                workdir: dir.clone(),
+            },
+        )
+        .with_env([
+            (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+            (OsString::from("GIT_CONFIG_GLOBAL"), global.into_os_string()),
+        ]);
+        let size = 4 << 20;
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let alias = "!i=0; while [ $i -lt 4000 ]; do \
+                 echo 0123456789012345678901234567890123456789012345678901234567890 >&2; \
+                 i=$((i+1)); done; wc -c";
+            let env: [(&str, &std::ffi::OsStr); 3] = [
+                ("GIT_CONFIG_COUNT", "1".as_ref()),
+                ("GIT_CONFIG_KEY_0", "alias.noisy".as_ref()),
+                ("GIT_CONFIG_VALUE_0", alias.as_ref()),
+            ];
+            let _ = send.send(runner.run(&["noisy"], &env, Some(&vec![b'x'; size])));
+        });
+        let result = receive
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the runner and git deadlocked");
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(result.unwrap().trim(), size.to_string());
+    }
+
+    /// Re-check: when git stops reading stdin and still exits 0, what it
+    /// saw is a prefix of the input. That must fail, never pass as saved.
+    #[test]
+    fn stdin_that_git_did_not_take_whole_fails_the_run() {
+        let dir = std::env::temp_dir().join(format!(
+            "invoke-git-undo-stdin-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let global = dir.join("gitconfig");
+        fs::write(&global, "").unwrap();
+        let runner = UndoRunner::new(
+            Git::detect("git").unwrap(),
+            RepoPaths {
+                git_dir: dir.join(".git"),
+                workdir: dir.clone(),
+            },
+        )
+        .with_env([
+            (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+            (OsString::from("GIT_CONFIG_GLOBAL"), global.into_os_string()),
+        ]);
+        let env: [(&str, &std::ffi::OsStr); 3] = [
+            ("GIT_CONFIG_COUNT", "1".as_ref()),
+            ("GIT_CONFIG_KEY_0", "alias.quits".as_ref()),
+            ("GIT_CONFIG_VALUE_0", "!true".as_ref()),
+        ];
+        let result = runner.run(&["quits"], &env, Some(&vec![b'x'; 4 << 20]));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    /// Re-check: the id git reports for a saved blob must be the id of the
+    /// bytes handed to it.
+    #[test]
+    fn a_blob_id_that_is_not_the_inputs_is_refused() {
+        let hash = gix::hash::Kind::Sha1;
+        let id = crate::staging::blob_id(hash, b"whole").unwrap();
+        assert_eq!(
+            checked_blob(&format!("{id}\n"), b"whole", hash),
+            Ok(id.to_string())
+        );
+        let prefix = crate::staging::blob_id(hash, b"who").unwrap();
+        assert!(checked_blob(&format!("{prefix}\n"), b"whole", hash).is_err());
+        assert!(checked_blob("", b"whole", hash).is_err());
     }
 }

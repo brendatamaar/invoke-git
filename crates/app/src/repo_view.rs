@@ -25,7 +25,7 @@ use crate::branch_panel::BranchPanel;
 use crate::commit_box::CommitBox;
 use crate::commit_pane::{InspectFile, StartRebase};
 use crate::conflict_view::ConflictPane;
-use crate::diff_load::{self, Loaded, Verb};
+use crate::diff_load::{self, Loaded};
 use crate::discard::{self, Confirm, What};
 use crate::file_insights::{FileInsights, FileInsightsEvent, FileMode, FileVersion, file_actions};
 use crate::history_view::HistoryPane;
@@ -66,10 +66,13 @@ enum FileBack {
 /// the previous to finish and for the repo to be read again.
 enum Bulk {
     Idle,
-    /// The next request is being built on a background thread.
-    Preparing,
     /// A request was handed to the core; waiting for the session to settle.
     Running,
+}
+
+enum QueuedFile {
+    Toggle(Section, RepoPath),
+    Discard(Box<Event>),
 }
 
 pub struct RepoView {
@@ -93,9 +96,10 @@ pub struct RepoView {
     diff: Entity<DiffView>,
     selected: Option<(Section, RepoPath)>,
     collapsed: HashSet<(Section, String)>,
-    queue: VecDeque<(Verb, Section, RepoPath)>,
-    /// A discard waiting for the user's yes.
-    confirm: Option<Confirm>,
+    queue: VecDeque<QueuedFile>,
+    /// A discard waiting for the user's yes, or being prepared for it.
+    /// Not tied to `request`, which every watcher read bumps.
+    confirm: discard::Confirmation,
     bulk: Bulk,
     /// Something the app itself has to say (a file that cannot be staged).
     local_notice: Option<String>,
@@ -254,7 +258,7 @@ impl RepoView {
             selected: None,
             collapsed: HashSet::new(),
             queue: VecDeque::new(),
-            confirm: None,
+            confirm: discard::Confirmation::default(),
             bulk: Bulk::Idle,
             local_notice: None,
             last_read: None,
@@ -416,7 +420,7 @@ impl RepoView {
     }
 
     fn clear(&mut self, cx: &mut Context<Self>) {
-        self.confirm = None;
+        self.confirm.clear();
         self.selected = None;
         self.request += 1;
         self.diff.update(cx, |diff, cx| {
@@ -425,7 +429,7 @@ impl RepoView {
     }
 
     fn select(&mut self, section: Section, path: RepoPath, cx: &mut Context<Self>) {
-        self.confirm = None;
+        self.confirm.clear();
         self.selected = Some((section, path.clone()));
         self.diff
             .update(cx, |diff, cx| diff.set_content(DiffContent::Loading, cx));
@@ -458,6 +462,18 @@ impl RepoView {
                         Loaded::Message(text) => {
                             this.diff.update(cx, |diff, cx| {
                                 diff.set_content(DiffContent::Message(text.into()), cx)
+                            });
+                            None
+                        }
+                        Loaded::FileMessage { text, mode } => {
+                            this.diff.update(cx, |diff, cx| {
+                                diff.set_content(
+                                    DiffContent::FileMessage {
+                                        text: text.into(),
+                                        mode,
+                                    },
+                                    cx,
+                                )
                             });
                             None
                         }
@@ -521,7 +537,11 @@ impl RepoView {
             ),
         };
         if discard {
-            self.ask_to_discard(&path, &part, cx);
+            if part == Part::File {
+                self.prepare_discard(vec![path], cx);
+            } else {
+                self.ask_to_discard(&path, &part, cx);
+            }
             return;
         }
         let request = {
@@ -552,9 +572,35 @@ impl RepoView {
                 what: What::Request(Box::new(event)),
             }
         };
+        // This confirmation is the newest; a file list still being prepared
+        // must not replace it.
         self.local_notice = None;
-        self.confirm = Some(confirm);
+        self.confirm.show(confirm);
         cx.notify();
+    }
+
+    fn prepare_discard(&mut self, files: Vec<RepoPath>, cx: &mut Context<Self>) {
+        if files.is_empty() {
+            return;
+        }
+        let paths = self.session.read(cx).discovered.paths.clone();
+        let ticket = self.confirm.start();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { discard::prepare(&paths, files) })
+                .await;
+            this.update(cx, |this, cx| {
+                match this.confirm.finish(ticket, result) {
+                    None => return,
+                    Some(Ok(())) => this.local_notice = None,
+                    Some(Err(error)) => this.local_notice = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The user said yes.
@@ -564,19 +610,20 @@ impl RepoView {
         };
         match confirm.what {
             What::Request(event) => self.deliver(*event, cx),
-            What::Files(files) => self.enqueue_with(
-                files
-                    .into_iter()
-                    .map(|path| (Verb::Discard, Section::Unstaged, path))
-                    .collect(),
-                cx,
-            ),
+            What::Files(files) => {
+                self.queue.extend(
+                    files
+                        .into_iter()
+                        .map(|event| QueuedFile::Discard(Box::new(event))),
+                );
+                self.next_in_queue(cx);
+            }
         }
         cx.notify();
     }
 
     fn cancel_discard(&mut self, cx: &mut Context<Self>) {
-        self.confirm = None;
+        self.confirm.clear();
         cx.notify();
     }
 
@@ -615,17 +662,7 @@ impl RepoView {
                 cx,
             ),
             TreeAction::DiscardAll => {
-                let files = files_of(&status, Section::Unstaged, None);
-                if !files.is_empty() {
-                    let (text, button) = discard::describe_files(files.len());
-                    self.confirm = Some(Confirm {
-                        text,
-                        button,
-                        what: What::Files(files),
-                    });
-                    self.local_notice = None;
-                    cx.notify();
-                }
+                self.prepare_discard(files_of(&status, Section::Unstaged, None), cx);
             }
             TreeAction::All { section } => self.enqueue(
                 files_of(&status, section, None)
@@ -638,15 +675,12 @@ impl RepoView {
     }
 
     fn enqueue(&mut self, files: Vec<(Section, RepoPath)>, cx: &mut Context<Self>) {
-        let files = files
-            .into_iter()
-            .map(|(section, path)| (Verb::Toggle, section, path));
-        self.enqueue_with(files.collect(), cx);
-    }
-
-    fn enqueue_with(&mut self, files: Vec<(Verb, Section, RepoPath)>, cx: &mut Context<Self>) {
         self.local_notice = None;
-        self.queue.extend(files);
+        self.queue.extend(
+            files
+                .into_iter()
+                .map(|(section, path)| QueuedFile::Toggle(section, path)),
+        );
         self.next_in_queue(cx);
     }
 
@@ -655,44 +689,23 @@ impl RepoView {
         if !matches!(self.bulk, Bulk::Idle) || !self.settled(cx) {
             return;
         }
-        let Some((verb, section, path)) = self.queue.pop_front() else {
+        let Some(disk) = self.session.read(cx).state.fresh_disk() else {
             return;
         };
-        self.bulk = Bulk::Preparing;
-        let paths = self.session.read(cx).discovered.paths.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let path = path.clone();
-                    async move { diff_load::file_request(&paths, &path, section, verb) }
-                })
-                .await;
-            this.update(cx, |this, cx| match result {
-                Ok(Some(event)) => {
-                    this.bulk = Bulk::Running;
-                    this.session
-                        .update(cx, |session, cx| session.deliver(event, cx));
+        while let Some(file) = self.queue.pop_front() {
+            let event = match file {
+                QueuedFile::Toggle(section, path) => {
+                    if !has(&disk.status, section, &path) {
+                        continue;
+                    }
+                    staging::file_request(section, path, disk.index.clone())
                 }
-                Ok(None) => {
-                    this.bulk = Bulk::Idle;
-                    this.next_in_queue(cx);
-                }
-                Err(message) => {
-                    let what = if verb == Verb::Discard {
-                        "discard"
-                    } else {
-                        "stage"
-                    };
-                    this.local_notice = Some(format!("Cannot {what} {}: {message}", path.0));
-                    this.bulk = Bulk::Idle;
-                    this.next_in_queue(cx);
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
+                QueuedFile::Discard(event) => *event,
+            };
+            self.bulk = Bulk::Running;
+            self.deliver(event, cx);
+            break;
+        }
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
@@ -863,7 +876,7 @@ impl Render for RepoView {
             banners = banners.child(banner);
             any = true;
         }
-        if let Some(confirm) = &self.confirm {
+        if let Some(confirm) = self.confirm.shown() {
             let (yes, no) = (cx.entity(), cx.entity());
             banners = banners.child(
                 Banner::new(BannerKind::Warning, confirm.text.clone())

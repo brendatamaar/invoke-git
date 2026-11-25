@@ -131,6 +131,7 @@ pub fn encode(entry: &UndoEntry) -> String {
     w.index(&point.index);
     w.word(match point.index_effect {
         IndexEffect::Rewrites => "rewrites",
+        IndexEffect::RestoreBytes => "restore-bytes",
         IndexEffect::Untouched => "untouched",
     });
     match &point.reverse {
@@ -248,6 +249,7 @@ pub fn decode(line: &str) -> Result<UndoEntry, String> {
     let index = r.index()?;
     let index_effect = match r.next("index effect")? {
         "rewrites" => IndexEffect::Rewrites,
+        "restore-bytes" => IndexEffect::RestoreBytes,
         "untouched" => IndexEffect::Untouched,
         other => return Err(format!("unknown index effect {other:?}")),
     };
@@ -438,21 +440,21 @@ mod tests {
             head(),
             refs(),
             index(),
-            any::<bool>(),
+            prop_oneof![
+                Just(IndexEffect::Rewrites),
+                Just(IndexEffect::RestoreBytes),
+                Just(IndexEffect::Untouched),
+            ],
             reversal(),
         )
             .prop_map(
-                |(op, label, head, refs, index, rewrites, reverse)| UndoPoint {
+                |(op, label, head, refs, index, index_effect, reverse)| UndoPoint {
                     op: OpId(op),
                     label,
                     head,
                     refs,
                     index,
-                    index_effect: if rewrites {
-                        IndexEffect::Rewrites
-                    } else {
-                        IndexEffect::Untouched
-                    },
+                    index_effect,
                     reverse,
                 },
             );

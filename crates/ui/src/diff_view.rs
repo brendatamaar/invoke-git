@@ -49,6 +49,10 @@ pub enum Content {
     Loading,
     /// A message instead of a diff: no file selected, binary, not text.
     Message(SharedString),
+    FileMessage {
+        text: SharedString,
+        mode: StageMode,
+    },
     Text(Box<DiffData>),
 }
 
@@ -255,8 +259,11 @@ impl DiffView {
         }
         let (layout_view, around_view) = (cx.entity(), cx.entity());
         let discard_view = cx.entity();
-        let can_discard =
-            matches!(&self.content, Content::Text(data) if data.mode == StageMode::Stage);
+        let can_discard = match &self.content {
+            Content::Text(data) => data.mode == StageMode::Stage,
+            Content::FileMessage { mode, .. } => *mode == StageMode::Stage,
+            _ => false,
+        };
         bar.child(div().flex_1())
             .children(can_discard.then(|| {
                 Button::new("diff-discard-file", "Discard file")
@@ -353,7 +360,9 @@ impl Render for DiffView {
         let p = cx.palette();
         let body: AnyElement = match &self.content {
             Content::Loading => self.message("Reading the diff…".into(), cx),
-            Content::Message(text) => self.message(text.clone(), cx),
+            Content::Message(text) | Content::FileMessage { text, .. } => {
+                self.message(text.clone(), cx)
+            }
             Content::Text(data) if data.diff.is_empty() => {
                 self.message("No differences".into(), cx)
             }
