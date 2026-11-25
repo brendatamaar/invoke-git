@@ -20,7 +20,7 @@ use invoke_core::forge::{
 };
 use shell::forge::{ForgeError, ForgeService, KeyringStore, ServiceConfig, SignInRunner};
 use tokens::{
-    SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_SMALL, TEXT_TITLE,
+    DIALOG, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_SMALL, TEXT_TITLE,
 };
 use ui::convert::hsla;
 use ui::{
@@ -71,7 +71,49 @@ pub fn shared_or_open<T: Clone, E>(
     Ok(value)
 }
 
+/// A change to the connected accounts the user asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountChange {
+    Disconnect(String),
+    Prefer(String),
+}
+
+/// What a change came to: whether the list changed, and what to tell the
+/// user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeOutcome {
+    pub changed: bool,
+    pub notice: Option<(BannerKind, String)>,
+}
+
+/// Carries out a change. It blocks on the keychain and the disk, so it is
+/// only ever called on a background thread.
+pub fn apply_change(service: &ForgeService, change: &AccountChange) -> ChangeOutcome {
+    let result = match change {
+        AccountChange::Disconnect(key) => service.disconnect(key),
+        AccountChange::Prefer(key) => service.prefer(key),
+    };
+    match (result, change) {
+        (Ok(()), AccountChange::Disconnect(_)) => ChangeOutcome {
+            changed: true,
+            notice: Some((
+                BannerKind::Warning,
+                "Disconnected. The token was removed from the keychain.".into(),
+            )),
+        },
+        (Ok(()), AccountChange::Prefer(_)) => ChangeOutcome {
+            changed: true,
+            notice: None,
+        },
+        (Err(error), _) => ChangeOutcome {
+            changed: false,
+            notice: Some((BannerKind::Error, error.user_message())),
+        },
+    }
+}
+
 /// What the sign-in area shows.
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignInScreen {
     /// Nothing running.
@@ -175,6 +217,8 @@ pub struct AccountsView {
     instance: Entity<TextEditor>,
     /// A token is being checked with the server.
     checking: bool,
+    /// A disconnect or preference change running in the background.
+    changing: Option<AccountChange>,
     notice: Option<(BannerKind, String)>,
     _pump: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -230,6 +274,7 @@ impl AccountsView {
             token,
             instance,
             checking: false,
+            changing: None,
             notice: None,
             _pump: Self::pump(inbox, cx),
             _subscriptions: subscriptions,
@@ -372,26 +417,33 @@ impl AccountsView {
 
     // -- the list -----------------------------------------------------------------
 
-    fn disconnect(&mut self, key: &str, cx: &mut Context<Self>) {
-        match self.service.disconnect(key) {
-            Ok(()) => {
-                self.notice = Some((
-                    BannerKind::Warning,
-                    "Disconnected. The token was removed from the keychain.".into(),
-                ));
-                cx.emit(AccountsEvent::Changed);
-            }
-            Err(error) => self.notice = Some((BannerKind::Error, error.user_message())),
+    /// Disconnect and preference changes touch the keychain and the disk, so
+    /// they run in the background: a slow or stuck keychain never freezes the
+    /// window. One change at a time.
+    fn change(&mut self, change: AccountChange, cx: &mut Context<Self>) {
+        if self.changing.is_some() {
+            return;
         }
+        self.changing = Some(change.clone());
+        self.notice = None;
+        let service = self.service.clone();
         cx.notify();
-    }
-
-    fn prefer(&mut self, key: &str, cx: &mut Context<Self>) {
-        match self.service.prefer(key) {
-            Ok(()) => cx.emit(AccountsEvent::Changed),
-            Err(error) => self.notice = Some((BannerKind::Error, error.user_message())),
-        }
-        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { apply_change(&service, &change) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.changing = None;
+                if outcome.changed {
+                    cx.emit(AccountsEvent::Changed);
+                }
+                this.notice = outcome.notice;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn show_token_panel(&mut self, cx: &mut Context<Self>) {
@@ -437,12 +489,17 @@ impl Render for AccountsView {
                 .text_style(&TEXT_SMALL, cx)
                 .text_color(hsla(p.ink_muted))
         };
-        let mut body = div().flex().flex_col().gap(px(SPACE_4)).w(px(520.)).child(
-            div()
-                .text_style(&TEXT_TITLE, cx)
-                .text_color(hsla(p.ink))
-                .child("Accounts"),
-        );
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_4))
+            .w(px(DIALOG))
+            .child(
+                div()
+                    .text_style(&TEXT_TITLE, cx)
+                    .text_color(hsla(p.ink))
+                    .child("Accounts"),
+            );
         body = body.child(muted(cx).child(
             "Optional. Connect GitHub or GitLab to pick repositories to clone. Git itself keeps using your usual credentials, and tokens stay in the system keychain.",
         ));
@@ -635,7 +692,9 @@ impl AccountsView {
                     )
                     .ghost()
                     .on_click(move |_, _, cx| {
-                        prefer.update(cx, |this, cx| this.prefer(&prefer_key, cx))
+                        prefer.update(cx, |this, cx| {
+                            this.change(AccountChange::Prefer(prefer_key.clone()), cx)
+                        })
                     }),
                 );
             }
@@ -643,7 +702,9 @@ impl AccountsView {
                 Button::new(("forge-disconnect", index), "Disconnect")
                     .ghost()
                     .on_click(move |_, _, cx| {
-                        disconnect.update(cx, |this, cx| this.disconnect(&disconnect_key, cx))
+                        disconnect.update(cx, |this, cx| {
+                            this.change(AccountChange::Disconnect(disconnect_key.clone()), cx)
+                        })
                     }),
             );
             list = list.child(
@@ -924,6 +985,27 @@ mod tests {
             Err("disk")
         );
         assert_eq!(shared_or_open(&empty, || Ok::<_, &str>(7)), Ok(7));
+    }
+
+    #[test]
+    fn an_account_change_reports_what_happened() {
+        let service = ForgeService::new(
+            Arc::new(shell::forge::MemoryStore::new()),
+            ServiceConfig::default(),
+            None,
+        )
+        .unwrap();
+        for change in [
+            AccountChange::Disconnect("github|https://github.com|ghost".into()),
+            AccountChange::Prefer("github|https://github.com|ghost".into()),
+        ] {
+            let outcome = apply_change(&service, &change);
+            assert!(!outcome.changed, "{change:?}");
+            assert!(
+                matches!(&outcome.notice, Some((BannerKind::Error, text)) if text.contains("no longer connected")),
+                "{change:?}: {outcome:?}"
+            );
+        }
     }
 
     #[test]
