@@ -2428,3 +2428,38 @@ fn a_cancelled_device_request_that_answers_late_cannot_replace_the_new_one() {
         assert_eq!(event, SignInEvent::Pending);
     }
 }
+
+#[test]
+fn a_repo_that_shows_either_token_anywhere_is_dropped() {
+    let mock = Mock::start(|_| {
+        Box::new(|request| match request.path() {
+            "/user" => Reply::json(r#"{"login":"ana"}"#),
+            _ => Reply::json(
+                r#"[{"full_name":"a/ok","clone_url":"https://github.com/a/ok.git","description":"fine"},
+                    {"full_name":"a/desc","clone_url":"https://github.com/a/d.git","description":"see GHP_ANA here"},
+                    {"full_name":"a/ghr_refresh9","clone_url":"https://github.com/a/n.git"},
+                    {"full_name":"a/clone","clone_url":"https://github.com/ghr_REFRESH9/c.git"},
+                    {"full_name":"a/branch","clone_url":"https://github.com/a/b.git","default_branch":"ghp_ana"}]"#,
+            ),
+        })
+    });
+    let store = memory();
+    let service = service(&mock, store.clone(), None);
+    let account = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    // The account also holds a refresh token.
+    store
+        .save(
+            &account.key(),
+            &Credential {
+                access: Secret::new("ghp_ANA").unwrap(),
+                refresh: Secret::new("ghr_REFRESH9"),
+                expires_at: None,
+            },
+        )
+        .unwrap();
+    let listing = service.list_repos(&account.key(), 1).unwrap();
+    let names: Vec<&str> = listing.repos.iter().map(|r| r.full_name.as_str()).collect();
+    assert_eq!(names, ["a/ok"]);
+}

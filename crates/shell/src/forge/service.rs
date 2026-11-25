@@ -646,10 +646,10 @@ impl ForgeService {
     pub fn list_repos_page(&self, key: &str, cursor: Option<&str>) -> Result<RepoPage, ForgeError> {
         let account = self.account(key)?;
         let credential = self.credential(&account)?;
-        match self.page(&account, &credential.access, cursor) {
+        match self.page(&account, &credential, cursor) {
             Err(ForgeError::Unauthorized) if credential.refresh.is_some() => {
                 let fresh = self.refresh(&account, &credential)?;
-                self.page(&account, &fresh.access, cursor)
+                self.page(&account, &fresh, cursor)
             }
             other => other,
         }
@@ -658,9 +658,10 @@ impl ForgeService {
     fn page(
         &self,
         account: &ForgeAccount,
-        token: &Secret,
+        credential: &Credential,
         cursor: Option<&str>,
     ) -> Result<RepoPage, ForgeError> {
+        let token = &credential.access;
         let mut page = match account.kind {
             ForgeKind::GitHub => api::github::list_repos_page(
                 &self.inner.http,
@@ -672,11 +673,26 @@ impl ForgeService {
                 api::gitlab::list_repos_page(&self.inner.http, &account.origin, token, cursor)
             }
         }?;
-        // A clone address ends up in the new repo's config: one that holds
-        // the token (in any case, anywhere) is dropped.
-        let secret = token.expose().to_ascii_lowercase();
-        page.repos
-            .retain(|repo| !repo.clone_url.to_ascii_lowercase().contains(&secret));
+        // Every field of a repo is shown or used (the clone address ends up
+        // in the new repo's config): a repo where any of them holds the
+        // access or the refresh token, in any case, is dropped.
+        let secrets: Vec<String> = std::iter::once(&credential.access)
+            .chain(credential.refresh.as_ref())
+            .map(|secret| secret.expose().to_ascii_lowercase())
+            .collect();
+        page.repos.retain(|repo| {
+            let fields = [
+                Some(repo.full_name.as_str()),
+                Some(repo.clone_url.as_str()),
+                Some(repo.description.as_str()),
+                repo.default_branch.as_deref(),
+                repo.updated_at.as_deref(),
+            ];
+            !fields.into_iter().flatten().any(|field| {
+                let field = field.to_ascii_lowercase();
+                secrets.iter().any(|secret| field.contains(secret))
+            })
+        });
         Ok(page)
     }
 
