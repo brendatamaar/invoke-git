@@ -1,5 +1,5 @@
 # P9 - Pull Requests & Merge Requests
-Status: review
+Status: done
 Depends on: P8
 Parallel-safe with: P4b, P5, P6, P7, P10, P11
 
@@ -34,6 +34,7 @@ Memungkinkan user melihat daftar Pull Request (GitHub) dan Merge Request (GitLab
   - `runner.rs`: temp ref `refs/invoke-git/pr-checkout/op-<pid>-<seq>` memakai `AtomicU64` global per proses (aman lintas linked worktrees); urutan pemeriksaan pasca-fetch diperketat: cek `read_state` & resolusi OID dulu, lalu tepat sebelum `git switch` cek ulang `cancelled()`, `precondition::check`, dan `precondition::check_refs`.
   - `app/src/pr_view.rs`: `configured_upstream` kini diikat ke nama branch lokal (`Option<(String, BranchUpstream)>`) sehingga pergantian branch tidak pernah memakai upstream branch lama.
   - `shell/src/forge/service.rs` & `api.rs`: `head_repo` GitHub mengirim nama repo saja (`head_repo_name`); GitLab `get_pr_detail` meneruskan status eksplisit `ReviewStatus::Pending` saat `approved: false`; origin `web_url` GitLab selalu diikat ke `account.origin` (termasuk loopback); `pct_decode_lossy` memindai token ter-encode meski ada escape `%` cacat di bagian lain URL/teks.
+- **Verifikasi manual Windows (2026-11-25):** Lulus seluruh tahap oleh pengguna (connect akun, list/filter/detail PR, penolakan tanpa upstream, pembuatan PR dari pasca-push Review, penolakan dirty worktree & branch existing, serta checkout `refs/pull/1/head` ke `pr/1` dengan Law 9 & Law 11 terjaga). Temuan visual layar Accounts tanpa padding diperbaiki di `041f55d` (merender `AccountsView` langsung seperti `CloneView` + pesan 403 GitHub dengan tombol `Reconnect…`).
   - **UI (`crates/app`):** `pr_view.rs` (`PrPane`: daftar PR/MR, filter `Open | Closed | All`, pencarian, pemilih remote, detail + status review + "Checkout as pr/<n>" + "Open in browser", form Create PR/MR dengan dukungan fork & draft, overlay `AccountsView` jika host belum terhubung), integrasi tab `Pull Requests` di `repo_view.rs`, tombol `Create Pull / Merge Request` pasca-push di `review_view.rs`, serta pesan penolakan di `notice.rs` dan status progress di `sync.rs`.
 - **Checklist verifikasi manual Windows:**
   1. Build `cargo build -p app -p askpass`, jalankan dengan profil bersih: `$env:INVOKE_GIT_DATA_DIR = "$env:TEMP\ig-p9"`.
