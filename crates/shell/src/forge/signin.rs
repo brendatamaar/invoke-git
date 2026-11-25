@@ -103,16 +103,23 @@ impl SignInRunner {
                 });
             }
             SignInCommand::Abort => {
-                // Never waits for a write in progress (that flow undoes its own
-                // write); undoes a finished commit. What is stored matches the
-                // "cancelled" shown, and a failed undo is reported, not dropped.
+                // Flag cancellation synchronously so in-flight polls/writes
+                // stop at once, then run any committed-attempt undo off the
+                // caller thread so the UI never blocks on the OS lock or
+                // Credential Manager.
                 let (attempt, cancel) = self.current_cancel();
-                if let Err(error) = self.service.cancel_flow(&cancel) {
-                    Outbox { attempt, events }
-                        .post(SignInReply::CleanupFailed(error.user_message()));
-                }
+                let committed = self.service.begin_cancel(&cancel);
                 if let Ok(mut device) = self.device.lock() {
                     *device = None;
+                }
+                if let Some(commit) = committed {
+                    let service = self.service.clone();
+                    let out = Outbox { attempt, events };
+                    thread::spawn(move || {
+                        if let Err(error) = service.undo_commit(&commit) {
+                            out.post(SignInReply::CleanupFailed(error.user_message()));
+                        }
+                    });
                 }
             }
         }

@@ -136,7 +136,7 @@ enum Gate {
     Cancelled,
 }
 
-struct Commit {
+pub(super) struct Commit {
     account: ForgeAccount,
     written: Credential,
     previous_account: Option<ForgeAccount>,
@@ -416,36 +416,31 @@ impl ForgeService {
         self.register(kind, origin, &username, AuthMethod::OAuth, credential, flow)
     }
 
-    /// Cancels a flow without ever waiting for a write in progress (see
-    /// [`FlowControl`]). If it already committed (and the user was not yet
-    /// told), that commit is undone, so what is stored matches the
-    /// "cancelled" the user sees. Undoing is compare-and-restore: it only
-    /// touches the account and token this flow wrote, and only if they are
-    /// still as it left them (a later sign-in or disconnect wins). An undo
-    /// that fails is returned (`RollbackFailed`), never dropped.
-    pub(super) fn cancel_flow(&self, flow: &FlowControl) -> Result<(), ForgeError> {
+    /// Marks `flow` cancelled without ever waiting on IO or file locks (see
+    /// [`FlowControl`]). Returns the finished [`Commit`] if this flow already
+    /// committed, so the caller can run [`undo_commit`](Self::undo_commit) on
+    /// a background thread.
+    pub(super) fn begin_cancel(&self, flow: &FlowControl) -> Option<Box<Commit>> {
         flow.cancelled.store(true, Ordering::SeqCst);
-        let committed = {
-            let mut gate = flow.gate();
-            match std::mem::replace(&mut *gate, Gate::Cancelled) {
-                Gate::Committed(commit) => Some(commit),
-                Gate::Committing { .. } => {
-                    // The flow undoes its own write when it finishes.
-                    *gate = Gate::Committing {
-                        cancel_requested: true,
-                    };
-                    None
-                }
-                Gate::Open | Gate::Cancelled => None,
+        let mut gate = flow.gate();
+        match std::mem::replace(&mut *gate, Gate::Cancelled) {
+            Gate::Committed(commit) => Some(commit),
+            Gate::Committing { .. } => {
+                // The flow undoes its own write when it finishes.
+                *gate = Gate::Committing {
+                    cancel_requested: true,
+                };
+                None
             }
-        };
-        match committed {
-            Some(commit) => {
-                let mut writing = self.begin_write().map_err(|_| ForgeError::RollbackFailed)?;
-                self.undo_locked(&mut writing.book, &commit)
-            }
-            None => Ok(()),
+            Gate::Open | Gate::Cancelled => None,
         }
+    }
+
+    /// Undoes a finished commit returned by [`begin_cancel`](Self::begin_cancel).
+    /// Blocks on the OS lock and keychain; call off the UI thread.
+    pub(super) fn undo_commit(&self, commit: &Commit) -> Result<(), ForgeError> {
+        let mut writing = self.begin_write().map_err(|_| ForgeError::RollbackFailed)?;
+        self.undo_locked(&mut writing.book, commit)
     }
 
     /// Puts back what `commit` replaced, if it is still what the flow wrote.

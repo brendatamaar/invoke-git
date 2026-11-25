@@ -165,8 +165,71 @@ impl KeyringStore {
         }
     }
 
+    /// Scopes the keychain service name to one app data directory so two
+    /// profiles (for example via `INVOKE_GIT_DATA_DIR`) do not share or
+    /// overwrite each other's Credential Manager entries.
+    pub fn for_data_dir(dir: &std::path::Path) -> Self {
+        let normalized = normalize_data_dir(dir);
+        let digest = super::codec::sha256(normalized.as_bytes());
+        let mut tag = String::with_capacity(12);
+        for byte in &digest[..6] {
+            use std::fmt::Write as _;
+            let _ = write!(&mut tag, "{byte:02x}");
+        }
+        Self {
+            service: format!("{} ({tag})", Self::SERVICE),
+        }
+    }
+
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
     fn entry(&self, key: &str) -> Result<keyring::Entry, ForgeError> {
         keyring::Entry::new(&self.service, key).map_err(keychain_error)
+    }
+}
+
+/// Canonicalizes the longest existing ancestor of `dir` and re-attaches any
+/// uncreated tail so the namespace tag stays identical before and after the
+/// folder is first created.
+fn normalize_data_dir(dir: &std::path::Path) -> String {
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut existing = abs.as_path();
+    let mut tail = Vec::new();
+    let canonical = loop {
+        if let Ok(found) = std::fs::canonicalize(existing) {
+            break found;
+        }
+        match existing.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                match existing.parent() {
+                    Some(parent) => existing = parent,
+                    None => break abs.clone(),
+                }
+            }
+            None => break abs.clone(),
+        }
+    };
+    let mut full = canonical;
+    for part in tail.into_iter().rev() {
+        full.push(part);
+    }
+    let text = full.to_string_lossy();
+    let trimmed = if cfg!(windows) {
+        text.strip_prefix(r"\\?\")
+            .unwrap_or(&text)
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    } else {
+        text.trim_end_matches('/').to_owned()
+    };
+    if trimmed.is_empty() {
+        text.into_owned()
+    } else {
+        trimmed
     }
 }
 

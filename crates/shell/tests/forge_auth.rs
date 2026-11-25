@@ -1989,6 +1989,14 @@ fn abort(runner: &SignInRunner) {
     runner.execute(SignInCommand::Abort, sender);
 }
 
+fn wait_until(mut predicate: impl FnMut() -> bool, what: &str) {
+    let started = Instant::now();
+    while !predicate() {
+        assert!(started.elapsed() < Duration::from_secs(5), "{what}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn a_cancel_after_the_commit_undoes_that_commit() {
     let mock = device_mock("granted");
@@ -1998,9 +2006,11 @@ fn a_cancel_after_the_commit_undoes_that_commit() {
     let runner = SignInRunner::new(service.clone());
     run_until_committed(&runner, &service);
     abort(&runner);
-    // Cancel returned: what is stored already agrees with "cancelled".
-    assert!(service.accounts().is_empty());
-    assert!(store.is_empty());
+    // Undo runs off the caller thread; wait for it to finish.
+    wait_until(
+        || service.accounts().is_empty() && store.is_empty(),
+        "cancel never undid the committed account",
+    );
     let text = std::fs::read_to_string(data.book()).unwrap();
     assert!(AccountBook::decode(&text).is_empty());
 }
@@ -2507,7 +2517,8 @@ fn a_repo_that_shows_either_token_anywhere_is_dropped() {
                     {"full_name":"a/desc","clone_url":"https://github.com/a/d.git","description":"see GHP_ANA here"},
                     {"full_name":"a/ghr_refresh9","clone_url":"https://github.com/a/n.git"},
                     {"full_name":"a/clone","clone_url":"https://github.com/ghr_REFRESH9/c.git"},
-                    {"full_name":"a/branch","clone_url":"https://github.com/a/b.git","default_branch":"ghp_ana"}]"#,
+                    {"full_name":"a/branch","clone_url":"https://github.com/a/b.git","default_branch":"ghp_ana"},
+                    {"full_name":"a/date","clone_url":"https://github.com/a/t.git","updated_at":"2026-01-01T00:00:00Z-ghr_refresh9"}]"#,
             ),
         })
     });
@@ -2760,9 +2771,63 @@ fn a_late_granted_from_a_cancelled_attempt_never_connects_the_next_one() {
     let (after, _) = step_sign_in(next.clone(), queued.remove(0));
     assert_eq!(after, next, "an old answer moved the new attempt");
     assert!(!matches!(after, SignInPhase::Authorized(_)));
-    assert!(
-        service.accounts().is_empty(),
-        "the cancelled account stayed"
+    wait_until(
+        || service.accounts().is_empty() && store.is_empty(),
+        "the cancelled account stayed",
     );
-    assert!(store.is_empty());
+}
+
+// -- round 6: profile-scoped keychain namespace and non-blocking abort --------
+
+#[test]
+fn different_data_dirs_use_separate_keychain_namespaces() {
+    let base = TempDir::new("keychain-ns");
+    let profile_a = base.0.join("profile-a");
+    let profile_b = base.0.join("profile-b");
+
+    let before_create = shell::forge::KeyringStore::for_data_dir(&profile_a);
+    let other = shell::forge::KeyringStore::for_data_dir(&profile_b);
+    assert!(
+        before_create
+            .service()
+            .starts_with(shell::forge::KeyringStore::SERVICE)
+    );
+    assert_ne!(
+        before_create.service(),
+        other.service(),
+        "different profiles must not share a Credential Manager namespace"
+    );
+
+    // Creating the directory later must keep the exact same namespace tag.
+    std::fs::create_dir_all(&profile_a).unwrap();
+    let after_create = shell::forge::KeyringStore::for_data_dir(&profile_a);
+    assert_eq!(
+        before_create.service(),
+        after_create.service(),
+        "namespace tag changed after directory creation"
+    );
+}
+
+#[test]
+fn abort_does_not_block_the_caller_when_undo_waits_on_the_keychain() {
+    let mock = device_mock("granted");
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), None);
+    let runner = SignInRunner::new(service.clone());
+    run_until_committed(&runner, &service);
+
+    store.delete_delay_ms.store(400, Ordering::SeqCst);
+    let (events, _inbox) = mpsc::channel();
+    let started = Instant::now();
+    runner.execute(SignInCommand::Abort, events);
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "Abort blocked the caller for {:?}",
+        started.elapsed()
+    );
+
+    wait_until(
+        || service.accounts().is_empty() && store.inner.is_empty(),
+        "background undo never finished",
+    );
 }

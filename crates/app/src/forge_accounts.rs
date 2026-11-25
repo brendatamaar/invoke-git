@@ -47,12 +47,13 @@ pub enum AccountsEvent {
 pub fn open_service() -> Result<ForgeService, ForgeError> {
     static SHARED: std::sync::Mutex<Option<ForgeService>> = std::sync::Mutex::new(None);
     shared_or_open(&SHARED, || {
-        let path = persist::data_dir().map(|dir| dir.join("forge-accounts.txt"));
-        ForgeService::new(
-            Arc::new(KeyringStore::new()),
-            ServiceConfig::default(),
-            path,
-        )
+        let dir = persist::data_dir();
+        let store = match &dir {
+            Some(dir) => KeyringStore::for_data_dir(dir),
+            None => KeyringStore::new(),
+        };
+        let path = dir.map(|dir| dir.join("forge-accounts.txt"));
+        ForgeService::new(Arc::new(store), ServiceConfig::default(), path)
     })
 }
 
