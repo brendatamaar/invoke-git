@@ -121,9 +121,12 @@ fn next_page(response: &HttpResponse, base: &str) -> Option<String> {
     same_origin(&next, base).then_some(next)
 }
 
-/// A repository address git may clone: http(s) only.
+/// A repository address git may clone and keep as `origin`: http(s) only,
+/// and nothing that could carry a credential into the repo's config: no
+/// user name or password (`origin_of_url` refuses those), no query and no
+/// fragment.
 fn clone_url_ok(url: &str) -> bool {
-    !url.starts_with('-') && origin_of_url(url).is_some()
+    !url.starts_with('-') && !url.contains(['?', '#']) && origin_of_url(url).is_some()
 }
 
 fn api_get(
@@ -481,6 +484,10 @@ mod tests {
     fn a_clone_address_git_could_run_a_command_for_is_dropped() {
         for url in [
             "ext::sh -c touch% /tmp/pwned",
+            "https://x-access-token:ghp_SECRET@github.com/a/b.git",
+            "https://ghp_SECRET@github.com/a/b.git",
+            "https://github.com/a/b.git?access_token=ghp_SECRET",
+            "https://github.com/a/b.git#ghp_SECRET",
             "file:///etc/passwd",
             "--upload-pack=evil",
             "git@github.com:a/b.git",

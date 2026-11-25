@@ -661,7 +661,7 @@ impl ForgeService {
         token: &Secret,
         cursor: Option<&str>,
     ) -> Result<RepoPage, ForgeError> {
-        match account.kind {
+        let mut page = match account.kind {
             ForgeKind::GitHub => api::github::list_repos_page(
                 &self.inner.http,
                 &self.inner.config.github.api,
@@ -671,7 +671,13 @@ impl ForgeService {
             ForgeKind::GitLab => {
                 api::gitlab::list_repos_page(&self.inner.http, &account.origin, token, cursor)
             }
-        }
+        }?;
+        // A clone address ends up in the new repo's config: one that holds
+        // the token (in any case, anywhere) is dropped.
+        let secret = token.expose().to_ascii_lowercase();
+        page.repos
+            .retain(|repo| !repo.clone_url.to_ascii_lowercase().contains(&secret));
+        Ok(page)
     }
 
     /// Up to `max_pages` pages, newest activity first. When the limit stops

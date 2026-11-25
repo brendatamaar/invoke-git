@@ -2338,3 +2338,25 @@ fn a_list_changed_on_disk_during_a_write_is_not_overwritten() {
     assert_eq!(std::fs::read_to_string(data.book()).unwrap(), text);
     assert!(store.inner.is_empty());
 }
+
+#[test]
+fn a_clone_address_that_carries_the_token_is_never_offered() {
+    let mock = Mock::start(|_| {
+        Box::new(|request| match request.path() {
+            "/user" => Reply::json(r#"{"login":"ana"}"#),
+            _ => Reply::json(
+                r#"[{"full_name":"a/ok","clone_url":"https://github.com/a/ok.git"},
+                    {"full_name":"a/path","clone_url":"https://github.com/GHP_ANA/x.git"},
+                    {"full_name":"a/query","clone_url":"https://github.com/a/q.git?t=ghp_ANA"},
+                    {"full_name":"a/user","clone_url":"https://ghp_ANA@github.com/a/u.git"}]"#,
+            ),
+        })
+    });
+    let service = service(&mock, memory(), None);
+    let account = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    let listing = service.list_repos(&account.key(), 1).unwrap();
+    let names: Vec<&str> = listing.repos.iter().map(|r| r.full_name.as_str()).collect();
+    assert_eq!(names, ["a/ok"]);
+}
