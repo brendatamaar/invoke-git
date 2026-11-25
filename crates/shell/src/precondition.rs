@@ -277,6 +277,8 @@ impl ScratchDir {
 
     pub(crate) fn create(parent: &Path) -> io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Git children resolve paths from the worktree, including when temp is relative.
+        let parent = std::path::absolute(parent)?;
         let builder = fs::DirBuilder::new();
         #[cfg(unix)]
         let builder = {
