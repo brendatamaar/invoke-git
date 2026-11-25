@@ -54,7 +54,8 @@ pub fn action_of(request: &WriteRequest) -> Option<Action> {
         | WriteRequest::WorktreeAdd { .. }
         | WriteRequest::WorktreeRemove { .. }
         | WriteRequest::Submodule { .. }
-        | WriteRequest::LfsPull { .. } => None,
+        | WriteRequest::LfsPull { .. }
+        | WriteRequest::CheckoutPr { .. } => None,
     }
 }
 
@@ -244,7 +245,8 @@ fn check(
         | WriteRequest::WorktreeAdd { .. }
         | WriteRequest::WorktreeRemove { .. }
         | WriteRequest::Submodule { .. }
-        | WriteRequest::LfsPull { .. } => Err(Refusal::NotYetSupported { task: 15 }),
+        | WriteRequest::LfsPull { .. }
+        | WriteRequest::CheckoutPr { .. } => Err(Refusal::NotYetSupported { task: 15 }),
     }
 }
 

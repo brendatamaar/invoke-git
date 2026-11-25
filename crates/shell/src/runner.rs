@@ -397,6 +397,14 @@ impl Job {
                 return OpOutcome::Failed(failure);
             }
         }
+        if let GitArgs::CheckoutPr {
+            remote,
+            remote_ref,
+            local_branch,
+        } = &self.args
+        {
+            return self.run_checkout_pr(remote, &remote_ref.0, &local_branch.0);
+        }
         // Task 23: a request is one git run, except taking a side whole,
         // which is two; it stops at the first one that fails.
         let mut outcome = OpOutcome::Succeeded;
@@ -410,6 +418,139 @@ impl Job {
             }
         }
         outcome
+    }
+
+    /// P9: hardened two-stage PR/MR checkout enforcing Laws 9, 11, 12, and 13:
+    /// 1. Fetch into a unique operation-owned ref (`refs/invoke-git/pr-checkout/...`)
+    ///    with `--no-tags --no-prune --no-write-fetch-head --refmap=` so configured
+    ///    `remote.<name>.fetch` mappings can never move any other branch (Law 9)
+    ///    and `FETCH_HEAD` is never touched.
+    /// 2. Re-verify `index.lock`, `HEAD`, `index`, expected destination ref
+    ///    absence, AND worktree cleanliness right before switching.
+    /// 3. Resolve the temp ref to its exact commit OID and run
+    ///    `git switch --no-track --no-overwrite-ignore -c <local_branch> <oid>`
+    ///    with deferred cancellation so a slow `post-checkout` hook never
+    ///    reports `Cancelled` after Git has already switched branches (Law 13).
+    /// 4. Always delete the temp ref via RAII drop guard.
+    fn run_checkout_pr(&self, remote: &str, remote_ref: &str, local_branch: &str) -> OpOutcome {
+        static TEMP_REF_SEQ: AtomicU64 = AtomicU64::new(1);
+        let seq = TEMP_REF_SEQ.fetch_add(1, Ordering::Relaxed);
+        let temp_ref = format!(
+            "refs/invoke-git/pr-checkout/op-{}-{seq}",
+            std::process::id()
+        );
+        struct TempRefGuard {
+            git: Git,
+            workdir: PathBuf,
+            env: Vec<(OsString, OsString)>,
+            temp_ref: String,
+        }
+        impl Drop for TempRefGuard {
+            fn drop(&mut self) {
+                let mut cmd = self.git.command(&self.workdir);
+                cmd.args(crate::git::GLOBAL_ARGS)
+                    .args(["update-ref", "-d", &self.temp_ref])
+                    .envs(self.env.iter().map(|(k, v)| (k, v)))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let _ = cmd.status();
+            }
+        }
+        let _cleanup = TempRefGuard {
+            git: self.git.clone(),
+            workdir: self.paths.workdir.clone(),
+            env: self.env.clone(),
+            temp_ref: temp_ref.clone(),
+        };
+
+        // Stage 1: cancellable fetch into the isolated operation-owned temp ref.
+        let mut fetch_argv: Vec<OsString> =
+            crate::git::GLOBAL_ARGS.iter().map(OsString::from).collect();
+        fetch_argv.extend(
+            [
+                "fetch",
+                "--progress",
+                "--no-tags",
+                "--no-prune",
+                "--no-write-fetch-head",
+                "--refmap=",
+                "--",
+            ]
+            .map(OsString::from),
+        );
+        fetch_argv.push(remote.into());
+        fetch_argv.push(format!("+{remote_ref}:{temp_ref}").into());
+        let fetch_outcome = self.run_one(Invocation {
+            args: fetch_argv,
+            stdin: None,
+        });
+        if fetch_outcome != OpOutcome::Succeeded {
+            return fetch_outcome;
+        }
+        if self.cancelled() {
+            return OpOutcome::Cancelled;
+        }
+
+        // Resolve our isolated temp ref to its exact commit OID and verify
+        // worktree cleanliness.
+        match crate::read::read_state(&self.paths) {
+            Ok(disk) => {
+                if disk.phase != invoke_core::Phase::Clean || !disk.status.entries.is_empty() {
+                    return failed(
+                        ErrorClass::PreconditionChanged,
+                        "Working tree or repository state changed during fetch; commit, stash, or discard local changes and try again.".into(),
+                    );
+                }
+            }
+            Err(failure) => return OpOutcome::Failed(failure),
+        }
+        let target_oid = match precondition::open(&self.paths).and_then(|repo| {
+            let mut reference = repo
+                .find_reference(&temp_ref)
+                .map_err(|e| format!("read fetched PR ref: {e}"))?;
+            let id = reference
+                .peel_to_id()
+                .map_err(|e| format!("resolve fetched PR ref: {e}"))?;
+            Ok(id.to_string())
+        }) {
+            Ok(oid) => oid,
+            Err(err) => return failed(ErrorClass::Bug, err),
+        };
+
+        // Immediately before starting the deferred-cancellation switch, re-check
+        // cancellation, `index.lock`, `HEAD`, `index`, and destination ref absence.
+        if self.cancelled() {
+            return OpOutcome::Cancelled;
+        }
+        if let Err(failure) = precondition::check(&self.paths, &self.expect) {
+            return OpOutcome::Failed(failure);
+        }
+        if let Err(failure) = precondition::check_refs(&self.paths, &self.args.expected_refs()) {
+            return OpOutcome::Failed(failure);
+        }
+
+        // Stage 2: local switch to the exact OID with `--no-overwrite-ignore`
+        // and deferred cancellation (Law 13).
+        let mut switch_argv: Vec<OsString> =
+            crate::git::GLOBAL_ARGS.iter().map(OsString::from).collect();
+        switch_argv
+            .extend(["switch", "--no-track", "--no-overwrite-ignore", "-c"].map(OsString::from));
+        switch_argv.push(local_branch.into());
+        switch_argv.push(target_oid.into());
+        let mut command = self.git.command(&self.paths.workdir);
+        command
+            .args(&switch_argv)
+            .envs(self.env.iter().map(|(k, v)| (k, v)));
+        let non_cancel = Control {
+            cancelled: AtomicBool::new(false),
+            defer_cancellation: true,
+            askpass: Mutex::new(None),
+        };
+        match run_child(command, None, None, &non_cancel) {
+            Ok(done) => classify(done.success, &done.output),
+            Err(error) => failed(ErrorClass::Environment, format!("start git: {error}")),
+        }
     }
 
     fn run_one(&self, run: Invocation) -> OpOutcome {

@@ -363,6 +363,8 @@ pub enum Action {
     WorktreeRemove,
     Submodule,
     LfsPull,
+    // P9.
+    CheckoutPr,
     // Task 17: the user asked to remove a leftover `index.lock`.
     RemoveLock,
 }
@@ -425,6 +427,8 @@ pub enum Refusal {
     Submodule(SubmoduleRefusal),
     /// P10: a Git LFS request on a repo with no LFS detected.
     Lfs(LfsRefusal),
+    /// P9: a PR/MR checkout request that cannot run on the snapshot.
+    PrCheckout(PrCheckoutRefusal),
 }
 
 impl StatusSnapshot {
@@ -492,6 +496,20 @@ pub enum TagRefusal {
     NoSuchTag(TagName),
     /// No remote was named.
     NoRemote,
+}
+
+/// Why a PR/MR checkout request was turned down (P9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrCheckoutRefusal {
+    InvalidRemote,
+    InvalidRef,
+    InvalidBranch(NameProblem),
+    /// Uncommitted or untracked changes exist in the working tree or index.
+    DirtyWorktree,
+    /// The target local branch already exists; refuse to move or overwrite it (law 9).
+    BranchAlreadyExists(BranchName),
+    /// A branch whose name is a folder prefix/child of the target name exists.
+    BranchNameConflict(BranchName),
 }
 
 /// What moved since the operation, as found when an undo was planned.

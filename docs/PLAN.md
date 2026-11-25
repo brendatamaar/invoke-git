@@ -25,7 +25,7 @@
 | P6 | Commit Search | done | P1 | P1b, P2, P3, P4a, P4b, P7, P8, P9, P10, P11 |
 | P7 | Reflog View | done | P1 | P1b, P2, P3, P4a, P4b, P5, P6, P8, P9, P10, P11 |
 | P8 | Forge Auth & Repo List (GitHub/GitLab) | done | P1 | P1b, P2, P3, P4a, P4b, P5, P6, P7, P10, P11 |
-| P9 | Pull Requests & Merge Requests | todo | P8 | P4b, P5, P6, P7, P10, P11 |
+| P9 | Pull Requests & Merge Requests | done | P8 | P4b, P5, P6, P7, P10, P11 |
 | P10 | Worktrees, Submodules & Git LFS | done | P1 | P4b, P5, P6, P7, P8, P9, P11 |
 | P11 | Bundled MinGit Fallback (Windows) | done | P1 | P2, P3, P4a, P4b, P5, P6, P7, P8, P9, P10 |
 | P12 | Pre-Release Dogfood & Public Release Gate | todo | P1b, P3, P4b, P5, P6, P7, P9, P10, P11 | - |
@@ -35,3 +35,5 @@
 P2, P3, P5, P6, dan P7 memiliki implementasi core, shell, dan UI. `cargo xtask check` lulus sebelum perubahan UI dengan 256 urutan model-based, dan lulus pada gabungan akhir dengan `INVOKE_HARNESS_CASES=16`. `cargo build -p app` dan smoke test pembukaan repo fixture dengan profil terisolasi juga lulus. Pengguna melaporkan seluruh verifikasi manual Windows lulus. Hasil dicatat di Handoff notes tiap fase.
 
 P1b, P8, P10, dan P11 (2026-11-25) lulus cross-review lintas model tanpa blocker dan lulus verifikasi manual Windows oleh pengguna (termasuk perbaikan `repo_picker` `.size_full()` di `89db033`), lalu di-merge ke `main`.
+
+P9 (2026-11-25) lulus cross-review lintas model 3 ronde tanpa blocker/medium, lulus `cargo xtask check` + `forge_pr` (8/8), dan lulus seluruh tahap verifikasi manual Windows oleh pengguna (termasuk perbaikan layout `AccountsView` & pesan 403 GitHub di `041f55d`), lalu di-merge ke `main`.

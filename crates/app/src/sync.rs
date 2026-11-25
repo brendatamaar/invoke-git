@@ -217,6 +217,9 @@ pub fn what(request: &WriteRequest) -> Option<String> {
             Some(path) => format!("Pulling LFS object {}", path.0),
             None => "Pulling Git LFS objects".to_owned(),
         }),
+        WriteRequest::CheckoutPr { local_branch, .. } => {
+            Some(format!("Checking out {}", local_branch.0))
+        }
         _ => None,
     }
 }

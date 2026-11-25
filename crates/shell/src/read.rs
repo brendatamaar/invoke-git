@@ -364,3 +364,59 @@ fn count_only_on(
     }
     Ok(count)
 }
+
+/// P9: configured git remotes (name + fetch URL), read through `gix` without
+/// touching `index.lock`. Sorted by name so the UI order is deterministic.
+pub fn read_remotes(
+    paths: &RepoPaths,
+) -> Result<Vec<invoke_core::forge::ConfiguredRemote>, String> {
+    let repo = precondition::open(paths)?;
+    let mut names: Vec<String> = repo
+        .remote_names()
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    let mut remotes = Vec::new();
+    for name in names {
+        let Ok(remote) = repo.find_remote(name.as_str()) else {
+            continue;
+        };
+        let url = remote
+            .url(gix::remote::Direction::Fetch)
+            .or_else(|| remote.url(gix::remote::Direction::Push))
+            .map(|u| u.to_bstring().to_string());
+        if let Some(url) = url
+            && !url.trim().is_empty()
+        {
+            remotes.push(invoke_core::forge::ConfiguredRemote { name, url });
+        }
+    }
+    Ok(remotes)
+}
+
+/// P9: reads `branch.<name>.remote` and `branch.<name>.merge` directly from
+/// git config via `gix` (no lock), so remotes with `/` in their name and
+/// custom fetch refspecs resolve to the exact remote and server branch name.
+pub fn read_branch_upstream(
+    paths: &RepoPaths,
+    branch: &str,
+) -> Option<invoke_core::forge::BranchUpstream> {
+    let repo = precondition::open(paths).ok()?;
+    let cfg = repo.config_snapshot();
+    let remote = cfg
+        .string_by("branch", Some(branch.into()), "remote")?
+        .to_string();
+    let merge = cfg
+        .string_by("branch", Some(branch.into()), "merge")?
+        .to_string();
+    let remote_branch = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+    if remote.is_empty() || remote_branch.is_empty() {
+        return None;
+    }
+    Some(invoke_core::forge::BranchUpstream {
+        remote,
+        branch: remote_branch.to_owned(),
+    })
+}

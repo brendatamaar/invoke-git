@@ -526,6 +526,28 @@ pub fn invocation(args: &GitArgs) -> Invocation {
             }
             plain(argv)
         }
+        // P9: executed by `runner::Job::run_checkout_pr` using an isolated
+        // operation-owned temp ref (`--no-tags --no-prune --no-write-fetch-head
+        // --refmap=`) followed by `git switch --no-track --no-overwrite-ignore`.
+        GitArgs::CheckoutPr {
+            remote, remote_ref, ..
+        } => {
+            argv.extend(
+                [
+                    "fetch",
+                    "--progress",
+                    "--no-tags",
+                    "--no-prune",
+                    "--no-write-fetch-head",
+                    "--refmap=",
+                    "--",
+                ]
+                .map(OsString::from),
+            );
+            argv.push(remote.into());
+            argv.push((&remote_ref.0).into());
+            plain(argv)
+        }
     }
 }
 

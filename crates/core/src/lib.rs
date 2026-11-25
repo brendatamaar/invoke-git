@@ -58,9 +58,9 @@ pub use reflog::{ReflogEntry, ReflogTarget, ResetMode};
 pub use stash::StashEntry;
 pub use state::{
     Action, BranchRefusal, CommitRefusal, Conflicts, DiskState, FileChange, Freshness, Head,
-    LockState, Notice, OpPhase, OpQueue, Phase, QueuedOp, Reads, RefsSnapshot, Refusal, RepoState,
-    RunningOp, Snapshot, StatusEntry, StatusSnapshot, TagInfo, TagRefusal, Tracking, UndoMoved,
-    Upstream,
+    LockState, Notice, OpPhase, OpQueue, Phase, PrCheckoutRefusal, QueuedOp, Reads, RefsSnapshot,
+    Refusal, RepoState, RunningOp, Snapshot, StatusEntry, StatusSnapshot, TagInfo, TagRefusal,
+    Tracking, UndoMoved, Upstream,
 };
 pub use step::{open, step};
 pub use undo::{

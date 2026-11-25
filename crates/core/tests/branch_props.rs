@@ -418,7 +418,9 @@ impl Sim {
             | GitArgs::WorktreeAdd { .. }
             | GitArgs::WorktreeRemove { .. }
             | GitArgs::Submodule { .. }
-            | GitArgs::LfsPull { .. } => {
+            | GitArgs::LfsPull { .. }
+            // P9.
+            | GitArgs::CheckoutPr { .. } => {
                 panic!("unexpected command in the branch simulation: {args:?}")
             }
         }

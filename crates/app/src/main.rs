@@ -19,6 +19,7 @@ mod notes_db;
 mod notice;
 mod paths;
 mod persist;
+mod pr_view;
 mod rebase_view;
 mod reflog_pane;
 mod repo_picker;

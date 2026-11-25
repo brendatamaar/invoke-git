@@ -89,6 +89,72 @@ impl Json {
     pub fn str_field(&self, key: &str) -> Option<&str> {
         self.get(key).and_then(Json::as_str)
     }
+
+    /// Serializes this JSON value into compact RFC 8259 text.
+    pub fn encode(&self) -> String {
+        let mut out = String::new();
+        encode_value(self, &mut out);
+        out
+    }
+}
+
+fn encode_value(value: &Json, out: &mut String) {
+    match value {
+        Json::Null => out.push_str("null"),
+        Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Json::Number(n) => {
+            if n.is_finite() {
+                if n.fract() == 0.0 && *n >= 0.0 && *n < 9.0e15 {
+                    out.push_str(&format!("{}", *n as u64));
+                } else {
+                    out.push_str(&format!("{n}"));
+                }
+            } else {
+                out.push_str("null");
+            }
+        }
+        Json::Str(s) => encode_string(s, out),
+        Json::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                encode_value(item, out);
+            }
+            out.push(']');
+        }
+        Json::Object(fields) => {
+            out.push('{');
+            for (i, (key, item)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                encode_string(key, out);
+                out.push(':');
+                encode_value(item, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn encode_string(text: &str, out: &mut String) {
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 struct Parser<'a> {
