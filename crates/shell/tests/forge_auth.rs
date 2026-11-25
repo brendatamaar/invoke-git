@@ -2278,3 +2278,63 @@ fn a_cancel_that_cannot_read_the_keychain_reports_a_failed_undo() {
     assert_eq!(service.accounts().len(), 1);
     assert!(!store.inner.is_empty());
 }
+
+// -- the account list on disk is the source of truth -----------------------------
+
+#[test]
+fn two_windows_on_one_account_list_keep_each_others_accounts() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("two-windows");
+    let store = memory();
+    // Two clone dialogs, each with its own service, both opened on the
+    // same (empty) list.
+    let first = service(&mock, store.clone(), Some(data.book()));
+    let second = service(&mock, store.clone(), Some(data.book()));
+    let ana = first
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    let work = second
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_WORK")
+        .unwrap();
+    let on_disk = AccountBook::decode(&std::fs::read_to_string(data.book()).unwrap());
+    assert!(
+        on_disk.get(&ana.key()).is_some(),
+        "the first account was dropped"
+    );
+    assert!(on_disk.get(&work.key()).is_some());
+    assert_eq!(first.accounts().len(), 2);
+    assert_eq!(store.len(), 2);
+}
+
+#[test]
+fn a_list_changed_on_disk_during_a_write_is_not_overwritten() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("changed-on-disk");
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), Some(data.book()));
+    let mut theirs = AccountBook::default();
+    theirs.add(
+        ForgeAccount::new(
+            ForgeKind::GitLab,
+            invoke_core::forge::Origin::parse("https://git.corp").unwrap(),
+            "zed",
+            AuthMethod::Pat,
+        )
+        .unwrap(),
+    );
+    let text = theirs.encode();
+    {
+        // Another process writes the list while this one is signing in.
+        let (path, text) = (data.book(), text.clone());
+        *store.after_save.lock().unwrap() = Some(Box::new(move || {
+            std::fs::write(&path, &text).unwrap();
+        }));
+    }
+    let error = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap_err();
+    assert!(matches!(error, ForgeError::Disk(_)), "{error:?}");
+    // Their list stands, and this sign-in left no token behind.
+    assert_eq!(std::fs::read_to_string(data.book()).unwrap(), text);
+    assert!(store.inner.is_empty());
+}

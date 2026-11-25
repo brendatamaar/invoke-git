@@ -168,6 +168,9 @@ struct Inner {
     store: Arc<dyn TokenStore>,
     config: ServiceConfig,
     book: Mutex<AccountBook>,
+    /// The list file's text as this service last read or wrote it (`None`:
+    /// no file). The expected state every write is checked against.
+    on_disk: Mutex<Option<String>>,
     book_path: Option<PathBuf>,
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -193,16 +196,18 @@ impl ForgeService {
         config: ServiceConfig,
         book_path: Option<PathBuf>,
     ) -> Result<Self, ForgeError> {
-        let book = match &book_path {
-            Some(path) => load_book(path)?,
-            None => AccountBook::default(),
+        let on_disk = match &book_path {
+            Some(path) => read_disk(path)?,
+            None => None,
         };
+        let book = AccountBook::decode(on_disk.as_deref().unwrap_or(""));
         Ok(Self {
             inner: Arc::new(Inner {
                 http: Http::new()?,
                 store,
                 config,
                 book: Mutex::new(book),
+                on_disk: Mutex::new(on_disk),
                 book_path,
                 clock: Box::new(unix_now),
             }),
@@ -239,9 +244,30 @@ impl ForgeService {
         (self.inner.clock)()
     }
 
+    /// The account list, read again from disk first (the disk is the source
+    /// of truth: another window or process may have changed it). Lock order:
+    /// the list, then `on_disk`.
     fn book_lock(&self) -> MutexGuard<'_, AccountBook> {
-        self.inner
+        let mut book = self
+            .inner
             .book
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(path) = &self.inner.book_path
+            && let Ok(text) = read_disk(path)
+        {
+            let mut on_disk = self.on_disk();
+            if *on_disk != text {
+                *book = AccountBook::decode(text.as_deref().unwrap_or(""));
+                *on_disk = text;
+            }
+        }
+        book
+    }
+
+    fn on_disk(&self) -> MutexGuard<'_, Option<String>> {
+        self.inner
+            .on_disk
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -270,11 +296,23 @@ impl ForgeService {
         self.save_book(&book)
     }
 
+    /// Writes the list, but only over the text this service last saw: if the
+    /// file changed since (another window or process), nothing is written
+    /// and the caller rolls back, so no one's account is silently dropped.
     fn save_book(&self, book: &AccountBook) -> Result<(), ForgeError> {
-        match &self.inner.book_path {
-            Some(path) => save_book(path, book),
-            None => Ok(()),
+        let Some(path) = &self.inner.book_path else {
+            return Ok(());
+        };
+        let mut on_disk = self.on_disk();
+        if read_disk(path)? != *on_disk {
+            return Err(ForgeError::Disk(
+                "the account list changed on disk meanwhile; try again".into(),
+            ));
         }
+        let text = book.encode();
+        save_book(path, &text)?;
+        *on_disk = Some(text);
+        Ok(())
     }
 
     // -- connecting ------------------------------------------------------------
@@ -656,10 +694,11 @@ impl ForgeService {
     }
 }
 
-fn load_book(path: &Path) -> Result<AccountBook, ForgeError> {
+/// The list file's text, or `None` when there is no file yet.
+fn read_disk(path: &Path) -> Result<Option<String>, ForgeError> {
     match std::fs::read_to_string(path) {
-        Ok(text) => Ok(AccountBook::decode(&text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AccountBook::default()),
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(ForgeError::Disk(
             "the account list could not be read".into(),
         )),
@@ -668,13 +707,13 @@ fn load_book(path: &Path) -> Result<AccountBook, ForgeError> {
 
 /// Writes the list through a temporary file so a crash never leaves half of
 /// it. It holds names and hosts only.
-fn save_book(path: &Path, book: &AccountBook) -> Result<(), ForgeError> {
+fn save_book(path: &Path, text: &str) -> Result<(), ForgeError> {
     let disk = |_| ForgeError::Disk("the data folder is not writable".into());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(disk)?;
     }
     let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, book.encode()).map_err(disk)?;
+    std::fs::write(&temporary, text).map_err(disk)?;
     std::fs::rename(&temporary, path).map_err(disk)
 }
 

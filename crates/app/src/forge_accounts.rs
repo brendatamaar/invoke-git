@@ -39,16 +39,36 @@ pub enum AccountsEvent {
     Closed,
 }
 
-/// Opens the forge service: the OS keychain for tokens, and the account
-/// list in the app data folder. An error here only switches the forge
-/// features off.
+/// The forge service: the OS keychain for tokens, and the account list in
+/// the app data folder. One per process, shared by every window, so their
+/// writes are serialized by one lock (the service also checks the file
+/// against what it last saw before writing, for other processes). An error
+/// here only switches the forge features off, and is retried next time.
 pub fn open_service() -> Result<ForgeService, ForgeError> {
-    let path = persist::data_dir().map(|dir| dir.join("forge-accounts.txt"));
-    ForgeService::new(
-        Arc::new(KeyringStore::new()),
-        ServiceConfig::default(),
-        path,
-    )
+    static SHARED: std::sync::Mutex<Option<ForgeService>> = std::sync::Mutex::new(None);
+    shared_or_open(&SHARED, || {
+        let path = persist::data_dir().map(|dir| dir.join("forge-accounts.txt"));
+        ForgeService::new(
+            Arc::new(KeyringStore::new()),
+            ServiceConfig::default(),
+            path,
+        )
+    })
+}
+
+/// The value in `slot`, or a new one from `open` kept there. A failure is
+/// not kept, so the next call tries again.
+pub fn shared_or_open<T: Clone, E>(
+    slot: &std::sync::Mutex<Option<T>>,
+    open: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(value) = slot.as_ref() {
+        return Ok(value.clone());
+    }
+    let value = open()?;
+    *slot = Some(value.clone());
+    Ok(value)
 }
 
 /// What the sign-in area shows.
@@ -885,6 +905,25 @@ mod tests {
         let text = failure_text(&SignInFailure::CancelledWithLeftover("Remove it.".into()));
         assert!(text.starts_with("Cancelled, but"), "{text}");
         assert!(text.contains("Remove it."));
+    }
+
+    #[test]
+    fn every_window_shares_one_service_and_a_failure_is_retried() {
+        let slot = std::sync::Mutex::new(None);
+        let opened = std::cell::Cell::new(0);
+        let open = || {
+            opened.set(opened.get() + 1);
+            Ok::<_, ()>(opened.get())
+        };
+        assert_eq!(shared_or_open(&slot, open), Ok(1));
+        assert_eq!(shared_or_open(&slot, open), Ok(1));
+        assert_eq!(opened.get(), 1, "a second window opened its own copy");
+        let empty: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+        assert_eq!(
+            shared_or_open(&empty, || Err::<u32, _>("disk")),
+            Err("disk")
+        );
+        assert_eq!(shared_or_open(&empty, || Ok::<_, &str>(7)), Ok(7));
     }
 
     #[test]
