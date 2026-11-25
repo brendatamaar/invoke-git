@@ -174,6 +174,8 @@ fn spacing_radius_and_size_match_the_json() {
     assert_eq!(tokens::RADIUS_MD, 6.0);
     assert_eq!(tokens::ROW_LIST, 28.0);
     assert_eq!(tokens::LANE, 14.0);
+    assert_eq!(tokens::DIALOG, 520.0);
+    assert_eq!(tokens::NAME_COLUMN, 260.0);
 }
 
 #[test]

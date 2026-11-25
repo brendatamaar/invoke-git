@@ -10,6 +10,7 @@ pub mod commit;
 pub mod conflict;
 pub mod detect;
 pub mod event;
+pub mod forge;
 pub mod ids;
 pub mod message;
 pub mod notes;

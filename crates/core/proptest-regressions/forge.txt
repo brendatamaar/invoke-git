@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ad855a6153a89dfb4d1d4f8cc16a1e722b4ce017c0653d2c4f195ce2b1d500e9 # shrinks to url = "0Ϲ:"
+cc aa3c77d4eba96f24e52059bc602c986544ac411c8a041d80c421076255acc30f # shrinks to events = [Begin(GitLabBrowser), PromptReady { prompt: DeviceCode { user_code: "ABCD-1234", verification_url: "https://github.com/login/device" }, interval_secs: 0 }, Pending]

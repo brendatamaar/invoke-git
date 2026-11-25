@@ -17,15 +17,19 @@ use gpui::{
 };
 use invoke_core::clone::{CloneEvent, ClonePhase, CloneRequest, CloneState, step_clone};
 use invoke_core::{Failure, OpId, OpOutcome, Progress};
+use shell::forge::{ForgeError, ForgeService};
 use shell::{CloneRunner, Git};
 use tokens::{SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_SMALL, TEXT_TITLE};
 use ui::convert::hsla;
 use ui::{
-    Banner, BannerKind, Button, EditorEvent, ProgressBar, TextEditor, TextStyleExt, ThemeExt,
+    Banner, BannerKind, Button, EditorEvent, ProgressBar, Segmented, TextEditor, TextStyleExt,
+    ThemeExt,
 };
 
 use crate::auth_prompt::{AuthEvent, AuthPromptView};
+use crate::forge_accounts::{AccountsEvent, AccountsView, open_service};
 use crate::notice::failure_message;
+use crate::repo_picker::{PickerEvent, RepoPicker};
 
 /// What the dialog tells its owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +125,26 @@ pub fn default_parent() -> Option<PathBuf> {
     Some(if documents.is_dir() { documents } else { home })
 }
 
+/// Where the form gets the repository from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// An address typed or pasted.
+    Address,
+    /// A repository chosen from a connected forge account.
+    Account,
+    /// The accounts screen, reached from the account list.
+    ManageAccounts,
+}
+
+/// The optional forge half of the dialog. Nothing in it is contacted until
+/// the user opens "From account", and a failure here never blocks cloning
+/// by address.
+struct ForgeParts {
+    service: Result<ForgeService, ForgeError>,
+    picker: Option<(Entity<RepoPicker>, Subscription)>,
+    accounts: Option<(Entity<AccountsView>, Subscription)>,
+}
+
 pub struct CloneView {
     runner: Arc<CloneRunner>,
     helper_missing: bool,
@@ -130,6 +154,8 @@ pub struct CloneView {
     job: Option<OpId>,
     url: Entity<TextEditor>,
     name: Entity<TextEditor>,
+    source: Source,
+    forge: ForgeParts,
     parent: Option<PathBuf>,
     auth: Option<(OpId, Entity<AuthPromptView>)>,
     /// The folder the running job clones into.
@@ -169,6 +195,12 @@ impl CloneView {
             job: None,
             url,
             name,
+            source: Source::Address,
+            forge: ForgeParts {
+                service: open_service(),
+                picker: None,
+                accounts: None,
+            },
             parent: default_parent(),
             auth: None,
             target: None,
@@ -221,6 +253,65 @@ impl CloneView {
             }
         })
         .detach();
+    }
+
+    /// Switches where the form gets the repository from. The forge parts are
+    /// built the first time they are needed, so nothing is contacted until
+    /// the user asks.
+    fn show(&mut self, source: Source, cx: &mut Context<Self>) {
+        match source {
+            Source::Account => self.ensure_picker(cx),
+            Source::ManageAccounts => self.ensure_accounts(cx),
+            Source::Address => {}
+        }
+        self.source = source;
+        cx.notify();
+    }
+
+    fn ensure_picker(&mut self, cx: &mut Context<Self>) {
+        if self.forge.picker.is_some() {
+            return;
+        }
+        let Ok(service) = self.forge.service.clone() else {
+            return;
+        };
+        let view = cx.new(|cx| RepoPicker::new(service, cx));
+        let subscription = cx.subscribe(&view, |this, _, event: &PickerEvent, cx| match event {
+            PickerEvent::Picked(repo) => this.use_address(&repo.clone_url, cx),
+            PickerEvent::ManageAccounts => this.show(Source::ManageAccounts, cx),
+        });
+        self.forge.picker = Some((view, subscription));
+    }
+
+    fn ensure_accounts(&mut self, cx: &mut Context<Self>) {
+        if self.forge.accounts.is_some() {
+            return;
+        }
+        let Ok(service) = self.forge.service.clone() else {
+            return;
+        };
+        let view = cx.new(|cx| AccountsView::new(service, cx));
+        let subscription = cx.subscribe(&view, |this, _, event: &AccountsEvent, cx| match event {
+            AccountsEvent::Changed => {
+                if let Some((picker, _)) = &this.forge.picker {
+                    picker.update(cx, |picker, cx| picker.refresh_accounts(cx));
+                }
+            }
+            AccountsEvent::Closed => {
+                // Dropping the screen also stops a sign-in still running.
+                this.forge.accounts = None;
+                this.show(Source::Account, cx);
+            }
+        });
+        self.forge.accounts = Some((view, subscription));
+    }
+
+    /// A repository was chosen from an account: its address goes in the
+    /// form, where the folder is chosen and the clone started.
+    fn use_address(&mut self, address: &str, cx: &mut Context<Self>) {
+        self.url.update(cx, |url, cx| url.set_text(address, cx));
+        self.name.update(cx, |name, cx| name.set_text("", cx));
+        self.show(Source::Address, cx);
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
@@ -359,6 +450,12 @@ impl Render for CloneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
         let screen = screen(&self.state, self.job);
+        if self.source == Source::ManageAccounts
+            && matches!(screen, Screen::Form | Screen::Failed(_) | Screen::Cancelled)
+            && let Some((view, _)) = &self.forge.accounts
+        {
+            return div().flex().flex_1().child(view.clone());
+        }
         let (start, browse, close, cancel, again) = (
             cx.entity(),
             cx.entity(),
@@ -413,91 +510,134 @@ impl Render for CloneView {
                     }
                     _ => {}
                 }
-                let target = self.target(cx);
-                let can_start = self.can_start(cx);
-                let label = |text: &'static str, cx: &mut Context<Self>| {
-                    div()
-                        .text_style(&TEXT_SMALL, cx)
-                        .text_color(hsla(p.ink_muted))
-                        .child(text)
-                };
-                body = body
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(SPACE_2))
-                            .child(label("Address", cx))
-                            .child(self.url.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(SPACE_2))
-                            .child(label("Clone into", cx))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(SPACE_3))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .truncate()
-                                            .text_style(&TEXT_BODY, cx)
-                                            .text_color(hsla(if self.parent.is_some() {
-                                                p.ink
-                                            } else {
-                                                p.ink_faint
-                                            }))
-                                            .child(match &self.parent {
-                                                Some(parent) => path_text(parent),
-                                                None => "No folder chosen".into(),
-                                            }),
-                                    )
-                                    .child(Button::new("clone-browse", "Choose folder…").on_click(
-                                        move |_, _, cx| {
-                                            browse.update(cx, |this, cx| this.browse(cx))
-                                        },
-                                    )),
+                let sources = cx.entity();
+                body = body.child(Segmented::new(
+                    "clone-source",
+                    vec!["Address".into(), "From account".into()],
+                    usize::from(self.source != Source::Address),
+                    move |index, _, cx| {
+                        sources.update(cx, |this, cx| {
+                            this.show(
+                                if index == 0 {
+                                    Source::Address
+                                } else {
+                                    Source::Account
+                                },
+                                cx,
+                            )
+                        })
+                    },
+                ));
+                if self.source == Source::Account {
+                    body = match (&self.forge.picker, &self.forge.service) {
+                        (Some((picker, _)), _) => body.child(picker.clone()),
+                        (None, Err(error)) => body.child(Banner::new(
+                            BannerKind::Warning,
+                            format!(
+                                "Accounts are not available: {} You can still clone by address.",
+                                error.user_message()
                             ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(SPACE_2))
-                            .child(label("Folder name", cx))
-                            .child(self.name.clone()),
-                    )
-                    .child(
+                        )),
+                        (None, Ok(_)) => body,
+                    };
+                    body = body.child(
+                        div().flex().child(
+                            Button::new("clone-account-close", "Cancel")
+                                .ghost()
+                                .on_click(move |_, _, cx| {
+                                    close.update(cx, |this, cx| this.close(cx))
+                                }),
+                        ),
+                    );
+                } else {
+                    let target = self.target(cx);
+                    let can_start = self.can_start(cx);
+                    let label = |text: &'static str, cx: &mut Context<Self>| {
                         div()
                             .text_style(&TEXT_SMALL, cx)
                             .text_color(hsla(p.ink_muted))
-                            .child(match target {
-                                Some(target) => format!("Will create {}", path_text(&target)),
-                                None => "Enter an address and choose a folder.".into(),
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(SPACE_2))
-                            .child(
-                                Button::new("clone-start", "Clone")
-                                    .primary()
-                                    .disabled(!can_start)
-                                    .on_click(move |_, _, cx| {
-                                        start.update(cx, |this, cx| this.start(cx))
-                                    }),
-                            )
-                            .child(Button::new("clone-close", "Cancel").ghost().on_click(
-                                move |_, _, cx| close.update(cx, |this, cx| this.close(cx)),
-                            )),
-                    );
-                let _ = again;
+                            .child(text)
+                    };
+                    body = body
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(SPACE_2))
+                                .child(label("Address", cx))
+                                .child(self.url.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(SPACE_2))
+                                .child(label("Clone into", cx))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(SPACE_3))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_style(&TEXT_BODY, cx)
+                                                .text_color(hsla(if self.parent.is_some() {
+                                                    p.ink
+                                                } else {
+                                                    p.ink_faint
+                                                }))
+                                                .child(match &self.parent {
+                                                    Some(parent) => path_text(parent),
+                                                    None => "No folder chosen".into(),
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("clone-browse", "Choose folder…").on_click(
+                                                move |_, _, cx| {
+                                                    browse.update(cx, |this, cx| this.browse(cx))
+                                                },
+                                            ),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(SPACE_2))
+                                .child(label("Folder name", cx))
+                                .child(self.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_style(&TEXT_SMALL, cx)
+                                .text_color(hsla(p.ink_muted))
+                                .child(match target {
+                                    Some(target) => format!("Will create {}", path_text(&target)),
+                                    None => "Enter an address and choose a folder.".into(),
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(SPACE_2))
+                                .child(
+                                    Button::new("clone-start", "Clone")
+                                        .primary()
+                                        .disabled(!can_start)
+                                        .on_click(move |_, _, cx| {
+                                            start.update(cx, |this, cx| this.start(cx))
+                                        }),
+                                )
+                                .child(Button::new("clone-close", "Cancel").ghost().on_click(
+                                    move |_, _, cx| close.update(cx, |this, cx| this.close(cx)),
+                                )),
+                        );
+                    let _ = again;
+                }
             }
             Screen::Running { stage, fraction } => {
                 body = body

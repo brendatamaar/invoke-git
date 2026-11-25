@@ -11,6 +11,7 @@ pub mod commit_detail;
 pub mod conflict;
 pub mod discard;
 pub mod discover;
+pub mod forge;
 pub mod git;
 pub mod git_discovery;
 pub mod history;
