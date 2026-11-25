@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="256" height="256">
+  <defs>
+    <linearGradient id="onyx" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#21242d"/>
+      <stop offset="100%" stop-color="#0b0d11"/>
+    </linearGradient>
+    <radialGradient id="platinum-glow" cx="50%" cy="30%" r="64%">
+      <stop offset="0%" stop-color="#e2e8f0" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#e2e8f0" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="platinum" gradientUnits="userSpaceOnUse" x1="28" y1="20" x2="98" y2="106">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="52%" stop-color="#dce2ed"/>
+      <stop offset="100%" stop-color="#8b95a6"/>
+    </linearGradient>
+    <linearGradient id="platinum-dim" gradientUnits="userSpaceOnUse" x1="28" y1="20" x2="98" y2="106">
+      <stop offset="0%" stop-color="#e2e8f0" stop-opacity="0.62"/>
+      <stop offset="100%" stop-color="#94a3b8" stop-opacity="0.46"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Obsidian tile with platinum rim -->
+  <rect x="2" y="2" width="124" height="124" rx="28" fill="url(#onyx)"/>
+  <rect x="2" y="2" width="124" height="124" rx="28" fill="url(#platinum-glow)"/>
+  <rect x="3.5" y="3.5" width="121" height="121" rx="26.5" fill="none" stroke="#cbd5e1" stroke-opacity="0.44" stroke-width="2.5"/>
+
+  <!-- Helix Staff rune: braided branches around main spine into HEAD ring -->
+  <path d="M40 94 C40 70, 88 74, 88 52 C88 36, 72 30, 64 30" fill="none" stroke="url(#platinum-dim)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M88 94 C88 70, 40 74, 40 52 C40 36, 56 30, 64 30" fill="none" stroke="url(#platinum)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M64 102 L64 34" stroke="url(#platinum)" stroke-width="9.5" stroke-linecap="round"/>
+  <circle cx="64" cy="30" r="9.5" fill="#0d0f14" stroke="#ffffff" stroke-width="6.5"/>
+</svg>

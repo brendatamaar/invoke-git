@@ -97,4 +97,4 @@ There is no icon set yet. Until one is chosen:
 
 ## Logo
 
-None yet. Set "Invoke Git" in Inter 600 in `ink`; do not draw a substitute mark.
+The **Helix Staff** rune: braided branches weaving around a central `main` spine into a hollow `HEAD` ring, rendered in brushed platinum on an obsidian tile with a subtle platinum rim (part of the Invoke suite alongside Mint for Invoke API and Gold for Invoke DB). Source vector: `crates/app/assets/invoke-git.svg`; Windows multi-size icon: `crates/app/assets/invoke-git.ico`. Set the wordmark "Invoke Git" in Inter 600 in `ink`.
