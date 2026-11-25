@@ -356,8 +356,17 @@ impl ForgeService {
     /// The caller holds the list lock.
     fn undo_locked(&self, book: &mut AccountBook, commit: &Commit) -> Result<(), ForgeError> {
         let key = commit.account.key();
-        let still_ours = book.get(&key) == Some(&commit.account)
-            && matches!(self.inner.store.load(&key), Ok(Some(current)) if current == commit.written);
+        if book.get(&key) != Some(&commit.account) {
+            return Ok(());
+        }
+        // A keychain that cannot be read leaves the outcome unknown: that is
+        // a failed undo to report, not "nothing to undo".
+        let current = self
+            .inner
+            .store
+            .load(&key)
+            .map_err(|_| ForgeError::RollbackFailed)?;
+        let still_ours = current.as_ref() == Some(&commit.written);
         if !still_ours {
             return Ok(());
         }

@@ -1443,6 +1443,8 @@ struct HookStore {
     after_save: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Makes every delete fail (a keychain that refuses).
     fail_delete: AtomicBool,
+    /// Makes every load fail (a keychain that went away).
+    fail_load: AtomicBool,
 }
 
 impl TokenStore for HookStore {
@@ -1454,6 +1456,11 @@ impl TokenStore for HookStore {
         Ok(())
     }
     fn load(&self, key: &str) -> Result<Option<Credential>, ForgeError> {
+        if self.fail_load.load(Ordering::SeqCst) {
+            return Err(ForgeError::Keychain(
+                "no keychain is available on this system".into(),
+            ));
+        }
         self.inner.load(key)
     }
     fn delete(&self, key: &str) -> Result<(), ForgeError> {
@@ -2250,4 +2257,24 @@ fn a_failed_undo_of_a_write_cancelled_midway_is_reported_by_the_flow() {
         }
     }
     assert!(message.unwrap().contains("keychain"));
+}
+
+#[test]
+fn a_cancel_that_cannot_read_the_keychain_reports_a_failed_undo() {
+    let mock = device_mock("granted");
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), None);
+    let runner = SignInRunner::new(service.clone());
+    run_until_committed(&runner, &service);
+    // The keychain goes away after the commit: whether the token is still
+    // the flow's cannot be known, so the undo must not claim success.
+    store.fail_load.store(true, Ordering::SeqCst);
+    let (events, inbox) = mpsc::channel();
+    runner.execute(SignInCommand::Abort, events);
+    let message = wait_for_cleanup_failed(&inbox).expect("the unknown outcome was hidden");
+    assert!(message.contains("keychain"), "{message}");
+    assert!(!message.contains("ghp_ANA"));
+    // Nothing was touched without knowing what is there.
+    assert_eq!(service.accounts().len(), 1);
+    assert!(!store.inner.is_empty());
 }
