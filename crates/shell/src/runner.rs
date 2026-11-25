@@ -186,6 +186,90 @@ impl Job {
         self.control.is_cancelled()
     }
 
+    /// Runs `git lfs version` through the cancellable child runner (`run_child`).
+    /// Returns `None` when `git-lfs` is available, or an early `OpOutcome`
+    /// (`Cancelled` or `Failed(Environment)`).
+    fn probe_git_lfs(&self) -> Option<OpOutcome> {
+        let mut command = self.git.command(&self.paths.workdir);
+        command
+            .args(["lfs", "version"])
+            .envs(self.env.iter().map(|(key, value)| (key, value)));
+        match run_child(command, None, None, &self.control) {
+            Ok(done) if done.killed && !done.success => Some(OpOutcome::Cancelled),
+            Ok(done) if done.success && done.output.trim_start().starts_with("git-lfs/") => None,
+            Ok(_) => Some(failed(
+                ErrorClass::Environment,
+                "Git LFS is not installed (`git-lfs` was not found on PATH). Install Git LFS to pull LFS objects.".into(),
+            )),
+            Err(error) => Some(failed(
+                ErrorClass::Environment,
+                format!("start git: {error}"),
+            )),
+        }
+    }
+
+    /// Before a non-forced `git worktree remove`, checks the target worktree for
+    /// ignored, untracked, or modified files (`git worktree remove` alone ignores
+    /// gitignored files like `.env` and deletes them silently).
+    fn check_worktree_ignored_or_dirty(
+        &self,
+        workdir: &std::path::Path,
+        display_path: &str,
+    ) -> Option<OpOutcome> {
+        let mut command = self.git.command(workdir);
+        command
+            .args(crate::git::GLOBAL_ARGS)
+            .args([
+                "status",
+                "--porcelain=v1",
+                "--ignored=matching",
+                "--untracked-files=all",
+                "-z",
+            ])
+            .envs(self.env.iter().map(|(key, value)| (key, value)))
+            // Never refresh the target worktree's index during the read-only
+            // cleanliness probe, or the post-probe index guard would see drift.
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        match run_child(command, None, None, &self.control) {
+            Ok(done) if done.killed && !done.success => Some(OpOutcome::Cancelled),
+            Ok(done) if !done.success => Some(failed(
+                ErrorClass::Expected,
+                format!(
+                    "Could not verify whether worktree '{display_path}' contains ignored or uncommitted files: {}",
+                    done.output.trim()
+                ),
+            )),
+            Ok(done) => {
+                let paths = crate::advanced::parse_porcelain_z_paths(&done.output);
+                if paths.is_empty() {
+                    return None;
+                }
+                let limit = 10;
+                let shown = paths
+                    .iter()
+                    .take(limit)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let suffix = if paths.len() > limit {
+                    format!(", and {} more", paths.len() - limit)
+                } else {
+                    String::new()
+                };
+                Some(failed(
+                    ErrorClass::Expected,
+                    format!(
+                        "Refused to remove worktree '{display_path}': it contains ignored, untracked, or modified files that would be lost ({shown}{suffix}). Move them or tick Force remove."
+                    ),
+                ))
+            }
+            Err(error) => Some(failed(
+                ErrorClass::Environment,
+                format!("start git: {error}"),
+            )),
+        }
+    }
+
     fn execute(self) -> OpOutcome {
         if self.cancelled() {
             return OpOutcome::Cancelled;
@@ -219,6 +303,99 @@ impl Job {
         }
         if let Err(failure) = crate::rebase::check(&self.paths, &self.args, &self.expect) {
             return OpOutcome::Failed(failure);
+        }
+        if let GitArgs::WorktreeRemove {
+            path,
+            force,
+            expect_head,
+            expect_index,
+            ..
+        } = &self.args
+        {
+            let target = match crate::advanced::check_worktree_remove_target(
+                &self.paths,
+                path,
+                expect_head.as_ref(),
+                expect_index.as_ref(),
+                *force,
+            ) {
+                Ok(t) => t,
+                Err(failure) => return OpOutcome::Failed(failure),
+            };
+            // Re-checked on disk at run time: if the checkout folder is truly
+            // missing, fall through to `git worktree remove -- <path>` (without
+            // `--force`), which removes only this target's admin entry without
+            // pruning unrelated missing worktrees.
+            if target.dir_exists && !*force {
+                if !target.has_git_link {
+                    return failed(
+                        ErrorClass::Expected,
+                        format!(
+                            "Refused to remove worktree '{path}': directory exists on disk without a valid .git link. Inspect its contents or tick Force remove."
+                        ),
+                    );
+                }
+                if let Some(early) = self.check_worktree_ignored_or_dirty(&target.workdir, path) {
+                    return early;
+                }
+                if self.cancelled() {
+                    return OpOutcome::Cancelled;
+                }
+                if let Err(failure) = precondition::check(&self.paths, &self.expect) {
+                    return OpOutcome::Failed(failure);
+                }
+                if let Err(failure) = crate::advanced::check_worktree_remove_target(
+                    &self.paths,
+                    path,
+                    expect_head.as_ref(),
+                    expect_index.as_ref(),
+                    *force,
+                ) {
+                    return OpOutcome::Failed(failure);
+                }
+            }
+        }
+        if let GitArgs::Submodule {
+            op: invoke_core::SubmoduleOp::UpdateInitRecursive,
+            path,
+        } = &self.args
+        {
+            if let Err(failure) = run_submodule_preflight(
+                &self.paths,
+                &self.expect,
+                path.as_ref(),
+                crate::advanced::check_submodule_update,
+            ) {
+                return OpOutcome::Failed(failure);
+            }
+            if self.cancelled() {
+                return OpOutcome::Cancelled;
+            }
+        }
+        // P10: run the `git lfs version` probe through the cancellable runner,
+        // then re-check the final guard (`index.lock`, HEAD, index) right
+        // before launching `git lfs pull`.
+        if let GitArgs::LfsPull { path } = &self.args {
+            if let Some(p) = path
+                && !invoke_core::lfs_include_path_is_literal(p)
+            {
+                return failed(
+                    ErrorClass::Expected,
+                    format!(
+                        "Cannot pull '{}' individually because its path contains comma or wildcard characters. Use LFS Pull (all) instead.",
+                        p.0
+                    ),
+                );
+            }
+            if let Some(early) = self.probe_git_lfs() {
+                return early;
+            }
+            if self.cancelled() {
+                return OpOutcome::Cancelled;
+            }
+            if let Err(failure) = precondition::check(&self.paths, &self.expect) {
+                return OpOutcome::Failed(failure);
+            }
         }
         // Task 23: a request is one git run, except taking a side whole,
         // which is two; it stops at the first one that fails.
@@ -485,10 +662,66 @@ fn collect(drained: Drained) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Runs the submodule disk check and immediately re-verifies the calling repo's
+/// precondition (`index.lock`, `HEAD`, `index`) right before spawning `git submodule update`.
+fn run_submodule_preflight(
+    paths: &RepoPaths,
+    expect: &Expect,
+    path: Option<&invoke_core::RepoPath>,
+    check_sub: impl FnOnce(&RepoPaths, Option<&invoke_core::RepoPath>) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    check_sub(paths, path)?;
+    precondition::check(paths, expect)
+}
+
 pub(crate) fn failed(class: ErrorClass, details: String) -> OpOutcome {
     OpOutcome::Failed(Failure { class, details })
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submodule_preflight_rechecks_precondition_after_submodule_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "invoke-sub-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let paths = RepoPaths {
+            workdir: dir.clone(),
+            git_dir: dir.join(".git"),
+        };
+        let expect = precondition::current(&paths).unwrap();
+
+        // Simulate `index.lock` appearing during the submodule disk scan.
+        let lock_path = paths.git_dir.join("index.lock");
+        let res = run_submodule_preflight(&paths, &expect, None, |_, _| {
+            std::fs::write(&lock_path, b"lock").unwrap();
+            Ok(())
+        });
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match res {
+            Err(f) => assert_eq!(f.class, ErrorClass::PreconditionChanged),
+            Ok(()) => panic!("expected PreconditionChanged when index.lock appeared during scan"),
+        }
+    }
 }

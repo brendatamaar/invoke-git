@@ -200,6 +200,23 @@ pub fn what(request: &WriteRequest) -> Option<String> {
         } else {
             format!("Pushing to {}", remote_text(to))
         }),
+        WriteRequest::WorktreeAdd { path, .. } => Some(format!("Adding worktree {path}")),
+        WriteRequest::WorktreeRemove { path, .. } => Some(format!("Removing worktree {path}")),
+        WriteRequest::Submodule { op, path } => {
+            let verb = match op {
+                invoke_core::SubmoduleOp::Init => "Initializing",
+                invoke_core::SubmoduleOp::UpdateInitRecursive => "Updating",
+                invoke_core::SubmoduleOp::SyncRecursive => "Syncing",
+            };
+            Some(match path {
+                Some(path) => format!("{verb} submodule {}", path.0),
+                None => format!("{verb} submodules"),
+            })
+        }
+        WriteRequest::LfsPull { path } => Some(match path {
+            Some(path) => format!("Pulling LFS object {}", path.0),
+            None => "Pulling Git LFS objects".to_owned(),
+        }),
         _ => None,
     }
 }
@@ -444,6 +461,7 @@ mod tests {
                     refs: RefsSnapshot::default(),
                     stashes: Vec::new(),
                     lock,
+                    advanced: Default::default(),
                 },
             };
             state

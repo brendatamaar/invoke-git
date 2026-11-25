@@ -25,7 +25,7 @@ use tokens::{
 };
 
 use crate::code_text::{expand_tabs, expanded_offset, merge_styles};
-use crate::components::{Banner, BannerKind, Button, Segmented};
+use crate::components::{Banner, BannerKind, Button, Pill, Segmented};
 use crate::convert::hsla;
 use crate::diff_rows::{Layout, Row, hunk_header, rows};
 use crate::scrollbar::Scrollbar;
@@ -94,12 +94,24 @@ pub enum DiffEvent {
     DiscardHunk { hunk: usize },
     /// Throw away the selected unstaged lines of one hunk.
     DiscardLines { hunk: usize, lines: Vec<usize> },
+    /// P10: request `git lfs pull` for the currently shown LFS pointer file.
+    PullLfs,
+}
+
+/// P10: Git LFS metadata shown as a badge and banner in the diff viewer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LfsDiffInfo {
+    /// Human-readable summary (e.g. `"Git LFS pointer · 12.1 KiB · sha256:4d7a214614ab"`).
+    pub summary: SharedString,
+    /// True when the file in the worktree is still an un-smudged pointer.
+    pub is_pointer: bool,
 }
 
 pub struct DiffData {
     pub path: SharedString,
     pub mode: StageMode,
     pub inputs: Option<InputsMeta>,
+    pub lfs: Option<LfsDiffInfo>,
     pub diff: TextDiff,
     /// Spans over `diff.old` and `diff.new`; empty for plain text.
     pub old_spans: Arc<[Span]>,
@@ -242,6 +254,7 @@ impl DiffView {
                         .truncate()
                         .child(data.path.clone()),
                 )
+                .children(data.lfs.as_ref().map(|_| Pill::new("LFS")))
                 .child(
                     div()
                         .flex_none()
@@ -367,6 +380,18 @@ impl Render for DiffView {
                 self.message("No differences".into(), cx)
             }
             Content::Text(data) => {
+                let lfs_banner = data.lfs.as_ref().map(|lfs| {
+                    let pull_view = cx.entity();
+                    let mut banner = Banner::new(BannerKind::Warning, lfs.summary.clone());
+                    if lfs.is_pointer {
+                        banner = banner.action(Button::new("diff-lfs-pull", "Pull LFS").on_click(
+                            move |_, _, cx| {
+                                pull_view.update(cx, |_, cx| cx.emit(DiffEvent::PullLfs))
+                            },
+                        ));
+                    }
+                    banner
+                });
                 let note = (data.diff.note == Some(DiffNote::TooExpensive)).then(|| {
                     Banner::new(
                         BannerKind::Warning,
@@ -386,6 +411,7 @@ impl Render for DiffView {
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.))
+                    .children(lfs_banner)
                     .children(note)
                     .child(
                         div()
@@ -736,6 +762,7 @@ pub fn compute(path: &str, old: &str, new: &str) -> DiffData {
         path: path.to_owned().into(),
         mode: StageMode::ReadOnly,
         inputs: None,
+        lfs: None,
         diff: diff::diff_text(old, new, &diff::DiffOptions::default()),
         old_spans: Arc::from(Vec::new()),
         new_spans: Arc::from(Vec::new()),

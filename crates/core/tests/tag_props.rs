@@ -39,6 +39,7 @@ fn disk(tags: &[&str], phase: Phase) -> DiskState {
         },
         stashes: Vec::new(),
         lock: LockState::Free,
+        advanced: Default::default(),
     }
 }
 

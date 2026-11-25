@@ -39,6 +39,7 @@ fn disk(stashes: &[u64], phase: Phase, lock: LockState) -> DiskState {
         },
         stashes: stashes.iter().map(|n| entry(*n)).collect(),
         lock,
+        advanced: Default::default(),
     }
 }
 

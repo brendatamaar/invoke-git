@@ -41,7 +41,8 @@ pub use components::{
     SectionLabel, Segmented,
 };
 pub use diff_view::{
-    Around, Content as DiffContent, DiffData, DiffEvent, DiffView, InputsMeta, StageMode,
+    Around, Content as DiffContent, DiffData, DiffEvent, DiffView, InputsMeta, LfsDiffInfo,
+    StageMode,
 };
 pub use graph_view::{GraphEvent, GraphView, RowMeta};
 pub use rebase_editor::{

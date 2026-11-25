@@ -4,6 +4,7 @@
 //! randomness. The shell runs the [`Command`]s and reports back with
 //! [`Event`]s. See `docs/spec/core-design.md`.
 
+pub mod advanced;
 pub mod branch;
 pub mod clone;
 pub mod commit;
@@ -26,6 +27,14 @@ pub mod undo;
 pub mod undo_codec;
 pub mod watch;
 
+pub use advanced::{
+    AdvancedSnapshot, LFS_SPEC_VERSION, LfsFile, LfsFileState, LfsPointer, LfsRefusal, LfsSnapshot,
+    MAX_LFS_POINTER_BYTES, SubmoduleEntry, SubmoduleOp, SubmoduleRefusal, SubmoduleState,
+    WorktreeCheckout, WorktreeEntry, WorktreeRefusal, WorktreeSpec, WorktreeTarget,
+    classify_submodule_state, format_byte_size, gitattributes_uses_lfs,
+    lfs_include_path_is_literal, normalize_worktree_path, parse_lfs_pointer, same_worktree_path,
+    validate_worktree_path, worktree_holding_branch,
+};
 pub use conflict::{
     ConflictContent, ConflictFile, ConflictKind, ConflictRefusal, ContinueGate, FileState,
     Operation, ResolveChoice, Side, StageContent, continue_gate,

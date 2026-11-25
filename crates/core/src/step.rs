@@ -2,6 +2,7 @@
 
 use std::mem;
 
+use crate::advanced::{self, WorktreeSpec, WorktreeTarget};
 use crate::branch;
 use crate::commit::{self, CommitKind};
 use crate::conflict::{self, ConflictRefusal, Operation};
@@ -163,6 +164,58 @@ pub fn step(mut state: RepoState, event: Event) -> (RepoState, Vec<Command>) {
         Event::StashPopRequested(stash) => enqueue(&mut state, WriteRequest::StashPop { stash }),
         Event::StashDropRequested(stash) => {
             enqueue(&mut state, WriteRequest::StashDrop { stash });
+        }
+        // P10: worktrees, submodules, and Git LFS.
+        Event::WorktreeAddRequested { path, spec } => {
+            match advanced::validate_worktree_path(&path) {
+                Err(why) => {
+                    refuse_because(&mut state, Action::WorktreeAdd, Refusal::Worktree(why));
+                }
+                Ok(path) => match spec {
+                    WorktreeSpec::ExistingBranch(name) => enqueue(
+                        &mut state,
+                        WriteRequest::WorktreeAdd {
+                            path,
+                            target: WorktreeTarget::ExistingBranch(name),
+                        },
+                    ),
+                    WorktreeSpec::NewBranch { name, at } => match BranchName::parse(&name) {
+                        Ok(name) => enqueue(
+                            &mut state,
+                            WriteRequest::WorktreeAdd {
+                                path,
+                                target: WorktreeTarget::NewBranch { name, at },
+                            },
+                        ),
+                        Err(problem) => refuse_because(
+                            &mut state,
+                            Action::WorktreeAdd,
+                            Refusal::Worktree(advanced::WorktreeRefusal::InvalidBranch(problem)),
+                        ),
+                    },
+                    WorktreeSpec::Detach(at) => enqueue(
+                        &mut state,
+                        WriteRequest::WorktreeAdd {
+                            path,
+                            target: WorktreeTarget::Detach(at),
+                        },
+                    ),
+                },
+            }
+        }
+        Event::WorktreeRemoveRequested { path, force } => {
+            match advanced::validate_worktree_path(&path) {
+                Ok(path) => enqueue(&mut state, WriteRequest::WorktreeRemove { path, force }),
+                Err(why) => {
+                    refuse_because(&mut state, Action::WorktreeRemove, Refusal::Worktree(why))
+                }
+            }
+        }
+        Event::SubmoduleRequested { op, path } => {
+            enqueue(&mut state, WriteRequest::Submodule { op, path });
+        }
+        Event::LfsPullRequested { path } => {
+            enqueue(&mut state, WriteRequest::LfsPull { path });
         }
         Event::UndoSnapshotTaken { op, tree } => {
             if let UndoPending::Recording { point } = &state.undo.pending
@@ -1192,6 +1245,25 @@ fn dispatch(state: &mut RepoState, commands: &mut Vec<Command>) {
                     }
                     Err(reason) => {
                         if let Some(action) = tag::action_of(tag_request) {
+                            refuse_because(state, action, reason);
+                        }
+                        continue;
+                    }
+                }
+            }
+            // P10: worktrees, submodules, and Git LFS.
+            adv_request if advanced::action_of(adv_request).is_some() => {
+                let Some(planned) = advanced::plan(adv_request, &disk) else {
+                    continue;
+                };
+                match planned {
+                    Ok(args) => commands.push(Command::RunGit {
+                        op: id,
+                        args,
+                        expect,
+                    }),
+                    Err(reason) => {
+                        if let Some(action) = advanced::action_of(adv_request) {
                             refuse_because(state, action, reason);
                         }
                         continue;

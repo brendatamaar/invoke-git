@@ -17,7 +17,7 @@ use ui::{Banner, BannerKind, Button, Summary, TabBar, TabItem, TextStyleExt, The
 use crate::clone_view::{CloneView, CloneViewEvent};
 use crate::paths;
 use crate::persist::{self, Saved};
-use crate::repo_view::RepoView;
+use crate::repo_view::{RepoView, RepoViewEvent};
 use crate::session::RepoSession;
 use crate::setup;
 use crate::tabs::{Active, Tabs};
@@ -252,7 +252,12 @@ impl Workspace {
         self.tabs.open(existing, || {
             let session = cx.new(|cx| RepoSession::new(found, git, cx));
             cx.observe(&session, |_, _, cx| cx.notify()).detach();
-            cx.new(|cx| RepoView::new(session, cx))
+            let view = cx.new(|cx| RepoView::new(session, cx));
+            cx.subscribe(&view, |this, _, event: &RepoViewEvent, cx| match event {
+                RepoViewEvent::OpenRepo(path) => this.open_path(path.clone(), cx),
+            })
+            .detach();
+            view
         });
         self.changed(cx);
     }

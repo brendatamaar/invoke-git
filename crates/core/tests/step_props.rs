@@ -125,6 +125,7 @@ fn disk() -> impl Strategy<Value = DiskState> {
             refs,
             stashes,
             lock,
+            advanced: Default::default(),
         },
     )
 }
@@ -522,6 +523,7 @@ fn commit_round_trip() {
         refs: RefsSnapshot::default(),
         stashes: Vec::new(),
         lock: LockState::HeldByOther,
+        advanced: Default::default(),
     };
 
     // Locked by someone else: the commit waits.
@@ -790,6 +792,7 @@ fn read_disk(refs: &[(&str, char)], phase: Phase, head_oid: char) -> DiskState {
         },
         lock: LockState::Free,
         stashes: Vec::new(),
+        advanced: Default::default(),
     }
 }
 

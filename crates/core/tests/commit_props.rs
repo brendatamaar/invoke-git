@@ -95,6 +95,7 @@ fn disk(head: HeadKind, phase: PhaseKind, staged: bool, unstaged: bool) -> DiskS
         refs: RefsSnapshot::default(),
         stashes: Vec::new(),
         lock: LockState::Free,
+        advanced: Default::default(),
     }
 }
 

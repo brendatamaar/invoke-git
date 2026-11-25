@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::git_discovery::{self, GitSource};
-use invoke_core::{GitArgs, Operation, PullMode, RepoPath, ResetMode, Side};
+use invoke_core::{
+    GitArgs, Operation, PullMode, RepoPath, ResetMode, Side, SubmoduleOp, WorktreeCheckout,
+};
 
 /// The oldest git Invoke Git supports (PRD → "Decisions").
 pub const MIN_VERSION: GitVersion = GitVersion {
@@ -449,6 +451,79 @@ pub fn invocation(args: &GitArgs) -> Invocation {
             );
             argv.push(target.to_string().into());
             argv.push("--".into());
+            plain(argv)
+        }
+        // P10: worktrees, submodules, and Git LFS. `--` ends options before
+        // paths so no user-supplied path can be interpreted as a flag.
+        GitArgs::WorktreeAdd { path, checkout } => {
+            argv.extend(["worktree", "add"].map(OsString::from));
+            match checkout {
+                WorktreeCheckout::ExistingBranch { name, .. } => {
+                    argv.extend(["--no-guess-remote", "--"].map(OsString::from));
+                    argv.push(path.into());
+                    argv.push((&name.0).into());
+                }
+                WorktreeCheckout::NewBranch { name, at } => {
+                    argv.push("-b".into());
+                    argv.push((&name.0).into());
+                    argv.push("--".into());
+                    argv.push(path.into());
+                    argv.push(at.to_string().into());
+                }
+                WorktreeCheckout::Detach(at) => {
+                    argv.extend(["--detach", "--"].map(OsString::from));
+                    argv.push(path.into());
+                    argv.push(at.to_string().into());
+                }
+            }
+            plain(argv)
+        }
+        GitArgs::WorktreeRemove {
+            path,
+            force,
+            locked,
+            ..
+        } => {
+            argv.extend(["worktree", "remove"].map(OsString::from));
+            if *force {
+                argv.push("--force".into());
+                if *locked {
+                    // git requires `-f -f` to remove a locked worktree.
+                    argv.push("--force".into());
+                }
+            }
+            argv.push("--".into());
+            argv.push(path.into());
+            plain(argv)
+        }
+        GitArgs::Submodule { op, path } => {
+            argv.push("submodule".into());
+            match op {
+                SubmoduleOp::Init => argv.push("init".into()),
+                SubmoduleOp::UpdateInitRecursive => {
+                    // Always force `--checkout` so configured `submodule.<name>.update`
+                    // (merge/rebase) can never silently move a checked-out branch (Law 9).
+                    argv.extend(
+                        ["update", "--init", "--recursive", "--checkout"].map(OsString::from),
+                    );
+                }
+                SubmoduleOp::SyncRecursive => {
+                    argv.extend(["sync", "--recursive"].map(OsString::from));
+                }
+            }
+            if let Some(path) = path {
+                argv.push("--".into());
+                // Use `:(literal)` pathspec magic so submodule paths containing
+                // glob characters (e.g. `libs/a[12]`) never match other submodules.
+                argv.push(format!(":(literal){}", path.0).into());
+            }
+            plain(argv)
+        }
+        GitArgs::LfsPull { path } => {
+            argv.extend(["lfs", "pull"].map(OsString::from));
+            if let Some(path) = path {
+                argv.push(format!("--include={}", path.0).into());
+            }
             plain(argv)
         }
     }
@@ -1083,5 +1158,132 @@ mod tests {
             vec!["reset", "--mixed", &target.to_string(), "--"]
         );
         assert!(mixed.stdin.is_none());
+    }
+
+    #[test]
+    fn p10_worktree_submodule_and_lfs_argv() {
+        let oid = Oid::from_hex(&"c".repeat(40)).unwrap();
+        let add_existing = invocation(&GitArgs::WorktreeAdd {
+            path: "/wt/feat".into(),
+            checkout: WorktreeCheckout::ExistingBranch {
+                name: BranchName("feat".into()),
+                tip: oid.clone(),
+            },
+        });
+        assert_eq!(
+            after_globals(&add_existing),
+            [
+                "worktree",
+                "add",
+                "--no-guess-remote",
+                "--",
+                "/wt/feat",
+                "feat"
+            ]
+        );
+
+        let add_new = invocation(&GitArgs::WorktreeAdd {
+            path: "/wt/new".into(),
+            checkout: WorktreeCheckout::NewBranch {
+                name: BranchName("topic".into()),
+                at: oid.clone(),
+            },
+        });
+        assert_eq!(
+            after_globals(&add_new),
+            [
+                "worktree",
+                "add",
+                "-b",
+                "topic",
+                "--",
+                "/wt/new",
+                &oid.to_string()
+            ]
+        );
+
+        let add_detach = invocation(&GitArgs::WorktreeAdd {
+            path: "/wt/det".into(),
+            checkout: WorktreeCheckout::Detach(oid.clone()),
+        });
+        assert_eq!(
+            after_globals(&add_detach),
+            [
+                "worktree",
+                "add",
+                "--detach",
+                "--",
+                "/wt/det",
+                &oid.to_string()
+            ]
+        );
+
+        let rm_plain = invocation(&GitArgs::WorktreeRemove {
+            path: "/wt/feat".into(),
+            force: false,
+            locked: false,
+            expect_head: None,
+            expect_index: None,
+        });
+        assert_eq!(
+            after_globals(&rm_plain),
+            ["worktree", "remove", "--", "/wt/feat"]
+        );
+
+        let rm_locked = invocation(&GitArgs::WorktreeRemove {
+            path: "/wt/locked".into(),
+            force: true,
+            locked: true,
+            expect_head: None,
+            expect_index: None,
+        });
+        assert_eq!(
+            after_globals(&rm_locked),
+            [
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                "--",
+                "/wt/locked"
+            ]
+        );
+
+        let sub_update = invocation(&GitArgs::Submodule {
+            op: SubmoduleOp::UpdateInitRecursive,
+            path: Some(RepoPath("libs/child".into())),
+        });
+        assert_eq!(
+            after_globals(&sub_update),
+            [
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+                "--checkout",
+                "--",
+                ":(literal)libs/child"
+            ]
+        );
+
+        let sub_sync = invocation(&GitArgs::Submodule {
+            op: SubmoduleOp::SyncRecursive,
+            path: None,
+        });
+        assert_eq!(
+            after_globals(&sub_sync),
+            ["submodule", "sync", "--recursive"]
+        );
+
+        let lfs_all = invocation(&GitArgs::LfsPull { path: None });
+        assert_eq!(after_globals(&lfs_all), ["lfs", "pull"]);
+
+        let lfs_one = invocation(&GitArgs::LfsPull {
+            path: Some(RepoPath("assets/a.bin".into())),
+        });
+        assert_eq!(
+            after_globals(&lfs_one),
+            ["lfs", "pull", "--include=assets/a.bin"]
+        );
     }
 }

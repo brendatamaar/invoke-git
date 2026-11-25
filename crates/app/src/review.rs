@@ -388,6 +388,7 @@ mod tests {
                 refs,
                 stashes: Vec::new(),
                 lock: invoke_core::LockState::Free,
+                advanced: Default::default(),
             },
         };
         state

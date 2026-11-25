@@ -9,8 +9,8 @@ use gpui::{
     App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, RenderOnce,
     StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, uniform_list,
 };
-use invoke_core::{Head, RefsSnapshot, StashEntry, Tracking};
-use tokens::{RADIUS_MD, ROW_LIST, SPACE_1, SPACE_2, TEXT_BODY, TEXT_LABEL, TEXT_SMALL};
+use invoke_core::{AdvancedSnapshot, Head, RefsSnapshot, StashEntry, SubmoduleState, Tracking};
+use tokens::{RADIUS_MD, RADIUS_SM, ROW_LIST, SPACE_1, SPACE_2, TEXT_BODY, TEXT_LABEL, TEXT_SMALL};
 
 use crate::convert::hsla;
 use crate::focus;
@@ -36,6 +36,23 @@ pub enum SideRow {
         index: usize,
         label: String,
     },
+    /// P10: a git worktree (main or linked).
+    Worktree {
+        path: String,
+        label: String,
+        branch: String,
+        main: bool,
+        current: bool,
+        locked: bool,
+        prunable: bool,
+    },
+    /// P10: a configured submodule with its operational status.
+    Submodule {
+        path: String,
+        name: String,
+        status: String,
+        state: SubmoduleState,
+    },
 }
 
 /// What the user asked for in the sidebar.
@@ -53,6 +70,12 @@ pub enum SideAction {
     StashApply(usize),
     StashPop(usize),
     StashDrop(usize),
+    /// P10: open a linked/main worktree in its own tab, or remove a linked one.
+    WorktreeOpen(String),
+    WorktreeRemove(String),
+    /// P10: update (`--init --recursive`) or sync (`--recursive`) a submodule.
+    SubmoduleUpdate(Option<String>),
+    SubmoduleSync(Option<String>),
 }
 
 fn tracking_text(tracking: Tracking) -> String {
@@ -62,10 +85,40 @@ fn tracking_text(tracking: Tracking) -> String {
     }
 }
 
+fn worktree_branch_label(head: Option<&Head>, locked: bool, prunable: bool) -> String {
+    let base = match head {
+        Some(Head::Branch { name, .. } | Head::Unborn(name)) => name.0.clone(),
+        Some(Head::Detached(oid)) => oid.as_hex()[..7.min(oid.as_hex().len())].to_owned(),
+        None => "unknown".to_owned(),
+    };
+    if prunable {
+        format!("{base} · missing")
+    } else if locked {
+        format!("{base} · locked")
+    } else {
+        base
+    }
+}
+
+fn submodule_status_label(state: SubmoduleState) -> &'static str {
+    match state {
+        SubmoduleState::Clean => "clean",
+        SubmoduleState::Uninitialized => "uninit",
+        SubmoduleState::OutOfSync => "out of sync",
+        SubmoduleState::Dirty => "dirty",
+        SubmoduleState::MergeConflict => "conflict",
+    }
+}
+
 /// The rows for the refs: LOCAL (the current branch first, then the others
-/// by name), one REMOTE section per remote, TAGS, and STASHES when there are
-/// any. A section without entries has no rows.
-pub fn sidebar_rows(refs: &RefsSnapshot, head: &Head, stashes: &[StashEntry]) -> Vec<SideRow> {
+/// by name), one REMOTE section per remote, TAGS, STASHES, WORKTREES, and
+/// SUBMODULES when there are any. A section without entries has no rows.
+pub fn sidebar_rows(
+    refs: &RefsSnapshot,
+    head: &Head,
+    stashes: &[StashEntry],
+    advanced: &AdvancedSnapshot,
+) -> Vec<SideRow> {
     let current = match head {
         Head::Branch { name, .. } | Head::Unborn(name) => Some(name.0.as_str()),
         Head::Detached(_) => None,
@@ -132,6 +185,31 @@ pub fn sidebar_rows(refs: &RefsSnapshot, head: &Head, stashes: &[StashEntry]) ->
             });
         }
     }
+    if !advanced.worktrees.is_empty() {
+        rows.push(SideRow::Header("WORKTREES".to_owned()));
+        for wt in &advanced.worktrees {
+            rows.push(SideRow::Worktree {
+                path: wt.path.clone(),
+                label: wt.name.clone(),
+                branch: worktree_branch_label(wt.head.as_ref(), wt.locked.is_some(), wt.prunable),
+                main: wt.is_main,
+                current: wt.is_current,
+                locked: wt.locked.is_some(),
+                prunable: wt.prunable,
+            });
+        }
+    }
+    if !advanced.submodules.is_empty() {
+        rows.push(SideRow::Header("SUBMODULES".to_owned()));
+        for sub in &advanced.submodules {
+            rows.push(SideRow::Submodule {
+                path: sub.path.0.clone(),
+                name: sub.name.clone(),
+                status: submodule_status_label(sub.state).to_owned(),
+                state: sub.state,
+            });
+        }
+    }
     rows
 }
 
@@ -158,6 +236,9 @@ impl Sidebar {
 /// The room the hover buttons take, so a name is cut short instead of covered.
 const ROW_ACTIONS_W: f32 = 160.0;
 const REMOTE_ACTIONS_W: f32 = 100.0;
+/// Worktree status dot geometry from design tokens (8 px circle, 4 px radius).
+const WORKTREE_DOT_SIZE: f32 = SPACE_2;
+const WORKTREE_DOT_RADIUS: f32 = RADIUS_SM;
 
 /// The shared look of a sidebar row: focusable, with a hover group so its
 /// actions can appear.
@@ -432,6 +513,169 @@ impl RenderOnce for Sidebar {
                                 .child(actions)
                                 .into_any_element()
                         }
+                        SideRow::Worktree {
+                            path,
+                            label,
+                            branch,
+                            main,
+                            current,
+                            locked,
+                            prunable,
+                        } => {
+                            let (open_click, open_btn, remove_btn) =
+                                (on_action.clone(), on_action.clone(), on_action.clone());
+                            let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
+                            let can_open = !*current && !*prunable;
+                            let can_remove = !*main && !*current;
+                            let dot = div()
+                                .flex_none()
+                                .size(px(WORKTREE_DOT_SIZE))
+                                .rounded(px(WORKTREE_DOT_RADIUS))
+                                .bg(hsla(if *current {
+                                    p.accent
+                                } else if *prunable || *locked {
+                                    p.warning
+                                } else {
+                                    p.line_control
+                                }));
+                            let mut row = base_row(
+                                ElementId::from(("side-worktree", index)),
+                                window,
+                                cx,
+                                ring,
+                            )
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .on_click(move |event, window, cx| {
+                                if event.click_count() >= 2 && can_open {
+                                    open_click(SideAction::WorktreeOpen(p1.clone()), window, cx)
+                                }
+                            })
+                            .child(dot)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .group_hover("side-row", |style| style.pr(px(ROW_ACTIONS_W)))
+                                    .font_weight(FontWeight(if *current { 600.0 } else { 400.0 }))
+                                    .text_color(hsla(if *prunable { p.ink_muted } else { p.ink }))
+                                    .child(label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_style(&TEXT_SMALL, cx)
+                                    .text_color(hsla(if *prunable || *locked {
+                                        p.warning
+                                    } else {
+                                        p.ink_faint
+                                    }))
+                                    .child(branch.clone()),
+                            );
+                            if can_open || can_remove {
+                                let actions = overlay(hover)
+                                    .gap(px(SPACE_1))
+                                    .opacity(0.)
+                                    .group_hover("side-row", |style| style.opacity(1.))
+                                    .children(can_open.then(|| {
+                                        row_action(
+                                            ElementId::from(("side-wt-open", index)),
+                                            "Open",
+                                            false,
+                                            cx,
+                                            hover,
+                                            move |w, c| {
+                                                open_btn(SideAction::WorktreeOpen(p2.clone()), w, c)
+                                            },
+                                        )
+                                    }))
+                                    .children(can_remove.then(|| {
+                                        row_action(
+                                            ElementId::from(("side-wt-remove", index)),
+                                            "Remove",
+                                            true,
+                                            cx,
+                                            hover,
+                                            move |w, c| {
+                                                remove_btn(
+                                                    SideAction::WorktreeRemove(p3.clone()),
+                                                    w,
+                                                    c,
+                                                )
+                                            },
+                                        )
+                                    }));
+                                row = row.child(actions);
+                            }
+                            row.into_any_element()
+                        }
+                        SideRow::Submodule {
+                            path,
+                            name: _,
+                            status,
+                            state,
+                        } => {
+                            let (update_btn, sync_btn) = (on_action.clone(), on_action.clone());
+                            let (p1, p2) = (path.clone(), path.clone());
+                            let status_color = match state {
+                                SubmoduleState::Clean => p.ink_faint,
+                                SubmoduleState::MergeConflict => p.danger,
+                                SubmoduleState::Uninitialized
+                                | SubmoduleState::OutOfSync
+                                | SubmoduleState::Dirty => p.warning,
+                            };
+                            let actions = overlay(hover)
+                                .gap(px(SPACE_1))
+                                .opacity(0.)
+                                .group_hover("side-row", |style| style.opacity(1.))
+                                .child(row_action(
+                                    ElementId::from(("side-sub-update", index)),
+                                    "Update",
+                                    false,
+                                    cx,
+                                    hover,
+                                    move |w, c| {
+                                        update_btn(
+                                            SideAction::SubmoduleUpdate(Some(p1.clone())),
+                                            w,
+                                            c,
+                                        )
+                                    },
+                                ))
+                                .child(row_action(
+                                    ElementId::from(("side-sub-sync", index)),
+                                    "Sync",
+                                    false,
+                                    cx,
+                                    hover,
+                                    move |w, c| {
+                                        sync_btn(SideAction::SubmoduleSync(Some(p2.clone())), w, c)
+                                    },
+                                ));
+                            base_row(ElementId::from(("side-submodule", index)), window, cx, ring)
+                                .hover(move |style| style.bg(hover))
+                                .text_color(hsla(p.ink_muted))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .group_hover("side-row", |style| {
+                                            style.pr(px(ROW_ACTIONS_W))
+                                        })
+                                        .child(path.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_style(&TEXT_SMALL, cx)
+                                        .text_color(hsla(status_color))
+                                        .child(status.clone()),
+                                )
+                                .child(actions)
+                                .into_any_element()
+                        }
                     }
                 })
                 .collect()
@@ -484,6 +728,13 @@ mod tests {
                 SideRow::Remote(n) => format!("r {n}"),
                 SideRow::Tag(n) => format!("t {n}"),
                 SideRow::Stash { index, label } => format!("s{index} {label}"),
+                SideRow::Worktree {
+                    label,
+                    branch,
+                    current,
+                    ..
+                } => format!("w {}{label} ({branch})", if *current { "* " } else { "" }),
+                SideRow::Submodule { path, status, .. } => format!("m {path} [{status}]"),
             })
             .collect()
     }
@@ -499,7 +750,7 @@ mod tests {
             "refs/remotes/up/dev",
             "refs/tags/v1",
         ]);
-        let rows = sidebar_rows(&snapshot, &head("main"), &[]);
+        let rows = sidebar_rows(&snapshot, &head("main"), &[], &AdvancedSnapshot::default());
         assert_eq!(
             texts(&rows),
             vec![
@@ -523,6 +774,7 @@ mod tests {
             &RefsSnapshot::default(),
             &Head::Unborn(BranchName("main".into())),
             &[],
+            &AdvancedSnapshot::default(),
         );
         assert_eq!(texts(&rows), vec!["# LOCAL", "* main"]);
     }
@@ -540,7 +792,7 @@ mod tests {
                 },
             },
         );
-        let rows = sidebar_rows(&snapshot, &head("main"), &[]);
+        let rows = sidebar_rows(&snapshot, &head("main"), &[], &AdvancedSnapshot::default());
         assert!(matches!(
             &rows[1],
             SideRow::Local { tracking: Some(t), .. } if t == "↑2 ↓0"
@@ -550,12 +802,86 @@ mod tests {
     #[test]
     fn a_detached_head_has_no_current_branch() {
         let snapshot = refs(&["refs/heads/main"]);
-        let rows = sidebar_rows(&snapshot, &Head::Detached(oid('a')), &[]);
+        let rows = sidebar_rows(
+            &snapshot,
+            &Head::Detached(oid('a')),
+            &[],
+            &AdvancedSnapshot::default(),
+        );
         assert!(matches!(&rows[1], SideRow::Local { current: false, .. }));
     }
 
     #[test]
     fn empty_sections_have_no_rows() {
-        assert!(sidebar_rows(&RefsSnapshot::default(), &Head::Detached(oid('a')), &[]).is_empty());
+        assert!(
+            sidebar_rows(
+                &RefsSnapshot::default(),
+                &Head::Detached(oid('a')),
+                &[],
+                &AdvancedSnapshot::default(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn worktrees_and_submodules_sections_appear_when_present() {
+        use invoke_core::{RepoPath, SubmoduleEntry, WorktreeEntry};
+        let adv = AdvancedSnapshot {
+            worktrees: vec![
+                WorktreeEntry {
+                    path: "/r".into(),
+                    name: "r".into(),
+                    head: Some(head("main")),
+                    index: None,
+                    is_main: true,
+                    is_current: true,
+                    locked: None,
+                    prunable: false,
+                },
+                WorktreeEntry {
+                    path: "/r-feat".into(),
+                    name: "r-feat".into(),
+                    head: Some(head("feat")),
+                    index: None,
+                    is_main: false,
+                    is_current: false,
+                    locked: Some("pinned".into()),
+                    prunable: false,
+                },
+            ],
+            submodules: vec![SubmoduleEntry {
+                name: "libs/a".into(),
+                path: RepoPath("libs/a".into()),
+                url: None,
+                index_oid: Some(oid('a')),
+                head_oid: None,
+                head: None,
+                state: SubmoduleState::Uninitialized,
+            }],
+            lfs: Default::default(),
+        };
+        let rows = sidebar_rows(
+            &RefsSnapshot::default(),
+            &Head::Detached(oid('a')),
+            &[],
+            &adv,
+        );
+        assert_eq!(
+            texts(&rows),
+            vec![
+                "# WORKTREES",
+                "w * r (main)",
+                "w r-feat (feat · locked)",
+                "# SUBMODULES",
+                "m libs/a [uninit]",
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_dot_uses_design_tokens() {
+        assert_eq!(WORKTREE_DOT_SIZE, SPACE_2);
+        assert_eq!(WORKTREE_DOT_RADIUS, RADIUS_SM);
     }
 }

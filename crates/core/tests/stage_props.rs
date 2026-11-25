@@ -29,6 +29,7 @@ fn disk(index: IndexId, lock: LockState) -> DiskState {
         },
         stashes: Vec::new(),
         lock,
+        advanced: Default::default(),
     }
 }
 

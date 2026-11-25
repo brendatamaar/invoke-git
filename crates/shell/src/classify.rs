@@ -17,7 +17,7 @@ const IDENTITY_MARKERS: [&str; 6] = [
 
 /// Markers checked in order; the first class with a match wins. Auth comes
 /// before network because `unable to access` also wraps auth failures.
-const MARKERS: [(ErrorClass, &[&str]); 5] = [
+const MARKERS: [(ErrorClass, &[&str]); 6] = [
     (
         ErrorClass::PreconditionChanged,
         &[
@@ -54,6 +54,14 @@ const MARKERS: [(ErrorClass, &[&str]); 5] = [
     // Task 14: the setup is wrong, not the request. Before `Expected`
     // because these come next to `fatal:` lines of their own.
     (ErrorClass::Environment, &IDENTITY_MARKERS),
+    (
+        ErrorClass::Environment,
+        &[
+            "'lfs' is not a git command",
+            "git-lfs was not found",
+            "Git LFS is not installed",
+        ],
+    ),
     (
         ErrorClass::Expected,
         &[
@@ -118,6 +126,15 @@ const MARKERS: [(ErrorClass, &[&str]); 5] = [
             "No stash entries found",
             "No local changes to save",
             "You do not have the initial commit yet",
+            // P10: worktrees and submodules.
+            "is not a working tree",
+            "contains modified or untracked files",
+            "is a locked working tree",
+            "cannot remove a locked working tree",
+            "already used by worktree",
+            "is a main working tree",
+            "did not match any file(s) known to git",
+            "No submodule mapping found",
         ],
     ),
 ];

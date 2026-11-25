@@ -78,6 +78,7 @@ impl World {
             },
             stashes: Vec::new(),
             lock: self.lock,
+            advanced: Default::default(),
         }
     }
 
@@ -412,7 +413,12 @@ impl Sim {
             | GitArgs::InteractiveRebase(_)
             | GitArgs::GuardedRebase { .. }
             // P7.
-            | GitArgs::Reset { .. } => {
+            | GitArgs::Reset { .. }
+            // P10.
+            | GitArgs::WorktreeAdd { .. }
+            | GitArgs::WorktreeRemove { .. }
+            | GitArgs::Submodule { .. }
+            | GitArgs::LfsPull { .. } => {
                 panic!("unexpected command in the branch simulation: {args:?}")
             }
         }
@@ -757,6 +763,7 @@ fn arb_disk() -> impl Strategy<Value = DiskState> {
                 },
                 stashes: Vec::new(),
                 lock: LockState::Free,
+                advanced: Default::default(),
             }
         })
 }

@@ -5,10 +5,11 @@
 //! selected, which folders are folded, and the files still to stage.
 
 use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window,
-    div, px,
+    AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, SharedString,
+    Styled, Window, div, px,
 };
 use invoke_core::{
     Event, FileChange, Notice, Phase, ReadId, RebasePause, RebaseState, RepoPath, Snapshot,
@@ -21,7 +22,7 @@ use ui::{
     StatusTree, Summary, TextStyleExt, ThemeExt, TreeAction, TreeRow, diff_view, tree_rows,
 };
 
-use crate::branch_panel::BranchPanel;
+use crate::branch_panel::{BranchPanel, BranchPanelEvent};
 use crate::commit_box::CommitBox;
 use crate::commit_pane::{InspectFile, StartRebase};
 use crate::conflict_view::ConflictPane;
@@ -73,6 +74,12 @@ enum Bulk {
 enum QueuedFile {
     Toggle(Section, RepoPath),
     Discard(Box<Event>),
+}
+
+/// Events emitted upward from a repo tab to `Workspace` (P10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepoViewEvent {
+    OpenRepo(PathBuf),
 }
 
 pub struct RepoView {
@@ -136,6 +143,8 @@ fn files_of(status: &StatusSnapshot, section: Section, dir: Option<&str>) -> Vec
         .collect()
 }
 
+impl EventEmitter<RepoViewEvent> for RepoView {}
+
 impl RepoView {
     fn show(&mut self, page: Page, cx: &mut Context<Self>) {
         if self.page == Page::Review && page != Page::Review {
@@ -187,6 +196,15 @@ impl RepoView {
         cx.subscribe(&review, |this, _, event: &ReviewEvent, cx| match event {
             ReviewEvent::Back => this.show(Page::Changes, cx),
         })
+        .detach();
+        cx.subscribe(
+            &branches,
+            |_, _, event: &BranchPanelEvent, cx| match event {
+                BranchPanelEvent::OpenWorktree(path) => {
+                    cx.emit(RepoViewEvent::OpenRepo(path.clone()));
+                }
+            },
+        )
         .detach();
         cx.subscribe(
             &rebase,
@@ -535,6 +553,10 @@ impl RepoView {
                 },
                 true,
             ),
+            DiffEvent::PullLfs => {
+                self.deliver(Event::LfsPullRequested { path: Some(path) }, cx);
+                return;
+            }
         };
         if discard {
             if part == Part::File {

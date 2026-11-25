@@ -606,6 +606,7 @@ mod tests {
             refs: RefsSnapshot::default(),
             stashes: Vec::new(),
             lock: LockState::Free,
+            advanced: Default::default(),
         }
     }
 

@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::advanced::{AdvancedSnapshot, LfsRefusal, SubmoduleRefusal, WorktreeRefusal};
 use crate::conflict::ConflictRefusal;
 use crate::ids::{
     BranchName, IndexId, NameProblem, Oid, OpId, ReadId, RefName, RepoId, RepoPath, TagName,
@@ -78,6 +79,8 @@ pub struct DiskState {
     /// The stash list, newest first (`stash@{0}` is first). Task 20.
     pub stashes: Vec<StashEntry>,
     pub lock: LockState,
+    /// P10: worktrees, submodules, and Git LFS state read from disk.
+    pub advanced: AdvancedSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -355,6 +358,11 @@ pub enum Action {
     InteractiveRebase,
     // P7.
     Reset,
+    // P10.
+    WorktreeAdd,
+    WorktreeRemove,
+    Submodule,
+    LfsPull,
     // Task 17: the user asked to remove a leftover `index.lock`.
     RemoveLock,
 }
@@ -410,6 +418,13 @@ pub enum Refusal {
     /// or not). git would start with some unstaged edits in place, but an
     /// abort then rewrites the files it touched and loses those edits.
     UncommittedChanges,
+    /// P10: a worktree request that cannot run on the snapshot it was checked
+    /// against.
+    Worktree(WorktreeRefusal),
+    /// P10: a submodule request that cannot run on the snapshot.
+    Submodule(SubmoduleRefusal),
+    /// P10: a Git LFS request on a repo with no LFS detected.
+    Lfs(LfsRefusal),
 }
 
 impl StatusSnapshot {

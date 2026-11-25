@@ -50,6 +50,7 @@ impl World {
             },
             stashes: Vec::new(),
             lock: self.lock,
+            advanced: Default::default(),
         }
     }
 }
