@@ -982,11 +982,9 @@ fn a_keychain_that_refuses_never_leaves_a_half_connected_account() {
 fn an_unwritable_account_list_rolls_the_token_back() {
     let mock = Mock::start(github_handler);
     let data = TempDir::new("unwritable");
-    // The temporary file the list is written through is a folder, so
-    // writing fails while reading (no list yet) works.
-    std::fs::create_dir_all(data.book().with_extension("tmp")).unwrap();
     let store = memory();
     let service = service(&mock, store.clone(), Some(data.book()));
+    break_list(&data);
     let error = service
         .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
         .unwrap_err();
@@ -1445,13 +1443,24 @@ struct HookStore {
     fail_delete: AtomicBool,
     /// Makes every load fail (a keychain that went away).
     fail_load: AtomicBool,
+    /// Makes every delete take this long (a slow keychain).
+    delete_delay_ms: AtomicUsize,
+    /// Set while a delete is in progress.
+    deleting: AtomicBool,
 }
 
 impl TokenStore for HookStore {
     fn save(&self, key: &str, credential: &Credential) -> Result<(), ForgeError> {
         self.inner.save(key, credential)?;
-        if let Some(hook) = self.after_save.lock().unwrap().as_ref() {
+        // Run the hook without holding its lock, so another thread saving
+        // meanwhile is not held up by the test machinery itself.
+        let hook = self.after_save.lock().unwrap().take();
+        if let Some(hook) = hook {
             hook();
+            let mut slot = self.after_save.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
         }
         Ok(())
     }
@@ -1464,6 +1473,11 @@ impl TokenStore for HookStore {
         self.inner.load(key)
     }
     fn delete(&self, key: &str) -> Result<(), ForgeError> {
+        self.deleting.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(
+            self.delete_delay_ms.load(Ordering::SeqCst) as u64,
+        ));
+        self.deleting.store(false, Ordering::SeqCst);
         if self.fail_delete.load(Ordering::SeqCst) {
             return Err(ForgeError::Keychain(
                 "access to the keychain was refused".into(),
@@ -1718,9 +1732,11 @@ fn a_refresh_does_not_overwrite_a_newer_sign_in() {
 
 // -- registering and disconnecting are undone cleanly --------------------------
 
-/// Makes writing the account list fail (its temporary file is a folder).
+/// Makes writing the account list fail: its path becomes a folder (after the
+/// service has read it), so every write is refused.
 fn break_list(data: &TempDir) {
-    std::fs::create_dir_all(data.book().with_extension("tmp")).unwrap();
+    let _ = std::fs::remove_file(data.book());
+    std::fs::create_dir_all(data.book()).unwrap();
 }
 
 #[test]
@@ -1746,9 +1762,9 @@ fn a_failed_reconnect_puts_the_previous_token_back() {
 fn an_undo_that_fails_is_reported_not_hidden() {
     let mock = Mock::start(github_handler);
     let data = TempDir::new("rollback");
-    break_list(&data);
     let stubborn = Arc::new(StubbornStore(MemoryStore::new()));
     let service = service(&mock, stubborn.clone(), Some(data.book()));
+    break_list(&data);
     let error = service
         .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
         .unwrap_err();
@@ -2302,6 +2318,7 @@ fn two_windows_on_one_account_list_keep_each_others_accounts() {
         "the first account was dropped"
     );
     assert!(on_disk.get(&work.key()).is_some());
+    first.reload();
     assert_eq!(first.accounts().len(), 2);
     assert_eq!(store.len(), 2);
 }
@@ -2462,4 +2479,168 @@ fn a_repo_that_shows_either_token_anywhere_is_dropped() {
     let listing = service.list_repos(&account.key(), 1).unwrap();
     let names: Vec<&str> = listing.repos.iter().map(|r| r.full_name.as_str()).collect();
     assert_eq!(names, ["a/ok"]);
+}
+
+// -- round 5: one writer at a time, across processes; the UI never waits --------
+
+#[test]
+fn two_processes_signing_in_the_same_account_take_turns() {
+    // Two services stand for two processes: separate memory, one list file,
+    // one keychain.
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("two-processes");
+    let store = Arc::new(HookStore::default());
+    let first = service(&mock, store.clone(), Some(data.book()));
+    let second = service(&mock, store.clone(), Some(data.book()));
+    let other: Arc<Mutex<Option<Result<ForgeAccount, ForgeError>>>> = Arc::default();
+    {
+        // While the first is between its keychain write and its list write,
+        // the second signs in the same account with another token.
+        let (second, other) = (second.clone(), other.clone());
+        let once = AtomicBool::new(false);
+        *store.after_save.lock().unwrap() = Some(Box::new(move || {
+            if once.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let (second, other) = (second.clone(), other.clone());
+            thread::spawn(move || {
+                let result = second.connect_with_token(ForgeKind::GitHub, "", "ghp_ANA_SECOND");
+                *other.lock().unwrap() = Some(result);
+            });
+            thread::sleep(Duration::from_millis(200));
+        }));
+    }
+    let mine = first.connect_with_token(ForgeKind::GitHub, "", "ghp_ANA");
+    eventually("the second sign-in never finished", || {
+        other.lock().unwrap().is_some()
+    });
+    // Both succeed, one after the other, and the account keeps a token.
+    let mine = mine.expect("the first sign-in was refused");
+    assert!(other.lock().unwrap().as_ref().unwrap().is_ok());
+    let kept = store.inner.load(&mine.key()).unwrap().expect("token lost");
+    assert_eq!(kept.access.expose(), "ghp_ANA_SECOND");
+    let on_disk = AccountBook::decode(&std::fs::read_to_string(data.book()).unwrap());
+    assert!(on_disk.get(&mine.key()).is_some());
+}
+
+#[test]
+fn a_rollback_never_deletes_a_token_it_did_not_write() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("rollback-theirs");
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), Some(data.book()));
+    let key = "github|https://github.com|ana".to_owned();
+    {
+        // A writer that ignores the lock (an older build, say) replaces the
+        // list and the token between this write's two steps.
+        let (path, inner_key, store_for_hook) = (data.book(), key.clone(), store.clone());
+        let once = AtomicBool::new(false);
+        *store.after_save.lock().unwrap() = Some(Box::new(move || {
+            if once.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            std::fs::write(&path, "invoke-git forge accounts v1\n").unwrap();
+            store_for_hook
+                .inner
+                .save(
+                    &inner_key,
+                    &Credential::token(Secret::new("theirs").unwrap()),
+                )
+                .unwrap();
+        }));
+    }
+    let error = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap_err();
+    assert!(matches!(error, ForgeError::Disk(_)), "{error:?}");
+    let kept = store
+        .inner
+        .load(&key)
+        .unwrap()
+        .expect("their token was deleted");
+    assert_eq!(kept.access.expose(), "theirs");
+}
+
+#[test]
+fn every_write_uses_a_temporary_file_of_its_own() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("own-temp");
+    // The old shared temporary name is taken (a folder): it must not matter.
+    std::fs::create_dir_all(data.book().with_extension("tmp")).unwrap();
+    let service = service(&mock, memory(), Some(data.book()));
+    service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    let on_disk = AccountBook::decode(&std::fs::read_to_string(data.book()).unwrap());
+    assert_eq!(on_disk.accounts().len(), 1);
+}
+
+#[test]
+fn reading_the_list_never_waits_for_a_slow_keychain() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("slow-keychain");
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), Some(data.book()));
+    let account = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    store.delete_delay_ms.store(800, Ordering::SeqCst);
+    let (again, key) = (service.clone(), account.key());
+    let disconnecting = thread::spawn(move || again.disconnect(&key));
+    eventually("the delete never started", || {
+        store.deleting.load(Ordering::SeqCst)
+    });
+    // What the window draws from: no wait on the change in progress.
+    let started = Instant::now();
+    let _ = service.book();
+    let _ = service.accounts();
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "drawing waited {:?} for the keychain",
+        started.elapsed()
+    );
+    disconnecting.join().unwrap().unwrap();
+    assert!(service.accounts().is_empty());
+}
+
+#[test]
+fn a_refused_preference_is_not_kept_in_memory() {
+    let mock = Mock::start(github_handler);
+    let data = TempDir::new("refused-prefer");
+    let service = service(&mock, memory(), Some(data.book()));
+    service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_ANA")
+        .unwrap();
+    let work = service
+        .connect_with_token(ForgeKind::GitHub, "", "ghp_WORK")
+        .unwrap();
+    break_list(&data);
+    assert!(matches!(
+        service.prefer(&work.key()),
+        Err(ForgeError::Disk(_))
+    ));
+    assert!(!service.book().is_preferred(&work.key()));
+    assert!(matches!(
+        service.resolve("https://github.com/o/r"),
+        Resolution::Choose(_)
+    ));
+}
+
+#[test]
+fn an_undo_whose_list_write_fails_stops_before_the_keychain() {
+    let mock = device_mock("granted");
+    let data = TempDir::new("undo-list-fails");
+    let store = Arc::new(HookStore::default());
+    let service = service(&mock, store.clone(), Some(data.book()));
+    let runner = SignInRunner::new(service.clone());
+    run_until_committed(&runner, &service);
+    break_list(&data);
+    let (events, inbox) = mpsc::channel();
+    runner.execute(SignInCommand::Abort, events);
+    let message = wait_for_cleanup_failed(&inbox).expect("the failed undo was not reported");
+    assert!(message.contains("keychain"), "{message}");
+    // The list still names the account, and its token is still there: the
+    // two agree, and the user is told to clean up.
+    assert_eq!(service.accounts().len(), 1);
+    assert!(!store.inner.is_empty(), "the token was deleted anyway");
 }

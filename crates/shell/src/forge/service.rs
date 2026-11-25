@@ -167,7 +167,12 @@ struct Inner {
     http: Http,
     store: Arc<dyn TokenStore>,
     config: ServiceConfig,
+    /// The working list, held for the whole of a change (keychain calls
+    /// included). Never taken by `accounts` or `book`, which the UI calls.
     book: Mutex<AccountBook>,
+    /// A copy of the list as last read or written, for the UI: locked only to
+    /// copy it, never across IO.
+    snapshot: Mutex<AccountBook>,
     /// The list file's text as this service last read or wrote it (`None`:
     /// no file). The expected state every write is checked against.
     on_disk: Mutex<Option<String>>,
@@ -206,6 +211,7 @@ impl ForgeService {
                 http: Http::new()?,
                 store,
                 config,
+                snapshot: Mutex::new(book.clone()),
                 book: Mutex::new(book),
                 on_disk: Mutex::new(on_disk),
                 book_path,
@@ -244,15 +250,40 @@ impl ForgeService {
         (self.inner.clock)()
     }
 
-    /// The account list, read again from disk first (the disk is the source
-    /// of truth: another window or process may have changed it). Lock order:
-    /// the list, then `on_disk`.
+    /// Takes the working list for reading, refreshed from disk first (the
+    /// disk is the source of truth: another window or process may have
+    /// changed it). Lock order: the list, the lock file, `on_disk`, the
+    /// snapshot.
     fn book_lock(&self) -> MutexGuard<'_, AccountBook> {
         let mut book = self
             .inner
             .book
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.reload_into(&mut book);
+        book
+    }
+
+    /// Takes the working list for a change: this process's lock, then the
+    /// lock file every process shares, then a fresh read. Held for the whole
+    /// read-check-write of the list and the keychain, so no other window or
+    /// process can interleave with it.
+    fn begin_write(&self) -> Result<Writing<'_>, ForgeError> {
+        let book = self
+            .inner
+            .book
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let file = match &self.inner.book_path {
+            Some(path) => Some(lock_file(path)?),
+            None => None,
+        };
+        let mut writing = Writing { _file: file, book };
+        self.reload_into(&mut writing.book);
+        Ok(writing)
+    }
+
+    fn reload_into(&self, book: &mut AccountBook) {
         if let Some(path) = &self.inner.book_path
             && let Ok(text) = read_disk(path)
         {
@@ -262,7 +293,7 @@ impl ForgeService {
                 *on_disk = text;
             }
         }
-        book
+        *self.snapshot() = book.clone();
     }
 
     fn on_disk(&self) -> MutexGuard<'_, Option<String>> {
@@ -272,14 +303,30 @@ impl ForgeService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    // -- the account list ----------------------------------------------------
-
-    pub fn accounts(&self) -> Vec<ForgeAccount> {
-        self.book_lock().accounts().to_vec()
+    fn snapshot(&self) -> MutexGuard<'_, AccountBook> {
+        self.inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    // -- the account list ----------------------------------------------------
+
+    /// The accounts as last read or written. No IO and no waiting on a
+    /// change in progress: safe to call while drawing.
+    pub fn accounts(&self) -> Vec<ForgeAccount> {
+        self.snapshot().accounts().to_vec()
+    }
+
+    /// The whole list as last read or written (see [`accounts`](Self::accounts)).
     pub fn book(&self) -> AccountBook {
-        self.book_lock().clone()
+        self.snapshot().clone()
+    }
+
+    /// Reads the list from disk again, for changes made by another process.
+    /// Does IO: call it off the UI thread.
+    pub fn reload(&self) {
+        drop(self.book_lock());
     }
 
     /// Which account serves a remote address.
@@ -287,13 +334,24 @@ impl ForgeService {
         self.book_lock().resolve(remote_url)
     }
 
-    /// Makes `key` the account used for its host.
+    /// Makes `key` the account used for its host. The list in memory only
+    /// changes once the file has.
     pub fn prefer(&self, key: &str) -> Result<(), ForgeError> {
-        let mut book = self.book_lock();
-        if !book.prefer(key) {
+        let mut writing = self.begin_write()?;
+        let mut new = writing.book.clone();
+        if !new.prefer(key) {
             return Err(ForgeError::UnknownAccount);
         }
-        self.save_book(&book)
+        self.commit_book(&mut writing.book, new)
+    }
+
+    /// Writes `new` and only then makes it the list in memory (and the UI's
+    /// copy). A refused write leaves memory as the disk is.
+    fn commit_book(&self, book: &mut AccountBook, new: AccountBook) -> Result<(), ForgeError> {
+        self.save_book(&new)?;
+        *self.snapshot() = new.clone();
+        *book = new;
+        Ok(())
     }
 
     /// Writes the list, but only over the text this service last saw: if the
@@ -383,8 +441,8 @@ impl ForgeService {
         };
         match committed {
             Some(commit) => {
-                let mut book = self.book_lock();
-                self.undo_locked(&mut book, &commit)
+                let mut writing = self.begin_write().map_err(|_| ForgeError::RollbackFailed)?;
+                self.undo_locked(&mut writing.book, &commit)
             }
             None => Ok(()),
         }
@@ -408,23 +466,24 @@ impl ForgeService {
         if !still_ours {
             return Ok(());
         }
+        let mut new = book.clone();
         match &commit.previous_account {
-            Some(previous) => book.add(previous.clone()),
+            Some(previous) => new.add(previous.clone()),
             None => {
-                book.remove(&key);
+                new.remove(&key);
             }
         }
         // The list first, like a disconnect: a restart must not find an
-        // account whose token is gone.
-        let list = self.save_book(book);
-        let token = match &commit.previous_credential {
+        // account whose token is gone. If the list cannot be written, stop
+        // before the keychain: list and token still agree, and the failure
+        // is reported.
+        self.commit_book(book, new)
+            .map_err(|_| ForgeError::RollbackFailed)?;
+        match &commit.previous_credential {
             Some(previous) => self.inner.store.save(&key, previous),
             None => self.inner.store.delete(&key),
-        };
-        if list.is_err() || token.is_err() {
-            return Err(ForgeError::RollbackFailed);
         }
-        Ok(())
+        .map_err(|_| ForgeError::RollbackFailed)
     }
 
     pub(super) fn origin_for_new(
@@ -490,8 +549,14 @@ impl ForgeService {
                 _ => return Err(ForgeError::Cancelled),
             }
         }
-        let mut book = self.book_lock();
-        let written = self.write_account(&mut book, &account, &credential);
+        let mut writing = match self.begin_write() {
+            Ok(writing) => writing,
+            Err(error) => {
+                *flow.gate() = Gate::Cancelled;
+                return Err(error);
+            }
+        };
+        let written = self.write_account(&mut writing.book, &account, &credential);
         let commit = match written {
             Ok(commit) => commit,
             Err(error) => {
@@ -510,7 +575,7 @@ impl ForgeService {
             // Cancelled while writing: undo this write now.
             _ => {
                 drop(gate);
-                self.undo_locked(&mut book, &commit)?;
+                self.undo_locked(&mut writing.book, &commit)?;
                 Err(ForgeError::Cancelled)
             }
         }
@@ -529,13 +594,18 @@ impl ForgeService {
         let previous_account = book.get(&key).cloned();
         let previous_credential = self.inner.store.load(&key)?;
         self.inner.store.save(&key, credential)?;
-        let before = book.clone();
-        book.add(account.clone());
-        if let Err(error) = self.save_book(book) {
-            *book = before;
-            let token_back = match &previous_credential {
-                Some(previous) => self.inner.store.save(&key, previous),
-                None => self.inner.store.delete(&key),
+        let mut new = book.clone();
+        new.add(account.clone());
+        if let Err(error) = self.commit_book(book, new) {
+            // Put the token back only if it is still the one written here:
+            // never delete or replace a credential someone else wrote.
+            let token_back = match self.inner.store.load(&key) {
+                Ok(Some(current)) if current == *credential => match &previous_credential {
+                    Some(previous) => self.inner.store.save(&key, previous),
+                    None => self.inner.store.delete(&key),
+                },
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
             };
             return Err(if token_back.is_err() {
                 ForgeError::RollbackFailed
@@ -556,18 +626,15 @@ impl ForgeService {
     /// keychain. If the keychain refuses, the account is put back (so the
     /// token is not left unseen) and the error is reported.
     pub fn disconnect(&self, key: &str) -> Result<(), ForgeError> {
-        let mut book = self.book_lock();
-        let before = book.clone();
-        if book.remove(key).is_none() {
+        let mut writing = self.begin_write()?;
+        let before = writing.book.clone();
+        let mut new = before.clone();
+        if new.remove(key).is_none() {
             return Err(ForgeError::UnknownAccount);
         }
-        if let Err(error) = self.save_book(&book) {
-            *book = before;
-            return Err(error);
-        }
+        self.commit_book(&mut writing.book, new)?;
         if let Err(error) = self.inner.store.delete(key) {
-            *book = before;
-            return match self.save_book(&book) {
+            return match self.commit_book(&mut writing.book, before) {
                 Ok(()) => Err(error),
                 Err(_) => Err(ForgeError::RollbackFailed),
             };
@@ -625,8 +692,8 @@ impl ForgeService {
         // disconnect from interleaving, so a refresh can never put back the
         // keychain entry of an account that was just removed.
         let key = account.key();
-        let book = self.book_lock();
-        if book.get(&key).is_none() {
+        let writing = self.begin_write()?;
+        if writing.book.get(&key).is_none() {
             return Err(ForgeError::UnknownAccount);
         }
         match self.inner.store.load(&key)? {
@@ -716,6 +783,31 @@ impl ForgeService {
     }
 }
 
+/// The working list held for a change. Fields drop in order: the lock file
+/// (other processes) is released before this process's lock.
+struct Writing<'a> {
+    _file: Option<std::fs::File>,
+    book: MutexGuard<'a, AccountBook>,
+}
+
+/// Takes the lock file next to the list (`forge-accounts.lock`), shared by
+/// every process: an OS lock on the file, released when the handle closes.
+fn lock_file(path: &Path) -> Result<std::fs::File, ForgeError> {
+    let disk = |_| ForgeError::Disk("the account list could not be locked".into());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(disk)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))
+        .map_err(disk)?;
+    file.lock().map_err(disk)?;
+    Ok(file)
+}
+
 /// The list file's text, or `None` when there is no file yet.
 fn read_disk(path: &Path) -> Result<Option<String>, ForgeError> {
     match std::fs::read_to_string(path) {
@@ -734,7 +826,13 @@ fn save_book(path: &Path, text: &str) -> Result<(), ForgeError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(disk)?;
     }
-    let temporary = path.with_extension("tmp");
+    // A name of its own per write, so two writers never share a temporary.
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::SeqCst)
+    ));
     std::fs::write(&temporary, text).map_err(disk)?;
     std::fs::rename(&temporary, path).map_err(disk)
 }

@@ -248,6 +248,16 @@ pub fn commands_on_close(phase: &SignInPhase) -> Vec<SignInCommand> {
 
 impl AccountsView {
     pub fn new(service: ForgeService, cx: &mut Context<Self>) -> Self {
+        // Pick up changes another process made to the list: off the UI
+        // thread, since it reads the disk.
+        let reloading = service.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .spawn(async move { reloading.reload() })
+                .await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
         let (events, inbox) = mpsc::channel();
         let token = cx.new(|cx| TextEditor::new("Paste the access token", 1, cx).masked());
         let instance = cx.new(|cx| {
