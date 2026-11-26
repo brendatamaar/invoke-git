@@ -280,6 +280,13 @@ impl RenderOnce for CommitList {
                     let handle = focus::handle(&element_id, window, cx);
                     div()
                         .id(element_id)
+                        .role(gpui::Role::Button)
+                        .aria_label(row.subject.clone())
+                        .aria_description(format!(
+                            "Commit {} · {}",
+                            short_hash(&row.id),
+                            row.details
+                        ))
                         .track_focus(&handle)
                         .tab_stop(true)
                         .cursor_pointer()

@@ -9,32 +9,32 @@ use std::path::PathBuf;
 
 use gpui::{
     AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Styled, Window, deferred, div, px,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use invoke_core::{
-    BranchName, Event, FileChange, Notice, Phase, PullMode, ReadId, RebasePause, RebaseState,
+    BranchName, Event, FileChange, Notice, OpId, Phase, PullMode, ReadId, RebasePause, RebaseState,
     RepoPath, Snapshot, StatusSnapshot,
 };
 use tokens::{
-    DIALOG, RADIUS_LG, ROW_DIFF, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_6,
-    SPACE_8, TEXT_CODE_SMALL, TEXT_SMALL,
+    DIALOG, ROW_DIFF, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_6, SPACE_8,
+    TEXT_CODE_SMALL, TEXT_SMALL,
 };
-use ui::convert::{hsla, shadows};
+use ui::convert::hsla;
 use ui::{
-    Banner, BannerKind, Button, DiffContent, DiffEvent, DiffView, Divider, IconName, NavTab,
-    NavTabs, RepoSummary, ResizeEdge, ResizeHandle, Section, StatusTree, Summary, TextStyleExt,
-    ThemeExt, TreeAction, TreeRow, diff_view, tree_rows,
+    Banner, BannerKind, Button, DiffContent, DiffEvent, DiffView, EditorEvent, IconName, NavTab,
+    NavTabs, RepoSummary, ResizeEdge, ResizeHandle, Section, StatusTree, Summary, TextEditor,
+    TextStyleExt, ThemeExt, TreeAction, TreeRow, diff_view, tree_rows,
 };
 
 use crate::branch_panel::{BranchPanel, BranchPanelEvent};
 use crate::command_palette::{PaletteAction, PaletteItem};
-use crate::commit_box::CommitBox;
+use crate::commit_box::{CommitBox, CommitSucceeded};
 use crate::commit_pane::{InspectFile, StartRebase};
 use crate::conflict_view::ConflictPane;
 use crate::diff_load::{self, Loaded};
 use crate::discard::{self, Confirm, What};
 use crate::file_insights::{FileInsights, FileInsightsEvent, FileMode, FileVersion};
-use crate::history_view::{HistoryPane, SelectionChanged};
+use crate::history_view::{HistoryPane, HistoryUiEvent};
 use crate::notice::{self, Tone};
 use crate::pr_view::PrPane;
 use crate::rebase_view::{RebaseView, RebaseViewEvent, origin_label, paused_heading};
@@ -54,23 +54,11 @@ const CHANGES_W: f32 = SIDEBAR + 2.0 * SPACE_8;
 const CHANGES_MIN: f32 = SIDEBAR - SPACE_4;
 const CHANGES_MAX: f32 = DIALOG;
 
-/// Default height of the top History graph pane in the unified Repository workspace.
-const GRAPH_H: f32 = SIDEBAR + SPACE_8;
-const GRAPH_MIN: f32 = SIDEBAR - SPACE_8 * 3.0;
-const GRAPH_MAX: f32 = DIALOG;
-
-/// What the bottom inspector of the unified Repository workspace shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkspaceFocus {
-    WorkingTree,
-    Commit,
-}
-
-/// The pages of a repo tab. Changes and History are combined in `Workspace`.
+/// Destinations within a repository tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
-    /// Unified Changes + History workspace.
-    Workspace,
+    Changes,
+    History,
     Reflog,
     /// Pull requests (GitHub) & merge requests (GitLab) (P9).
     PullRequests,
@@ -101,15 +89,18 @@ enum QueuedFile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RepoViewEvent {
     OpenRepo(PathBuf),
-    OpenPalette,
 }
 
 pub struct RepoView {
     pub session: Entity<RepoSession>,
     page: Page,
-    workspace_focus: WorkspaceFocus,
-    graph_collapsed: bool,
-    tools_menu_open: bool,
+    file_insights_return: Page,
+    last_main: Page,
+    changes_filter: Entity<TextEditor>,
+    saved_ui: Option<crate::persist::WorktreeUi>,
+    committed: bool,
+    notice_details: bool,
+    named_op: Option<(OpId, String)>,
     tab_visible: bool,
     history: Entity<HistoryPane>,
     reflog: Entity<ReflogPane>,
@@ -142,7 +133,6 @@ pub struct RepoView {
     request: u64,
     sidebar_w: f32,
     changes_w: f32,
-    graph_h: f32,
 }
 
 fn has(status: &StatusSnapshot, section: Section, path: &RepoPath) -> bool {
@@ -176,7 +166,6 @@ impl EventEmitter<RepoViewEvent> for RepoView {}
 
 impl RepoView {
     fn show(&mut self, page: Page, cx: &mut Context<Self>) {
-        self.tools_menu_open = false;
         if self.page == Page::Review && page != Page::Review {
             self.review.update(cx, |review, _| review.close());
         }
@@ -188,6 +177,11 @@ impl RepoView {
                 .update(cx, |insights, _| insights.close());
         }
         self.page = page;
+        self.committed = false;
+        if matches!(page, Page::Changes | Page::History) && self.last_main != page {
+            self.last_main = page;
+            self.save_ui(cx);
+        }
         self.sync_visibility(cx);
         if page == Page::Review {
             self.review.update(cx, |review, cx| review.open(cx));
@@ -195,7 +189,7 @@ impl RepoView {
         if page == Page::PullRequests {
             self.pull_requests.update(cx, |prs, cx| prs.open(cx));
         }
-        if page == Page::Workspace {
+        if page == Page::History {
             self.history
                 .update(cx, |history, cx| history.ensure_started(cx));
         }
@@ -205,14 +199,14 @@ impl RepoView {
     pub fn set_tab_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.tab_visible = visible;
         self.sync_visibility(cx);
-        if visible && self.page == Page::Workspace {
+        if visible && self.page == Page::History {
             self.history
                 .update(cx, |history, cx| history.ensure_started(cx));
         }
     }
 
     fn sync_visibility(&self, cx: &mut Context<Self>) {
-        let history_visible = self.tab_visible && self.page == Page::Workspace;
+        let history_visible = self.tab_visible && self.page == Page::History;
         self.history
             .update(cx, |history, cx| history.set_visible(history_visible, cx));
         let reflog_visible = self.tab_visible && self.page == Page::Reflog;
@@ -221,15 +215,11 @@ impl RepoView {
     }
 
     pub fn open_working_tree(&mut self, cx: &mut Context<Self>) {
-        self.workspace_focus = WorkspaceFocus::WorkingTree;
-        self.history
-            .update(cx, |history, cx| history.select_working_tree(cx));
-        self.show(Page::Workspace, cx);
+        self.show(Page::Changes, cx);
     }
 
     pub fn open_history(&mut self, cx: &mut Context<Self>) {
-        self.graph_collapsed = false;
-        self.show(Page::Workspace, cx);
+        self.show(Page::History, cx);
     }
 
     pub fn open_pull_requests(&mut self, cx: &mut Context<Self>) {
@@ -244,11 +234,23 @@ impl RepoView {
         self.show(Page::Review, cx);
     }
 
-    pub fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page != Page::Workspace {
-            self.show(Page::Workspace, cx);
+    pub fn find_in_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.page {
+            Page::Changes => self
+                .changes_filter
+                .update(cx, |filter, cx| filter.focus(window, cx)),
+            Page::History => self.toggle_search(window, cx),
+            Page::PullRequests => self
+                .pull_requests
+                .update(cx, |pane, cx| pane.focus_search(window, cx)),
+            _ => {}
         }
-        self.graph_collapsed = false;
+    }
+
+    pub fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page != Page::History {
+            self.show(Page::History, cx);
+        }
         self.history
             .update(cx, |history, cx| history.toggle_search(window, cx));
         cx.notify();
@@ -295,7 +297,7 @@ impl RepoView {
     pub fn palette_items(&self, cx: &gpui::App) -> Vec<PaletteItem> {
         let mut items = vec![
             PaletteItem {
-                title: "Working tree & changes".into(),
+                title: "Changes".into(),
                 subtitle: Some("View".into()),
                 shortcut: None,
                 icon: IconName::Changes,
@@ -408,17 +410,37 @@ impl RepoView {
 
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|_| DiffView::new().with_file_insights());
-        let history = cx.new(|cx| {
-            let mut pane = HistoryPane::new(session.clone(), cx);
-            pane.set_inline_detail(false, cx);
-            pane.select_working_tree(cx);
-            pane
-        });
+        let history = cx.new(|cx| HistoryPane::new(session.clone(), cx));
+        let workdir = &session.read(cx).discovered.paths.workdir;
+        let saved_ui = crate::persist::load_worktree_ui(workdir);
+        let last_main = if saved_ui.as_ref().is_some_and(|state| state.history) {
+            Page::History
+        } else {
+            Page::Changes
+        };
+        if let Some(state) = &saved_ui {
+            history.update(cx, |history, cx| {
+                history.set_detail_width(state.details, cx)
+            });
+        }
+        let changes_filter =
+            cx.new(|cx| TextEditor::new("Filter changed files…", 1, cx).single_line());
+        cx.subscribe(&changes_filter, |_, _, _: &EditorEvent, cx| cx.notify())
+            .detach();
         let reflog = cx.new(|cx| ReflogPane::new(session.clone(), cx));
         let pull_requests = cx.new(|cx| PrPane::new(session.clone(), cx));
         let reader = session.read(cx).blame.clone();
         let file_insights = cx.new(|_| FileInsights::new(reader));
         let commit = cx.new(|cx| CommitBox::new(session.clone(), cx));
+        if let Some(state) = &saved_ui {
+            commit.update(cx, |commit, cx| commit.set_draft(&state.draft, cx));
+        }
+        cx.observe(&commit, |this, _, cx| this.save_ui(cx)).detach();
+        cx.subscribe(&commit, |this, _, _: &CommitSucceeded, cx| {
+            this.committed = this.page == Page::Changes;
+            cx.notify();
+        })
+        .detach();
         let branches = cx.new(|cx| BranchPanel::new(session.clone(), cx));
         let sync_buttons = cx.new(|cx| SyncButtons::new(session.clone(), cx));
         let sync_strip = cx.new(|cx| SyncStrip::new(session.clone(), cx));
@@ -426,7 +448,7 @@ impl RepoView {
         let conflicts = cx.new(|cx| ConflictPane::new(session.clone(), cx));
         let rebase = cx.new(|cx| RebaseView::new(session.clone(), cx));
         cx.subscribe(&review, |this, _, event: &ReviewEvent, cx| match event {
-            ReviewEvent::Back => this.show(Page::Workspace, cx),
+            ReviewEvent::Back => this.open_working_tree(cx),
             ReviewEvent::CreatePr => {
                 this.page = Page::PullRequests;
                 this.review.update(cx, |review, _| review.close());
@@ -448,7 +470,7 @@ impl RepoView {
         cx.subscribe(
             &rebase,
             |this, _, event: &RebaseViewEvent, cx| match event {
-                RebaseViewEvent::BackToHistory => this.show(Page::Workspace, cx),
+                RebaseViewEvent::BackToHistory => this.show(Page::History, cx),
                 RebaseViewEvent::OpenChanges => this.open_working_tree(cx),
                 RebaseViewEvent::OpenConflicts => this.show(Page::Conflicts, cx),
             },
@@ -477,23 +499,23 @@ impl RepoView {
             this.show(Page::Rebase, cx);
         })
         .detach();
-        cx.subscribe(&history, |this, _, event: &SelectionChanged, cx| {
-            this.workspace_focus = match event.0 {
-                Some(_) => WorkspaceFocus::Commit,
-                None => WorkspaceFocus::WorkingTree,
-            };
-            cx.notify();
-        })
+        cx.subscribe(
+            &history,
+            |this, _, event: &HistoryUiEvent, cx| match event {
+                HistoryUiEvent::Changes => this.open_working_tree(cx),
+                HistoryUiEvent::Recovery => this.open_reflog(cx),
+                HistoryUiEvent::LayoutChanged => this.save_ui(cx),
+            },
+        )
         .detach();
         cx.subscribe(
             &file_insights,
             |this, _, event: &FileInsightsEvent, cx| match event {
                 FileInsightsEvent::Back => {
-                    this.show(Page::Workspace, cx);
+                    this.show(this.file_insights_return, cx);
                 }
                 FileInsightsEvent::Commit(id) => {
-                    this.workspace_focus = WorkspaceFocus::Commit;
-                    this.show(Page::Workspace, cx);
+                    this.show(Page::History, cx);
                     this.history
                         .update(cx, |history, cx| history.open_commit(*id, cx));
                 }
@@ -502,10 +524,14 @@ impl RepoView {
         .detach();
         Self {
             session,
-            page: Page::Workspace,
-            workspace_focus: WorkspaceFocus::WorkingTree,
-            graph_collapsed: false,
-            tools_menu_open: false,
+            page: last_main,
+            file_insights_return: Page::Changes,
+            last_main,
+            changes_filter,
+            saved_ui: saved_ui.clone(),
+            committed: false,
+            notice_details: false,
+            named_op: None,
             tab_visible: false,
             history,
             reflog,
@@ -529,15 +555,53 @@ impl RepoView {
             local_notice: None,
             last_read: None,
             request: 0,
-            sidebar_w: SIDEBAR,
-            changes_w: CHANGES_W,
-            graph_h: GRAPH_H,
+            sidebar_w: saved_ui.as_ref().map_or(SIDEBAR, |state| {
+                state.sidebar.clamp(SIDEBAR_MIN, SIDEBAR_MAX)
+            }),
+            changes_w: saved_ui.as_ref().map_or(CHANGES_W, |state| {
+                state.changes.clamp(CHANGES_MIN, CHANGES_MAX)
+            }),
         }
+    }
+
+    fn save_ui(&mut self, cx: &Context<Self>) {
+        let state = crate::persist::WorktreeUi {
+            history: self.last_main == Page::History,
+            sidebar: self.sidebar_w,
+            changes: self.changes_w,
+            details: self.history.read(cx).detail_width(),
+            draft: self.commit.read(cx).draft(cx),
+        };
+        if self.saved_ui.as_ref() != Some(&state) {
+            self.saved_ui = Some(state.clone());
+            let workdir = self.session.read(cx).discovered.paths.workdir.clone();
+            crate::persist::save_worktree_ui(workdir, state, cx);
+        }
+    }
+
+    fn reset_layout(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_w = SIDEBAR;
+        self.changes_w = CHANGES_W;
+        self.history
+            .update(cx, |history, cx| history.reset_layout(cx));
+        self.save_ui(cx);
+        cx.notify();
+    }
+
+    fn filtered_status(&self, mut status: StatusSnapshot, cx: &gpui::App) -> StatusSnapshot {
+        let needle = self.changes_filter.read(cx).text().trim().to_lowercase();
+        if !needle.is_empty() {
+            status
+                .entries
+                .retain(|entry| entry.path.0.to_lowercase().contains(&needle));
+        }
+        status
     }
 
     fn inspect_file(&mut self, file: FileVersion, mode: FileMode, cx: &mut Context<Self>) {
         self.file_insights
             .update(cx, |insights, cx| insights.open(file, mode, cx));
+        self.file_insights_return = self.page;
         self.show(Page::FileInsights, cx);
     }
 
@@ -580,6 +644,20 @@ impl RepoView {
     fn session_changed(&mut self, cx: &mut Context<Self>) {
         let (paused, rebase_edit, rebase_done) = {
             let state = &self.session.read(cx).state;
+            if let Some(op) = &state.ops.running
+                && self.named_op.as_ref().is_none_or(|(id, _)| *id != op.id)
+            {
+                self.notice_details = false;
+                self.named_op = sync::what(&op.request)
+                    .or_else(|| match &op.request {
+                        invoke_core::WriteRequest::Commit { amend: true, .. } => {
+                            Some("Amending commit".into())
+                        }
+                        invoke_core::WriteRequest::Commit { .. } => Some("Creating commit".into()),
+                        _ => None,
+                    })
+                    .map(|label| (op.id, label));
+            }
             let paused = matches!(
                 &state.snapshot,
                 Snapshot::Read { disk, .. } if disk.phase.operation().is_some()
@@ -625,10 +703,10 @@ impl RepoView {
             self.was_paused = false;
             self.was_rebase_edit = false;
             if matches!(self.page, Page::Conflicts | Page::Rebase) {
-                self.show(Page::Workspace, cx);
+                self.show(Page::History, cx);
             }
         } else if !paused && self.page == Page::Rebase && rebase_done {
-            self.show(Page::Workspace, cx);
+            self.show(Page::History, cx);
         }
         if matches!(self.bulk, Bulk::Running) && self.settled(cx) {
             self.bulk = Bulk::Idle;
@@ -910,6 +988,7 @@ impl RepoView {
         let Some(status) = self.status(cx) else {
             return;
         };
+        let status = self.filtered_status(status, cx);
         match action {
             TreeAction::Select { section, path } => self.select(section, RepoPath(path), cx),
             TreeAction::Collapse { section, dir } => {
@@ -986,6 +1065,8 @@ impl RepoView {
 
     fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.local_notice = None;
+        self.notice_details = false;
+        self.committed = false;
         self.session.update(cx, |session, cx| {
             session.deliver(Event::NoticeDismissed, cx)
         });
@@ -1000,7 +1081,15 @@ impl Render for RepoView {
         let summary_state = Summary::of(&session.state);
         let changes_badge = summary_state.badge();
         let changes_summary = summary_state.changes();
-        let mut summary = RepoSummary::new(summary_state, repo_path.clone());
+        let summary_reading = summary_state.reading;
+        let repo = &session.discovered;
+        let name = crate::paths::title(&repo.paths.workdir);
+        let identity = if repo.paths.git_dir != repo.common_dir {
+            format!("{name} · Worktree")
+        } else {
+            name
+        };
+        let mut summary = RepoSummary::new(summary_state, repo_path.clone()).repository(identity);
         if matches!(self.page, Page::Conflicts | Page::Rebase) {
             summary = summary.without_phase();
         }
@@ -1009,8 +1098,12 @@ impl Render for RepoView {
                 "Changes made outside Invoke Git will not show up on their own ({error}). Press F5 to refresh."
             ));
         }
+        let filtering = !self.changes_filter.read(cx).text().trim().is_empty();
         let rows: Vec<TreeRow> = match &session.state.snapshot {
-            Snapshot::Read { disk, .. } => tree_rows(&disk.status, &self.collapsed),
+            Snapshot::Read { disk, .. } => tree_rows(
+                &self.filtered_status(disk.status.clone(), cx),
+                &self.collapsed,
+            ),
             Snapshot::NotRead => Vec::new(),
         };
         let undo_label = session
@@ -1020,12 +1113,19 @@ impl Render for RepoView {
             .ok()
             .map(|entry| entry.point.label.clone());
         // A rejected push is shown by the sync strip, with its next steps.
-        let notice = session
+        let mut notice = session
             .state
             .notice
             .as_ref()
             .filter(|notice| !matches!(notice, Notice::PushRejected { .. }))
             .and_then(notice::message);
+        if let Some(Notice::OpEnded { op, .. }) = &session.state.notice
+            && let Some((id, label)) = &self.named_op
+            && op == id
+            && let Some(message) = &mut notice
+        {
+            message.text = format!("{label} · {}", message.text);
+        }
         let selected: Option<(Section, SharedString)> = self
             .selected
             .as_ref()
@@ -1044,7 +1144,7 @@ impl Render for RepoView {
                     | RebaseState::Reading { .. }
             );
         let repo_tab = {
-            let mut t = NavTab::new("Repository").icon(IconName::Changes);
+            let mut t = NavTab::new("Changes").icon(IconName::Changes);
             if !changes_badge.is_empty() {
                 t = t.badge(changes_badge);
             }
@@ -1052,9 +1152,10 @@ impl Render for RepoView {
         };
         let nav_tabs = vec![
             repo_tab,
+            NavTab::new("History").icon(IconName::History),
             NavTab::new("Pull Requests").icon(IconName::PullRequest),
         ];
-        let nav_targets = [Page::Workspace, Page::PullRequests];
+        let nav_targets = [Page::Changes, Page::History, Page::PullRequests];
         let active_nav = nav_targets
             .iter()
             .position(|page| *page == self.page)
@@ -1063,97 +1164,6 @@ impl Render for RepoView {
             if let Some(&target) = nav_targets.get(index) {
                 switch.update(cx, |view, cx| view.show(target, cx));
             }
-        });
-
-        let toggle_tools = cx.entity();
-        let close_tools = cx.entity();
-        let open_reflog = cx.entity();
-        let open_search = cx.entity();
-        let toggle_graph = cx.entity();
-        let open_palette = cx.entity();
-        let tools_popover = self.tools_menu_open.then(|| {
-            deferred(
-                div()
-                    .id("repo-tools-popover")
-                    .occlude()
-                    .absolute()
-                    .top(px(ROW_LIST + SPACE_1))
-                    .right(px(0.))
-                    .flex()
-                    .flex_col()
-                    .min_w(px(SIDEBAR - SPACE_8))
-                    .gap(px(SPACE_1 / 2.0))
-                    .p(px(SPACE_1))
-                    .rounded(px(RADIUS_LG))
-                    .border_1()
-                    .border_color(hsla(p.line))
-                    .bg(hsla(p.bg_raised))
-                    .shadow(shadows(p.shadow_overlay))
-                    .on_mouse_down_out(move |_, _, cx| {
-                        cx.stop_propagation();
-                        close_tools.update(cx, |view, cx| {
-                            view.tools_menu_open = false;
-                            cx.notify();
-                        });
-                    })
-                    .child(
-                        Button::new("tools-search", "Search commits")
-                            .icon(IconName::Search)
-                            .shortcut("Ctrl+F")
-                            .ghost()
-                            .full_width()
-                            .on_click(move |_, window, cx| {
-                                open_search.update(cx, |view, cx| {
-                                    view.tools_menu_open = false;
-                                    view.toggle_search(window, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new(
-                            "tools-toggle-graph",
-                            if self.graph_collapsed {
-                                "Show History pane"
-                            } else {
-                                "Hide History pane"
-                            },
-                        )
-                        .icon(IconName::PanelTop)
-                        .ghost()
-                        .full_width()
-                        .on_click(move |_, _, cx| {
-                            toggle_graph.update(cx, |view, cx| {
-                                view.tools_menu_open = false;
-                                view.graph_collapsed = !view.graph_collapsed;
-                                cx.notify();
-                            });
-                        }),
-                    )
-                    .child(div().py(px(SPACE_1 / 2.0)).child(Divider::horizontal()))
-                    .child(
-                        Button::new("tools-reflog", "Reflog (recovery)")
-                            .icon(IconName::History)
-                            .ghost()
-                            .full_width()
-                            .on_click(move |_, _, cx| {
-                                open_reflog.update(cx, |view, cx| view.open_reflog(cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("tools-palette", "Command palette")
-                            .icon(IconName::Command)
-                            .shortcut("Ctrl+K")
-                            .ghost()
-                            .full_width()
-                            .on_click(move |_, _, cx| {
-                                open_palette.update(cx, |view, cx| {
-                                    view.tools_menu_open = false;
-                                    cx.emit(RepoViewEvent::OpenPalette);
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            )
         });
 
         let open_conflicts = cx.entity();
@@ -1168,11 +1178,11 @@ impl Render for RepoView {
             .gap(px(SPACE_2))
             .child(page_switch)
             .children((self.page == Page::Reflog).then(|| {
-                Button::new("reflog-back-workspace", "← Back to Repository")
+                Button::new("reflog-back-workspace", "← Back to History")
                     .ghost()
                     .compact()
                     .on_click(move |_, _, cx| {
-                        back_reflog.update(cx, |view, cx| view.show(Page::Workspace, cx));
+                        back_reflog.update(cx, |view, cx| view.show(Page::History, cx));
                     })
             }))
             .children(
@@ -1196,24 +1206,7 @@ impl Render for RepoView {
                     })
             }))
             .child(div().flex_1())
-            .child(self.sync_buttons.clone())
-            .child(
-                div()
-                    .relative()
-                    .flex_none()
-                    .child(
-                        Button::new("repo-tools-btn", "")
-                            .icon(IconName::More)
-                            .ghost()
-                            .on_click(move |_, _, cx| {
-                                toggle_tools.update(cx, |view, cx| {
-                                    view.tools_menu_open = !view.tools_menu_open;
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .children(tools_popover),
-            );
+            .children((self.page != Page::Review).then(|| self.sync_buttons.clone()));
         summary = summary.control(controls);
 
         let mut banners = div().flex().flex_col().flex_none().gap(px(SPACE_2));
@@ -1306,16 +1299,58 @@ impl Render for RepoView {
                     .ghost()
                     .on_click(move |_, _, cx| dismiss.update(cx, |view, cx| view.dismiss(cx))),
             );
-            if let Some(details) = message.details {
+            if message.details.is_some() {
                 banner = banner.action(
-                    div()
-                        .max_w(px(360.))
-                        .truncate()
-                        .text_style(&TEXT_SMALL, cx)
-                        .child(crate::notice::headline(&details)),
+                    Button::new(
+                        "toggle-git-output",
+                        if self.notice_details {
+                            "Hide Git output"
+                        } else {
+                            "Git output"
+                        },
+                    )
+                    .ghost()
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.notice_details = !view.notice_details;
+                        cx.notify();
+                    })),
                 );
             }
             banners = banners.child(banner);
+            if self.notice_details
+                && let Some(details) = message.details
+            {
+                banners = banners.child(
+                    div()
+                        .id("git-output")
+                        .overflow_y_scroll()
+                        .max_h(px(SIDEBAR_MIN))
+                        .min_w(px(0.))
+                        .px(px(SPACE_3))
+                        .py(px(SPACE_2))
+                        .text_style(&TEXT_CODE_SMALL, cx)
+                        .child(details),
+                );
+            }
+            any = true;
+        } else if self.committed
+            && session.state.fresh_disk().is_some()
+            && let Some(plan) = sync::plan(&session.state)
+            && plan.can_push()
+            && (plan.ahead() > 0 || plan.publishes())
+        {
+            banners = banners.child(
+                Banner::new(BannerKind::Success, "Commit created")
+                    .action(
+                        Button::new("commit-created-review", "Review & push")
+                            .on_click(cx.listener(|view, _, _, cx| view.open_review(cx))),
+                    )
+                    .action(
+                        Button::new("commit-created-dismiss", "Dismiss")
+                            .ghost()
+                            .on_click(cx.listener(|view, _, _, cx| view.dismiss(cx))),
+                    ),
+            );
             any = true;
         }
         let banners = any.then(|| {
@@ -1325,42 +1360,47 @@ impl Render for RepoView {
                 .border_color(hsla(p.line))
         });
 
-        let body = match self.page {
-            Page::Reflog => div()
-                .flex()
-                .flex_1()
-                .min_h(px(0.))
-                .child(self.reflog.clone()),
-            Page::PullRequests => div()
-                .flex()
-                .flex_1()
-                .min_h(px(0.))
-                .child(self.pull_requests.clone()),
-            Page::FileInsights => div()
-                .flex()
-                .flex_1()
-                .min_h(px(0.))
-                .child(self.file_insights.clone()),
-            Page::Conflicts => div()
-                .flex()
-                .flex_1()
-                .min_h(px(0.))
-                .child(self.conflicts.clone()),
-            Page::Rebase => div()
-                .flex()
-                .flex_1()
-                .min_h(px(0.))
-                .child(self.rebase.clone()),
-            Page::Review => div()
-                .flex()
-                .flex_1()
-                .min_h(px(0.))
-                .child(self.review.clone()),
-            Page::Workspace => {
-                let resize_changes = cx.entity();
-                let resize_graph = cx.entity();
-                let bottom_pane = match self.workspace_focus {
-                    WorkspaceFocus::WorkingTree => div()
+        let body =
+            match self.page {
+                Page::Reflog => div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.reflog.clone()),
+                Page::PullRequests => div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.pull_requests.clone()),
+                Page::FileInsights => div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.file_insights.clone()),
+                Page::Conflicts => div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.conflicts.clone()),
+                Page::Rebase => div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.rebase.clone()),
+                Page::Review => div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.review.clone()),
+                Page::History => div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.history.clone()),
+                Page::Changes => {
+                    let resize_changes = cx.entity();
+                    let clear_filter = cx.entity();
+                    div()
                         .flex()
                         .flex_1()
                         .min_h(px(0.))
@@ -1371,12 +1411,51 @@ impl Render for RepoView {
                                 .flex_col()
                                 .flex_none()
                                 .w(px(self.changes_w))
+                                .max_w(gpui::relative(0.46))
                                 .bg(hsla(p.bg_panel))
-                                .child(div().flex().flex_1().min_h(px(0.)).pt(px(SPACE_2)).child(
-                                    StatusTree::new(rows, selected, move |action, _, cx| {
-                                        this.update(cx, |this, cx| this.tree_action(action, cx))
-                                    }),
-                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(SPACE_1))
+                                        .px(px(SPACE_2))
+                                        .pt(px(SPACE_2))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .child(self.changes_filter.clone()),
+                                        )
+                                        .children(filtering.then(|| {
+                                            Button::new("clear-changes-filter", "Clear")
+                                                .ghost()
+                                                .compact()
+                                                .on_click(move |_, _, cx| {
+                                                    clear_filter.update(cx, |view, cx| {
+                                                        view.changes_filter
+                                                            .update(cx, |filter, cx| {
+                                                                filter.set_text("", cx)
+                                                            });
+                                                    });
+                                                })
+                                        })),
+                                )
+                                .child(
+                                    div().flex().flex_1().min_h(px(0.)).pt(px(SPACE_2)).child(
+                                        StatusTree::new(rows, selected, move |action, _, cx| {
+                                            this.update(cx, |this, cx| this.tree_action(action, cx))
+                                        })
+                                        .empty_hint(
+                                            if summary_reading {
+                                                "Reading repository status…"
+                                            } else if filtering {
+                                                "No changed files match the filter"
+                                            } else {
+                                                "No working changes"
+                                            },
+                                        ),
+                                    ),
+                                )
                                 .child(self.commit.clone()),
                         )
                         .child(ResizeHandle::new(
@@ -1389,6 +1468,7 @@ impl Render for RepoView {
                             move |width, _, cx| {
                                 resize_changes.update(cx, |view, cx| {
                                     view.changes_w = width;
+                                    view.save_ui(cx);
                                     cx.notify();
                                 });
                             },
@@ -1398,49 +1478,14 @@ impl Render for RepoView {
                                 div().flex().flex_1().min_h(px(0.)).child(self.diff.clone()),
                             ),
                         )
-                        .into_any_element(),
-                    WorkspaceFocus::Commit => div()
-                        .flex()
-                        .flex_1()
-                        .min_h(px(0.))
-                        .min_w(px(0.))
-                        .child(self.history.read(cx).detail())
-                        .into_any_element(),
-                };
-                let mut stack = div().flex().flex_col().flex_1().min_h(px(0.)).min_w(px(0.));
-                if !self.graph_collapsed {
-                    stack = stack
-                        .child(
-                            div()
-                                .flex_none()
-                                .h(px(self.graph_h))
-                                .min_h(px(0.))
-                                .w_full()
-                                .child(self.history.clone()),
-                        )
-                        .child(ResizeHandle::new(
-                            "workspace-graph-resize",
-                            self.graph_h,
-                            GRAPH_H,
-                            GRAPH_MIN,
-                            GRAPH_MAX,
-                            ResizeEdge::Bottom,
-                            move |height, _, cx| {
-                                resize_graph.update(cx, |view, cx| {
-                                    view.graph_h = height;
-                                    cx.notify();
-                                });
-                            },
-                        ));
                 }
-                stack.child(bottom_pane)
             }
-        }
-        .min_w(px(0.));
+            .min_w(px(0.));
         let resize_sidebar = cx.entity();
         let sidebar = div()
             .flex_none()
             .w(px(self.sidebar_w))
+            .max_w(gpui::relative(0.28))
             .child(self.branches.clone());
         let sidebar_handle = ResizeHandle::new(
             "repo-sidebar-resize",
@@ -1452,6 +1497,7 @@ impl Render for RepoView {
             move |width, _, cx| {
                 resize_sidebar.update(cx, |view, cx| {
                     view.sidebar_w = width;
+                    view.save_ui(cx);
                     cx.notify();
                 });
             },
@@ -1461,7 +1507,7 @@ impl Render for RepoView {
             content = content.child(sidebar).child(sidebar_handle);
         }
 
-        let toggle_graph_bar = cx.entity();
+        let reset_layout = cx.entity();
         let status_bar = div()
             .flex()
             .flex_none()
@@ -1495,31 +1541,13 @@ impl Render for RepoView {
                     .compact()
                     .on_click(move |_, _, cx| undo.update(cx, |view, cx| view.undo(cx)))
             }))
-            .children((self.page == Page::Workspace).then(|| {
-                Button::new(
-                    "status-toggle-history",
-                    if self.graph_collapsed {
-                        "Show history"
-                    } else {
-                        "Hide history"
-                    },
-                )
-                .icon(IconName::PanelTop)
-                .ghost()
-                .compact()
-                .on_click(move |_, _, cx| {
-                    toggle_graph_bar.update(cx, |view, cx| {
-                        view.graph_collapsed = !view.graph_collapsed;
-                        cx.notify();
-                    });
-                })
-            }))
             .child(
-                div()
-                    .flex_none()
-                    .text_style(&TEXT_SMALL, cx)
-                    .text_color(hsla(p.ink_faint))
-                    .child("Ctrl+K Commands · F5 Refresh"),
+                Button::new("reset-layout", "Reset layout")
+                    .ghost()
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        reset_layout.update(cx, |view, cx| view.reset_layout(cx));
+                    }),
             );
 
         div()

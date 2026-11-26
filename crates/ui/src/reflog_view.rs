@@ -94,7 +94,7 @@ impl RenderOnce for ReflogView {
                                 .flex_none()
                                 .text_style(&TEXT_CODE_SMALL, cx)
                                 .text_color(hsla(p.ink_muted))
-                                .child(crate::short_hash(entry.new_oid.as_hex()).to_owned()),
+                                .child(format!("→ {}", crate::short_hash(entry.new_oid.as_hex()))),
                         )
                         .child(
                             Pill::new(action.to_owned())

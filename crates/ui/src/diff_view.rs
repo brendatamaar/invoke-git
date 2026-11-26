@@ -14,10 +14,10 @@ use std::sync::Arc;
 
 use diff::{DiffLine, DiffNote, Eol, LineKind, TextDiff};
 use gpui::{
-    AnyElement, Context, Div, ElementId, EventEmitter, FontWeight, HighlightStyle,
-    InteractiveElement, IntoElement, ParentElement, PathBuilder, Render, SharedString,
-    StatefulInteractiveElement, Styled, StyledText, UniformListScrollHandle, Window, canvas,
-    deferred, div, point, px, uniform_list,
+    AnyElement, App, Context, Div, ElementId, EventEmitter, FontWeight, HighlightStyle,
+    InteractiveElement, IntoElement, ParentElement, PathBuilder, Render, Role, ScrollStrategy,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, Toggled, UniformListScrollHandle,
+    Window, canvas, deferred, div, point, px, uniform_list,
 };
 use highlight::{Capture, Span};
 use tokens::{
@@ -164,6 +164,8 @@ pub struct DiffView {
     /// Selected changed lines as (hunk, line), for line staging.
     selection: BTreeSet<(usize, usize)>,
     scroll: UniformListScrollHandle,
+    hunk_rows: Vec<usize>,
+    navigated_hunk: usize,
     /// When true, show Blame and File history buttons in the toolbar when a file is loaded.
     show_file_insights: bool,
     context_menu_open: bool,
@@ -188,6 +190,8 @@ impl DiffView {
             number_w: NUMBER_W,
             selection: BTreeSet::new(),
             scroll: UniformListScrollHandle::new(),
+            hunk_rows: Vec::new(),
+            navigated_hunk: 0,
             show_file_insights: false,
             context_menu_open: false,
             actions_menu_open: false,
@@ -220,9 +224,9 @@ impl DiffView {
         self.actions_menu_open = false;
         if self.layout != layout {
             self.layout = layout;
-            self.selection.clear();
+            let hunk = self.navigated_hunk;
             self.rebuild();
-            self.scroll_to_top();
+            self.show_hunk(hunk, cx);
             cx.notify();
         } else if had_menu {
             cx.notify();
@@ -237,6 +241,7 @@ impl DiffView {
             self.around = around;
             self.selection.clear();
             self.rebuild();
+            self.scroll_to_top();
             cx.notify();
         } else if had_menu {
             cx.notify();
@@ -265,6 +270,8 @@ impl DiffView {
 
     /// Recomputes the hunks for the chosen context and the rows for the layout.
     fn rebuild(&mut self) {
+        self.navigated_hunk = 0;
+        self.hunk_rows.clear();
         let Content::Text(data) = &mut self.content else {
             self.rows.clear();
             return;
@@ -274,6 +281,20 @@ impl DiffView {
         }
         self.rows = rows(&data.diff, self.layout);
         self.number_w = number_width(&data.diff);
+        self.hunk_rows.extend(
+            self.rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| matches!(row, Row::HunkHeader { .. }).then_some(index)),
+        );
+    }
+
+    fn show_hunk(&mut self, hunk: usize, cx: &mut Context<Self>) {
+        if let Some(&row) = self.hunk_rows.get(hunk) {
+            self.navigated_hunk = hunk;
+            self.scroll.scroll_to_item_strict(row, ScrollStrategy::Top);
+            cx.notify();
+        }
     }
 
     fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -286,6 +307,11 @@ impl DiffView {
             .items_center()
             .gap(px(SPACE_2))
             .overflow_hidden();
+        let mode = match &self.content {
+            Content::Text(data) => data.mode,
+            Content::FileMessage { mode, .. } => *mode,
+            _ => StageMode::ReadOnly,
+        };
         if let Content::Text(data) = &self.content {
             let stats = data.diff.stats;
             left = left
@@ -313,6 +339,11 @@ impl DiffView {
                         .child(format!("−{}", stats.removed)),
                 );
         }
+        left = left.children(match mode {
+            StageMode::Stage => Some(Pill::new("Unstaged").compact()),
+            StageMode::Unstage => Some(Pill::new("Staged").compact()),
+            StageMode::ReadOnly => None,
+        });
         let layout_view = cx.entity();
         let has_file = matches!(self.content, Content::Text(_) | Content::FileMessage { .. });
         let can_discard = match &self.content {
@@ -504,7 +535,9 @@ impl DiffView {
                 .flex_none()
                 .child(
                     Button::new("diff-actions-menu", "")
+                        .tooltip("Diff options")
                         .icon(IconName::More)
+                        .tooltip("File actions")
                         .ghost()
                         .compact()
                         .on_click(move |_, _, cx| {
@@ -547,20 +580,47 @@ impl DiffView {
                 },
             ))
             .children(actions_menu);
-        div()
-            .flex()
-            .flex_wrap()
-            .flex_none()
-            .items_center()
-            .gap(px(SPACE_2))
-            .min_h(px(TOOLBAR))
-            .w_full()
-            .px(px(SPACE_4))
-            .py(px(SPACE_1))
-            .border_b_1()
-            .border_color(hsla(p.line))
+        let count = self.hunk_rows.len();
+        let hunk = self.navigated_hunk;
+        let previous = cx.entity();
+        let next = cx.entity();
+        file_toolbar(cx)
             .child(left)
             .child(controls)
+            .children((count > 1).then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_1))
+                    .child(
+                        Button::new("previous-hunk", "Previous change")
+                            .ghost()
+                            .compact()
+                            .disabled(hunk == 0)
+                            .on_click(move |_, _, cx| {
+                                previous.update(cx, |view, cx| {
+                                    view.show_hunk(hunk.saturating_sub(1), cx);
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_style(&TEXT_SMALL, cx)
+                            .text_color(hsla(p.ink_muted))
+                            .child(format!("{} / {count}", hunk + 1)),
+                    )
+                    .child(
+                        Button::new("next-hunk", "Next change")
+                            .ghost()
+                            .compact()
+                            .disabled(hunk + 1 >= count)
+                            .on_click(move |_, _, cx| {
+                                next.update(cx, |view, cx| {
+                                    view.show_hunk(hunk + 1, cx);
+                                })
+                            }),
+                    )
+            }))
     }
 
     fn message(&self, text: SharedString, cx: &mut Context<Self>) -> AnyElement {
@@ -604,9 +664,7 @@ impl DiffView {
         let number_w = self.number_w;
         range
             .map(|index| match rows.get(index) {
-                Some(Row::HunkHeader { hunk }) => {
-                    hunk_row(data, &view, selection, p, ring, *hunk, window, cx)
-                }
+                Some(Row::HunkHeader { hunk }) => hunk_row(data, &view, selection, p, *hunk, cx),
                 Some(Row::Unified { hunk, line }) => unified_row(
                     data, &view, selection, number_w, theme, p, ring, *hunk, *line, window, cx,
                 ),
@@ -618,6 +676,22 @@ impl DiffView {
             })
             .collect()
     }
+}
+
+/// The shared header surface for the diff, blame, and file history.
+pub fn file_toolbar(cx: &App) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .flex_none()
+        .items_center()
+        .gap(px(SPACE_2))
+        .min_h(px(TOOLBAR))
+        .w_full()
+        .px(px(SPACE_4))
+        .py(px(SPACE_1))
+        .border_b_1()
+        .border_color(hsla(cx.palette().line))
 }
 
 impl Render for DiffView {
@@ -704,16 +778,13 @@ impl Render for DiffView {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn hunk_row(
     data: &DiffData,
     view: &gpui::Entity<DiffView>,
     selection: &BTreeSet<(usize, usize)>,
     p: &tokens::Palette,
-    ring: gpui::Hsla,
     hunk: usize,
-    window: &mut Window,
-    cx: &mut gpui::App,
+    cx: &mut App,
 ) -> Div {
     let mut row = div()
         .flex()
@@ -738,97 +809,55 @@ fn hunk_row(
         StageMode::Unstage => "Unstage",
     };
     let selected = selection.range((hunk, 0)..(hunk + 1, 0)).count();
-    let hover_bg = hsla(p.bg_hover);
-    if selected > 0 {
-        let view = view.clone();
-        row = row.child(link_button(
-            ("hunk-lines", hunk),
-            format!(
-                "{verb} {selected} {}",
-                if selected == 1 { "line" } else { "lines" }
-            ),
-            p.accent,
-            hover_bg,
-            ring,
-            window,
-            cx,
-            move |cx| view.update(cx, |view, cx| view.request_lines(hunk, cx)),
-        ));
-    }
     let all_view = view.clone();
-    row = row.child(link_button(
-        ("hunk-all", hunk),
-        format!("{verb} hunk"),
-        p.accent,
-        hover_bg,
-        ring,
-        window,
-        cx,
-        move |cx| all_view.update(cx, |view, cx| view.request_hunk(hunk, cx)),
-    ));
-    // Only unstaged changes can be thrown away.
+    row = row.child(
+        Button::new(("hunk-all", hunk), format!("{verb} hunk"))
+            .ghost()
+            .compact()
+            .tooltip(format!("{verb} all changes in this hunk"))
+            .on_click(move |_, _, cx| all_view.update(cx, |view, cx| view.request_hunk(hunk, cx))),
+    );
+    if selected > 0 {
+        let lines_view = view.clone();
+        row = row.child(
+            Button::new(
+                ("hunk-lines", hunk),
+                format!("{verb} selected ({selected})"),
+            )
+            .compact()
+            .tooltip(format!("{verb} only the selected lines in this hunk"))
+            .on_click(move |_, _, cx| {
+                lines_view.update(cx, |view, cx| view.request_lines(hunk, cx))
+            }),
+        );
+    }
     if data.mode == StageMode::Stage {
         if selected > 0 {
-            let view = view.clone();
-            row = row.child(link_button(
-                ("hunk-discard-lines", hunk),
-                format!(
-                    "Discard {selected} {}",
-                    if selected == 1 { "line" } else { "lines" }
-                ),
-                p.danger,
-                hover_bg,
-                ring,
-                window,
-                cx,
-                move |cx| view.update(cx, |view, cx| view.request_discard_lines(hunk, cx)),
-            ));
+            let discard_view = view.clone();
+            row = row.child(
+                Button::new(
+                    ("hunk-discard-lines", hunk),
+                    format!("Discard selected ({selected})"),
+                )
+                .danger_ghost()
+                .compact()
+                .tooltip("Discard only the selected lines in this hunk")
+                .on_click(move |_, _, cx| {
+                    discard_view.update(cx, |view, cx| view.request_discard_lines(hunk, cx))
+                }),
+            );
         }
-        let view = view.clone();
-        row = row.child(link_button(
-            ("hunk-discard", hunk),
-            "Discard hunk".to_owned(),
-            p.danger,
-            hover_bg,
-            ring,
-            window,
-            cx,
-            move |cx| view.update(cx, |view, cx| view.request_discard_hunk(hunk, cx)),
-        ));
+        let discard_view = view.clone();
+        row = row.child(
+            Button::new(("hunk-discard", hunk), "Discard hunk")
+                .danger_ghost()
+                .compact()
+                .on_click(move |_, _, cx| {
+                    discard_view.update(cx, |view, cx| view.request_discard_hunk(hunk, cx))
+                }),
+        );
     }
     row
-}
-
-/// A small text button for a hunk header row (20px tall, like the row).
-#[allow(clippy::too_many_arguments)]
-fn link_button(
-    id: (&'static str, usize),
-    label: String,
-    colour: tokens::Rgba,
-    hover_bg: gpui::Hsla,
-    ring: gpui::Hsla,
-    window: &mut Window,
-    cx: &mut gpui::App,
-    on_click: impl Fn(&mut gpui::App) + 'static,
-) -> impl IntoElement {
-    let elem_id = ElementId::from(id);
-    let handle = focus::handle(&elem_id, window, cx);
-    div()
-        .id(elem_id)
-        .track_focus(&handle)
-        .tab_stop(true)
-        .flex()
-        .flex_none()
-        .items_center()
-        .h(px(ROW_DIFF))
-        .px(px(SPACE_2))
-        .rounded(px(RADIUS_SM))
-        .text_color(hsla(colour))
-        .cursor_pointer()
-        .hover(move |style| style.bg(hover_bg))
-        .focus_visible(move |style| focus::inset_ring(style, ring))
-        .on_click(move |_, _, cx| on_click(cx))
-        .child(label)
 }
 
 /// The checkbox slot of a changed line; context lines and read-only diffs
@@ -856,6 +885,12 @@ fn select_cell(
         return slot;
     }
     let on = selection.contains(&(hunk, line));
+    let change = &data.diff.hunks[hunk].lines[line];
+    let label = if let Some(number) = change.new_no {
+        format!("Select added line {number}")
+    } else {
+        format!("Select removed line {}", change.old_no.unwrap_or_default())
+    };
     let view = view.clone();
     let id = ElementId::from((SharedString::from(format!("line-check-{hunk}")), line));
     let handle = focus::handle(&id, window, cx);
@@ -864,6 +899,9 @@ fn select_cell(
     let hover_bg = hsla(p.bg_hover);
     let mut box_el = div()
         .id(id)
+        .role(Role::CheckBox)
+        .aria_label(label)
+        .aria_toggled(if on { Toggled::True } else { Toggled::False })
         .track_focus(&handle)
         .tab_stop(true)
         .flex()

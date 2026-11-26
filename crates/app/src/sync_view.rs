@@ -5,10 +5,12 @@
 
 use gpui::{
     AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, Subscription, Window, deferred, div, px,
+    Render, StatefulInteractiveElement, Styled, Subscription, Window, deferred, div, px,
 };
 use invoke_core::{Event, Notice, OpId, OpPhase, PullMode, RunningOp};
-use tokens::{RADIUS_LG, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_8, TEXT_SMALL};
+use tokens::{
+    RADIUS_LG, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_8, TEXT_CODE_SMALL, TEXT_SMALL,
+};
 use ui::convert::{hsla, shadows};
 use ui::{Banner, BannerKind, Button, IconName, ProgressBar, TextStyleExt, ThemeExt};
 
@@ -76,16 +78,16 @@ impl Render for SyncButtons {
         let ahead = plan.as_ref().map_or(0, Plan::ahead);
         let publishes = plan.as_ref().is_some_and(Plan::publishes);
         let pull_label = if behind > 0 {
-            format!("Pull ↓{behind}")
+            format!("Pull · {behind}")
         } else {
             "Pull".to_owned()
         };
         let push_label = if publishes && can_push {
             "Review & publish".to_owned()
         } else if ahead > 0 {
-            format!("Review & push ↑{ahead}")
+            format!("Review & push · {ahead}")
         } else {
-            "Push".to_owned()
+            "Review & push".to_owned()
         };
         let run = |plan: &Option<Plan>, make: fn(&Plan) -> Option<Event>| {
             let plan = plan.clone();
@@ -133,6 +135,7 @@ impl Render for SyncButtons {
             pull_group = pull_group
                 .child(
                     Button::new("sync-pull-more", "")
+                        .tooltip("Pull options")
                         .icon(IconName::ChevronDown)
                         .disabled(!ready || !can_pull)
                         .on_click(move |_, _, cx| {
@@ -230,6 +233,7 @@ pub struct SyncStrip {
     focus_prompt: bool,
     /// The user pressed "Force push…" and has not answered yet.
     confirm_force: bool,
+    show_rejection_output: bool,
     /// The user pressed "Remove lock file…" and has not answered yet.
     confirm_lock: bool,
     _observe: Subscription,
@@ -243,6 +247,7 @@ impl SyncStrip {
             auth: None,
             focus_prompt: false,
             confirm_force: false,
+            show_rejection_output: false,
             confirm_lock: false,
             _observe: observe,
         }
@@ -258,6 +263,7 @@ impl SyncStrip {
     fn session_changed(&mut self, cx: &mut Context<Self>) {
         if !self.rejected(cx) {
             self.confirm_force = false;
+            self.show_rejection_output = false;
         }
         if !sync::lock_to_offer(&self.session.read(cx).state) {
             self.confirm_lock = false;
@@ -392,7 +398,7 @@ impl Render for SyncStrip {
 
         if let Some(Notice::PushRejected { failure, .. }) = &state.notice {
             any = true;
-            let details = crate::notice::headline(&failure.details);
+            let details = &failure.details;
             let target = plan.as_ref().and_then(Plan::push_target);
             if self.confirm_force {
                 let (yes, no) = (cx.entity(), cx.entity());
@@ -425,10 +431,14 @@ impl Render for SyncStrip {
                 let fetch_event = plan.as_ref().map(Plan::fetch);
                 let rebase_event = plan.as_ref().and_then(|plan| plan.pull(PullMode::Rebase));
                 let can_rebase = rebase_event.is_some();
+                let target_name = target
+                    .as_ref()
+                    .map(sync::remote_text)
+                    .unwrap_or_else(|| "the remote branch".into());
                 column = column.child(
                     Banner::new(
                         BannerKind::Warning,
-                        "Push rejected: the remote has new commits. Fetch and rebase to continue.",
+                        format!("Push rejected. {target_name} has changed. Fetch to refresh the comparison."),
                     )
                     .action(
                         Button::new("rejected-fetch", "Fetch").on_click(move |_, _, cx| {
@@ -459,13 +469,28 @@ impl Render for SyncStrip {
                         },
                     ))
                     .action(
-                        div()
-                            .max_w(px(320.))
-                            .truncate()
-                            .text_style(&TEXT_SMALL, cx)
-                            .child(details),
+                        Button::new("rejected-output", if self.show_rejection_output { "Hide Git output" } else { "Git output" })
+                            .ghost()
+                            .tooltip(crate::notice::headline(details))
+                            .disabled(details.is_empty())
+                            .on_click(cx.listener(|strip, _, _, cx| {
+                                strip.show_rejection_output = !strip.show_rejection_output;
+                                cx.notify();
+                            })),
                     ),
                 );
+                if self.show_rejection_output {
+                    column = column.child(
+                        div()
+                            .id("push-rejected-output")
+                            .overflow_y_scroll()
+                            .max_h(px(SIDEBAR))
+                            .px(px(SPACE_3))
+                            .py(px(SPACE_2))
+                            .text_style(&TEXT_CODE_SMALL, cx)
+                            .child(details.clone()),
+                    );
+                }
             }
         }
 

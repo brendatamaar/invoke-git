@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use proptest::prelude::*;
-use shell::history::{CommitId, HistoryEvent, read_meta, walk};
+use shell::history::{CommitId, HistoryEvent, HistoryScope, read_meta, walk, walk_scoped};
 use shell::precondition::RepoPaths;
 
 struct Repo {
@@ -90,6 +90,10 @@ impl Drop for Repo {
 /// Runs the walk to the end and returns every commit in order.
 fn collect(paths: &RepoPaths) -> Vec<graph::Commit<CommitId>> {
     let rx = walk(paths.clone(), None, Arc::new(AtomicBool::new(false)));
+    collect_pages(rx)
+}
+
+fn collect_pages(rx: std::sync::mpsc::Receiver<HistoryEvent>) -> Vec<graph::Commit<CommitId>> {
     let mut all = Vec::new();
     loop {
         match rx
@@ -140,6 +144,58 @@ fn tangled() -> Repo {
     repo.git(&["switch", "-q", "main"]);
     repo.git(&["branch", "-q", "-D", "lonely"]);
     repo
+}
+
+#[test]
+fn current_branch_scope_excludes_history_reachable_only_from_other_refs() {
+    let repo = tangled();
+    let commits = collect_pages(walk_scoped(
+        repo.paths.clone(),
+        None,
+        HistoryScope::Head,
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let expected: HashSet<_> = repo
+        .git(&["rev-list", "HEAD"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let actual: HashSet<_> = commits.iter().map(|commit| hex(&commit.id)).collect();
+    assert!(
+        oracle(&repo).len() > expected.len(),
+        "fixture must contain an unrelated ref"
+    );
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn workspace_layout_and_drafts_round_trip_by_worktree() {
+    use shell::store::{WorktreeUi, load_worktree_ui, save_worktree_ui};
+
+    let repo = Repo::new();
+    let data = repo.root.join("profile").join("workspace.sqlite");
+    let first = WorktreeUi {
+        history: true,
+        sidebar: 210.0,
+        changes: 310.5,
+        details: 480.0,
+        draft: "Refactor history\n\nKeep the selected commit.".into(),
+    };
+    let second = WorktreeUi {
+        history: false,
+        draft: "Commit worktree changes".into(),
+        ..first.clone()
+    };
+    assert_eq!(load_worktree_ui(&data, "main"), None);
+    save_worktree_ui(&data, "main", &first).unwrap();
+    save_worktree_ui(&data, "feature", &second).unwrap();
+    let cleared = WorktreeUi {
+        draft: String::new(),
+        ..first
+    };
+    save_worktree_ui(&data, "main", &cleared).unwrap();
+    assert_eq!(load_worktree_ui(&data, "main"), Some(cleared));
+    assert_eq!(load_worktree_ui(&data, "feature"), Some(second));
 }
 
 #[test]

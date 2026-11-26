@@ -10,25 +10,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Point, Render, StatefulInteractiveElement, Styled, Subscription, Task, Window,
-    anchored, deferred, div, px,
+    Pixels, Point, Render, Styled, Subscription, Task, Window, anchored, deferred, div, px,
 };
 use invoke_core::{Head, Oid, RefsSnapshot, Snapshot};
-use shell::history::{CommitId, CommitMeta, HistoryEvent, read_meta, walk};
-use tokens::{RADIUS_SM, ROW_LIST, SPACE_1, SPACE_2, SPACE_3, TEXT_BODY_MEDIUM, TEXT_SMALL};
+use shell::history::{CommitId, CommitMeta, HistoryEvent, HistoryScope, read_meta, walk_scoped};
+use tokens::{SPACE_1, SPACE_2, SPACE_3};
 use ui::convert::{hsla, shadows};
 use ui::time::relative;
 use ui::{
-    Button, GraphEvent, GraphView, Icon, IconName, ResizeEdge, ResizeHandle, RowMeta, SectionLabel,
-    TextStyleExt, ThemeExt, focus, ref_labels::ref_labels,
+    Button, GraphEvent, GraphView, IconName, ResizeEdge, ResizeHandle, RowMeta, Segmented,
+    ThemeExt, ref_labels::ref_labels,
 };
 
 use crate::commit_pane::{CommitPane, InspectFile, StartRebase, rebase_button, replay_buttons};
 use crate::commit_search::{CommitSearch, CommitSelected};
 use crate::session::RepoSession;
 
-/// Emitted when the user picks either the Working Tree (`None`) or a commit (`Some(id)`).
-pub struct SelectionChanged(pub Option<CommitId>);
+pub enum HistoryUiEvent {
+    Changes,
+    Recovery,
+    LayoutChanged,
+}
 
 /// The width of the commit detail beside the graph.
 const DETAIL_W: f32 = tokens::DIALOG;
@@ -45,15 +47,15 @@ pub struct HistoryPane {
     last_refs: Option<(Head, RefsSnapshot)>,
     row_menu: Option<(Oid, Point<Pixels>)>,
     detail_w: f32,
-    inline_detail: bool,
-    working_tree_selected: bool,
+    scope: HistoryScope,
+    expanded: bool,
     _walk: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<InspectFile> for HistoryPane {}
 impl EventEmitter<StartRebase> for HistoryPane {}
-impl EventEmitter<SelectionChanged> for HistoryPane {}
+impl EventEmitter<HistoryUiEvent> for HistoryPane {}
 
 /// What a row shows for `meta`, with the date relative to `now`.
 pub fn row_meta(meta: &CommitMeta, now: i64) -> RowMeta {
@@ -79,6 +81,7 @@ impl HistoryPane {
         let search = cx.new(|cx| CommitSearch::new(paths, cx));
         let subscriptions = vec![
             cx.subscribe(&search, |this, _, event: &CommitSelected, cx| {
+                this.set_scope(HistoryScope::AllRefs, cx);
                 this.open_commit(event.0, cx)
             }),
             cx.subscribe(&detail, |_, _, event: &InspectFile, cx| {
@@ -91,10 +94,8 @@ impl HistoryPane {
                 GraphEvent::NeedMeta(range) => this.load_meta(range.clone(), cx),
                 GraphEvent::Selected(row) => {
                     this.row_menu = None;
-                    this.working_tree_selected = false;
                     let id = graph.read(cx).id_at(*row).copied();
                     this.detail.update(cx, |detail, cx| detail.show(id, cx));
-                    cx.emit(SelectionChanged(id));
                     cx.notify();
                 }
                 GraphEvent::RowMenu { row, position } => {
@@ -118,29 +119,43 @@ impl HistoryPane {
             last_refs: None,
             row_menu: None,
             detail_w: DETAIL_W,
-            inline_detail: true,
-            working_tree_selected: false,
+            scope: HistoryScope::AllRefs,
+            expanded: false,
             _walk: None,
             _subscriptions: subscriptions,
         }
     }
 
-    pub fn set_inline_detail(&mut self, inline: bool, cx: &mut Context<Self>) {
-        if self.inline_detail != inline {
-            self.inline_detail = inline;
+    pub fn detail_width(&self) -> f32 {
+        self.detail_w
+    }
+
+    pub fn set_detail_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.detail_w = width.clamp(DETAIL_MIN, DETAIL_MAX);
+        cx.notify();
+    }
+
+    pub fn reset_layout(&mut self, cx: &mut Context<Self>) {
+        self.expanded = false;
+        self.set_detail_width(DETAIL_W, cx);
+    }
+
+    fn set_scope(&mut self, scope: HistoryScope, cx: &mut Context<Self>) {
+        if self.scope != scope {
+            self.scope = scope;
+            self.start_walk(true, cx);
             cx.notify();
         }
     }
 
-    pub fn detail(&self) -> Entity<CommitPane> {
-        self.detail.clone()
-    }
-
-    pub fn select_working_tree(&mut self, cx: &mut Context<Self>) {
-        self.working_tree_selected = true;
-        self.row_menu = None;
-        cx.emit(SelectionChanged(None));
-        cx.notify();
+    fn head_id(&self, cx: &Context<Self>) -> Option<CommitId> {
+        let head = &self.session.read(cx).state.snapshot.disk()?.head;
+        match head {
+            Head::Branch { oid, .. } | Head::Detached(oid) => {
+                CommitId::from_hex(oid.as_hex().as_bytes()).ok()
+            }
+            Head::Unborn(_) => None,
+        }
     }
 
     pub fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -160,11 +175,9 @@ impl HistoryPane {
     }
 
     pub fn open_commit(&mut self, id: CommitId, cx: &mut Context<Self>) {
-        self.working_tree_selected = false;
         self.graph.update(cx, |graph, cx| graph.reveal(id, cx));
         self.detail
             .update(cx, |detail, cx| detail.show(Some(id), cx));
-        cx.emit(SelectionChanged(Some(id)));
         cx.notify();
     }
 
@@ -222,7 +235,7 @@ impl HistoryPane {
         self.cancel = Arc::new(AtomicBool::new(false));
         let paths = self.session.read(cx).discovered.paths.clone();
         let cancel = self.cancel.clone();
-        let inbox = walk(paths, None, cancel.clone());
+        let inbox = walk_scoped(paths, None, self.scope, cancel.clone());
         self.graph.update(cx, |graph, cx| {
             if refresh {
                 graph.begin_refresh();
@@ -237,7 +250,6 @@ impl HistoryPane {
             }
             Head::Unborn(_) => None,
         });
-        let auto_select = self.inline_detail;
         self._walk = Some(cx.spawn(async move |_, cx| {
             let mut inbox = inbox;
             let mut selected_initial = false;
@@ -268,8 +280,7 @@ impl HistoryPane {
                             HistoryEvent::Started { .. } => {}
                             HistoryEvent::Page(page) => {
                                 graph.push_page(&page, cx);
-                                if auto_select
-                                    && !selected_initial
+                                if !selected_initial
                                     && graph.selected().is_none()
                                     && let Some(target) =
                                         head_hint.or_else(|| graph.id_at(0).copied())
@@ -289,6 +300,7 @@ impl HistoryPane {
 
     /// Reads the metadata of rows `range` and hands it to the graph.
     fn load_meta(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        let cancel = self.cancel.clone();
         let ids: Vec<CommitId> = {
             let graph = self.graph.read(cx);
             range
@@ -304,6 +316,9 @@ impl HistoryPane {
                 .spawn(async move { read_meta(&paths, &ids) })
                 .await;
             let Ok(metas) = read else { return };
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let now = now_seconds();
             let rows: Vec<Option<RowMeta>> = metas
                 .iter()
@@ -322,9 +337,8 @@ impl Drop for HistoryPane {
 }
 
 impl Render for HistoryPane {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
-        let ring = focus::ring_color(cx);
         let menu = self.row_menu.clone().map(|(oid, position)| {
             let pane = cx.entity().downgrade();
             let rebase_pane = cx.entity().downgrade();
@@ -371,138 +385,122 @@ impl Render for HistoryPane {
             )
         });
 
-        let toggle_search = cx.entity();
         let search_open = self.search.read(cx).is_open();
+        let changes = self
+            .session
+            .read(cx)
+            .state
+            .snapshot
+            .disk()
+            .map_or(0, |disk| disk.status.entries.len());
+        let scope_changed = cx.entity();
+        let scope = Segmented::new(
+            "history-scope",
+            vec!["All refs".into(), "Current branch".into()],
+            usize::from(self.scope == HistoryScope::Head),
+            move |index, _, cx| {
+                let scope = if index == 0 {
+                    HistoryScope::AllRefs
+                } else {
+                    HistoryScope::Head
+                };
+                scope_changed.update(cx, |pane, cx| pane.set_scope(scope, cx));
+            },
+        );
         let header = div()
             .flex()
+            .flex_wrap()
             .flex_none()
             .items_center()
-            .justify_between()
             .gap(px(SPACE_2))
             .px(px(SPACE_3))
             .py(px(SPACE_1))
             .bg(hsla(p.bg_panel))
             .border_b_1()
             .border_color(hsla(p.line))
-            .child(SectionLabel::new("History"))
+            .child(scope)
             .child(
                 Button::new(
-                    "history-toggle-search",
-                    if search_open { "Hide search" } else { "Search" },
+                    "history-search",
+                    if search_open {
+                        "Hide search"
+                    } else {
+                        "Find commit"
+                    },
                 )
                 .icon(IconName::Search)
                 .shortcut("Ctrl+F")
                 .ghost()
-                .compact()
-                .on_click(move |_, window, cx| {
-                    toggle_search.update(cx, |pane, cx| pane.toggle_search(window, cx));
-                }),
+                .on_click(cx.listener(|pane, _, window, cx| pane.toggle_search(window, cx))),
+            )
+            .child(
+                Button::new("history-head", "Jump to HEAD")
+                    .ghost()
+                    .disabled(self.head_id(cx).is_none())
+                    .on_click(cx.listener(|pane, _, _, cx| {
+                        if let Some(id) = pane.head_id(cx) {
+                            pane.open_commit(id, cx);
+                        }
+                    })),
+            )
+            .child(
+                Button::new("history-recovery", "Recovery")
+                    .ghost()
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(HistoryUiEvent::Recovery))),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new(
+                    "history-expand",
+                    if self.expanded {
+                        "Show graph"
+                    } else {
+                        "Expand details"
+                    },
+                )
+                .ghost()
+                .on_click(cx.listener(|pane, _, _, cx| {
+                    pane.expanded = !pane.expanded;
+                    cx.notify();
+                })),
             );
-
-        let working_tree_row = (!self.inline_detail).then(|| {
-            let (staged, unstaged) = match &self.session.read(cx).state.snapshot {
-                Snapshot::Read { disk, .. } => {
-                    (disk.status.staged().count(), disk.status.unstaged().count())
-                }
-                Snapshot::NotRead => (0, 0),
-            };
-            let total = staged + unstaged;
-            let detail_text = if total == 0 {
-                "Working tree clean".to_owned()
-            } else {
-                format!("{staged} staged · {unstaged} unstaged")
-            };
-            let selected = self.working_tree_selected;
-            let select_wt = cx.entity();
-            let hover = hsla(p.bg_hover);
-            let id = gpui::ElementId::from("history-working-tree-row");
-            let handle = focus::handle(&id, window, cx);
-            let mut row = div()
-                .id(id)
-                .track_focus(&handle)
-                .tab_stop(true)
-                .relative()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(SPACE_2))
-                .h(px(ROW_LIST + SPACE_1))
-                .px(px(SPACE_3))
-                .border_b_1()
-                .border_color(hsla(p.line))
-                .cursor_pointer()
-                .focus_visible(move |style| focus::inset_ring(style, ring))
-                .on_click(move |_, _, cx| {
-                    select_wt.update(cx, |pane, cx| pane.select_working_tree(cx));
-                })
-                .child(Icon::new(IconName::Changes).small().color(if selected {
-                    p.accent
-                } else if total > 0 {
-                    p.warning
-                } else {
-                    p.ink_muted
-                }))
-                .child(
-                    div()
-                        .text_style(&TEXT_BODY_MEDIUM, cx)
-                        .text_color(hsla(p.ink))
-                        .child(if total > 0 {
-                            format!("Working tree ({total})")
-                        } else {
-                            "Working tree".to_owned()
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_style(&TEXT_SMALL, cx)
-                        .text_color(hsla(p.ink_muted))
-                        .child(detail_text),
-                );
-            row = if selected {
-                row.bg(hsla(p.bg_raised)).child(
-                    div()
-                        .absolute()
-                        .left(px(0.))
-                        .top(px(SPACE_1))
-                        .bottom(px(SPACE_1))
-                        .w(px(focus::ACCENT_BAR_W))
-                        .rounded(px(RADIUS_SM))
-                        .bg(hsla(p.accent)),
-                )
-            } else {
-                row.bg(hsla(p.bg_panel)).hover(move |s| s.bg(hover))
-            };
-            row
-        });
-
+        let working = if changes == 0 {
+            "Working changes".to_owned()
+        } else {
+            format!("Working changes · {changes}")
+        };
         let graph_col = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
-            .child(header)
             .child(self.search.clone())
-            .children(working_tree_row)
+            .child(
+                div().px(px(SPACE_3)).py(px(SPACE_1)).child(
+                    Button::new("history-changes", working)
+                        .icon(IconName::Changes)
+                        .ghost()
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(HistoryUiEvent::Changes))),
+                ),
+            )
             .child(div().flex_1().min_h(px(0.)).child(self.graph.clone()));
 
-        if !self.inline_detail {
+        if self.expanded {
             return div()
                 .flex()
+                .flex_col()
                 .size_full()
-                .min_h(px(0.))
-                .child(graph_col)
-                .children(menu)
+                .child(header)
+                .child(div().flex_1().min_h(px(0.)).child(self.detail.clone()))
                 .into_any_element();
         }
 
         let resize_detail = cx.entity();
-        div()
+        let panes = div()
             .flex()
-            .size_full()
+            .flex_1()
+            .min_h(px(0.))
             .child(graph_col)
             .child(ResizeHandle::new(
                 "history-detail-resize",
@@ -513,8 +511,8 @@ impl Render for HistoryPane {
                 ResizeEdge::Left,
                 move |width, _, cx| {
                     resize_detail.update(cx, |pane, cx| {
-                        pane.detail_w = width;
-                        cx.notify();
+                        pane.set_detail_width(width, cx);
+                        cx.emit(HistoryUiEvent::LayoutChanged);
                     });
                 },
             ))
@@ -522,9 +520,16 @@ impl Render for HistoryPane {
                 div()
                     .flex_none()
                     .w(px(self.detail_w))
+                    .max_w(gpui::relative(0.55))
                     .child(self.detail.clone()),
             )
-            .children(menu)
+            .children(menu);
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(header)
+            .child(panes)
             .into_any_element()
     }
 }

@@ -1,6 +1,7 @@
 use gpui::{
-    App, ClickEvent, CursorStyle, ElementId, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    App, AppContext, ClickEvent, Context, CursorStyle, ElementId, FontWeight, InteractiveElement,
+    IntoElement, ParentElement, Render, RenderOnce, Role, SharedString, StatefulInteractiveElement,
+    Styled, Window, div, px,
 };
 use tokens::{
     RADIUS_MD, RADIUS_SM, ROW_DIFF, ROW_LIST, SPACE_1, SPACE_2, SPACE_3, TEXT_BODY_MEDIUM,
@@ -45,6 +46,7 @@ pub struct Button {
     label: SharedString,
     icon: Option<IconName>,
     shortcut: Option<SharedString>,
+    tooltip: Option<SharedString>,
     kind: ButtonKind,
     size: ButtonSize,
     full_width: bool,
@@ -59,6 +61,7 @@ impl Button {
             label: label.into(),
             icon: None,
             shortcut: None,
+            tooltip: None,
             kind: ButtonKind::Secondary,
             size: ButtonSize::Default,
             full_width: false,
@@ -75,6 +78,12 @@ impl Button {
     /// Optional keyboard shortcut hint shown quietly beside the label.
     pub fn shortcut(mut self, shortcut: impl Into<SharedString>) -> Self {
         self.shortcut = Some(shortcut.into());
+        self
+    }
+
+    /// Explains an icon-only action or provides detail about a visible label.
+    pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(text.into());
         self
     }
 
@@ -129,6 +138,28 @@ impl Button {
     }
 }
 
+pub(crate) fn text_tooltip(text: SharedString, cx: &mut App) -> gpui::AnyView {
+    cx.new(|_| ButtonTooltip(text)).into()
+}
+
+struct ButtonTooltip(SharedString);
+
+impl Render for ButtonTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = cx.palette();
+        div()
+            .px(px(SPACE_2))
+            .py(px(SPACE_1))
+            .rounded(px(RADIUS_SM))
+            .border_1()
+            .border_color(hsla(p.line))
+            .bg(hsla(p.bg_raised))
+            .text_style(&TEXT_SMALL, cx)
+            .text_color(hsla(p.ink))
+            .child(self.0.clone())
+    }
+}
+
 impl RenderOnce for Button {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = cx.palette();
@@ -140,6 +171,12 @@ impl RenderOnce for Button {
         };
         let mut button = div()
             .id(self.id)
+            .role(Role::Button)
+            .aria_label(if self.label.is_empty() {
+                self.tooltip.clone().unwrap_or_default()
+            } else {
+                self.label.clone()
+            })
             .track_focus(&handle)
             .tab_stop(!self.disabled)
             .flex()
@@ -186,6 +223,9 @@ impl RenderOnce for Button {
             button = button.child(icon_el);
         }
         if !self.label.is_empty() {
+            if let Some(description) = self.tooltip.as_ref().filter(|text| **text != self.label) {
+                button = button.aria_description(description.clone());
+            }
             button = button.child(self.label);
         }
         if let Some(shortcut) = self.shortcut {
@@ -201,6 +241,9 @@ impl RenderOnce for Button {
                     }))
                     .child(shortcut),
             );
+        }
+        if let Some(text) = self.tooltip {
+            button = button.tooltip(move |_, cx| text_tooltip(text.clone(), cx));
         }
         if self.disabled {
             return button.opacity(0.4).cursor(CursorStyle::OperationNotAllowed);

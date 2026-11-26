@@ -170,6 +170,61 @@ pub fn save(saved: &Saved) {
     let _ = std::fs::write(file, encode(saved));
 }
 
+/// A worktree's layout and draft live in the app data folder.
+pub use shell::store::WorktreeUi;
+
+#[derive(Clone)]
+struct PendingUiSave {
+    generation: u64,
+    state: WorktreeUi,
+}
+
+fn pending_ui() -> &'static std::sync::Mutex<std::collections::HashMap<String, PendingUiSave>> {
+    static LATEST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, PendingUiSave>>,
+    > = std::sync::OnceLock::new();
+    LATEST.get_or_init(Default::default)
+}
+
+pub fn load_worktree_ui(workdir: &Path) -> Option<WorktreeUi> {
+    let file = data_dir()?.join("workspace.sqlite");
+    let key = crate::notes_db::repo_key(workdir);
+    if let Some(pending) = pending_ui().lock().ok()?.get(&key) {
+        return Some(pending.state.clone());
+    }
+    shell::store::load_worktree_ui(&file, &key)
+}
+
+pub fn save_worktree_ui(workdir: PathBuf, state: WorktreeUi, cx: &gpui::App) {
+    use std::sync::Mutex;
+
+    let Some(dir) = data_dir() else { return };
+    let file = dir.join("workspace.sqlite");
+    let key = crate::notes_db::repo_key(&workdir);
+    let generation = {
+        let Ok(mut requested) = pending_ui().lock() else {
+            return;
+        };
+        let generation = requested.get(&key).map_or(0, |save| save.generation + 1);
+        requested.insert(key.clone(), PendingUiSave { generation, state });
+        generation
+    };
+    cx.background_executor()
+        .spawn(async move {
+            // Recheck the latest generation after taking the lock that orders writes.
+            static WRITING: Mutex<()> = Mutex::new(());
+            let Ok(_writing) = WRITING.lock() else { return };
+            let newest = pending_ui()
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&key).cloned());
+            if let Some(save) = newest.filter(|save| save.generation == generation) {
+                let _ = shell::store::save_worktree_ui(&file, &key, &save.state);
+            }
+        })
+        .detach();
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;

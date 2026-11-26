@@ -4,15 +4,15 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce, ScrollHandle,
+    App, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce, Role, ScrollHandle,
     SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use tokens::{
-    RADIUS_MD, RADIUS_SM, ROW_DIFF, ROW_LIST, SPACE_1, SPACE_2, SPACE_3, TEXT_BODY_MEDIUM,
+    RADIUS_MD, RADIUS_SM, ROW_DIFF, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, TEXT_BODY_MEDIUM,
     TEXT_SMALL, TOOLBAR, Theme,
 };
 
-use crate::components::{Button, IconName};
+use crate::components::{Button, IconName, text_tooltip};
 use crate::convert::hsla;
 use crate::focus;
 use crate::text::TextStyleExt;
@@ -23,6 +23,7 @@ use crate::theme::{ThemeExt, set_theme};
 pub struct TabItem {
     /// The repo's folder name.
     pub title: SharedString,
+    pub path: SharedString,
     /// A short state hint after the title, such as the number of changed
     /// files. Empty for none.
     pub badge: SharedString,
@@ -116,8 +117,14 @@ impl RenderOnce for TabBar {
             let hover_ink = hsla(p.ink);
             let close_hover_bg = hsla(if active { p.bg_hover } else { p.bg_raised });
 
+            let close_label: SharedString = format!("Close {}", item.title).into();
+            let path = item.path;
             let mut tab = div()
                 .id(id)
+                .role(Role::Tab)
+                .aria_selected(active)
+                .aria_label(item.title.clone())
+                .tooltip(move |_, cx| text_tooltip(path.clone(), cx))
                 .track_focus(&handle)
                 .tab_stop(true)
                 .relative()
@@ -126,7 +133,7 @@ impl RenderOnce for TabBar {
                 .items_center()
                 .gap(px(SPACE_2))
                 .h(px(ROW_LIST))
-                .max_w(px(220.))
+                .max_w(px(SIDEBAR))
                 .pl(px(SPACE_3))
                 .pr(px(SPACE_1))
                 .rounded(px(RADIUS_MD))
@@ -169,6 +176,9 @@ impl RenderOnce for TabBar {
             }
             let close = div()
                 .id(close_id)
+                .role(Role::Button)
+                .aria_label(close_label.clone())
+                .tooltip(move |_, cx| text_tooltip(close_label.clone(), cx))
                 .track_focus(&close_handle)
                 .tab_stop(true)
                 .flex()

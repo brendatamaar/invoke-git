@@ -70,7 +70,6 @@ pub struct Workspace {
     /// The clone dialog, shown in place of the welcome screen.
     cloning: Option<(Entity<CloneView>, Subscription)>,
     palette: Entity<CommandPalette>,
-    pending_palette: bool,
     pending_search: bool,
     pub focus: FocusHandle,
     title: String,
@@ -92,7 +91,6 @@ impl Workspace {
             notice: None,
             cloning: None,
             palette,
-            pending_palette: false,
             pending_search: false,
             focus: cx.focus_handle(),
             title: String::new(),
@@ -290,10 +288,6 @@ impl Workspace {
             let view = cx.new(|cx| RepoView::new(session, cx));
             cx.subscribe(&view, |this, _, event: &RepoViewEvent, cx| match event {
                 RepoViewEvent::OpenRepo(path) => this.open_path(path.clone(), cx),
-                RepoViewEvent::OpenPalette => {
-                    this.pending_palette = true;
-                    cx.notify();
-                }
             })
             .detach();
             view
@@ -542,7 +536,7 @@ impl Workspace {
 
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(repo) = self.tabs.active_item().cloned() {
-            repo.update(cx, |view, cx| view.toggle_search(window, cx));
+            repo.update(cx, |view, cx| view.find_in_view(window, cx));
         }
     }
 
@@ -701,14 +695,42 @@ impl Workspace {
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> TabBar {
+        let repositories: Vec<_> = self
+            .tabs
+            .items()
+            .iter()
+            .map(|view| &view.read(cx).session.read(cx).discovered)
+            .collect();
         let items = self
             .tabs
             .items()
             .iter()
-            .map(|view| {
+            .zip(&repositories)
+            .map(|(view, repo)| {
                 let session = view.read(cx).session.read(cx);
+                let workdir = &repo.paths.workdir;
+                let name = paths::title(workdir);
+                let same_name = repositories
+                    .iter()
+                    .filter(|other| paths::title(&other.paths.workdir).eq_ignore_ascii_case(&name))
+                    .count()
+                    > 1;
+                let mut title = if same_name {
+                    format!(
+                        "{name} · {}",
+                        workdir
+                            .parent()
+                            .map_or_else(|| display_path(workdir), display_path)
+                    )
+                } else {
+                    name
+                };
+                if repo.paths.git_dir != repo.common_dir {
+                    title.push_str(" · Worktree");
+                }
                 TabItem {
-                    title: paths::title(&session.discovered.paths.workdir).into(),
+                    title: title.into(),
+                    path: display_path(workdir).into(),
                     badge: Summary::of(&session.state).badge().into(),
                 }
             })
@@ -727,9 +749,6 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if std::mem::take(&mut self.pending_palette) {
-            self.open_palette(window, cx);
-        }
         if std::mem::take(&mut self.pending_search) {
             self.toggle_search(window, cx);
         }

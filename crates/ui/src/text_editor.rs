@@ -15,9 +15,9 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, InteractiveElement,
     IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, ParentElement, Pixels, Point, Render, SharedString, Style, Styled, TextRun,
-    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, px, relative,
-    size,
+    PaintQuad, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
+    Style, Styled, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div,
+    fill, point, px, relative, size,
 };
 
 use crate::convert::hsla;
@@ -819,6 +819,15 @@ impl Render for TextEditor {
         let editor_id = ElementId::from(("text-editor", cx.entity_id().as_u64() as usize));
         let mut root = div()
             .id(editor_id)
+            .role(if self.masked {
+                gpui::Role::PasswordInput
+            } else if self.single_line {
+                gpui::Role::TextInput
+            } else {
+                gpui::Role::MultilineTextInput
+            })
+            .aria_label(self.placeholder.clone())
+            .aria_placeholder(self.placeholder.clone())
             .key_context("TextEditor")
             .track_focus(&self.focus)
             .tab_stop(true)
@@ -837,6 +846,9 @@ impl Render for TextEditor {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up));
+        if !self.masked && window.is_a11y_active() {
+            root = root.aria_value(self.text().to_owned());
+        }
         if !focused {
             root = root.hover(move |style| style.border_color(hover_border));
         }

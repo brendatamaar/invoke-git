@@ -21,3 +21,5 @@ pub use pill::{Pill, PillTone};
 pub use progress::{ProgressBar, clamp_fraction};
 pub use section_label::SectionLabel;
 pub use segmented::Segmented;
+
+pub(crate) use button::text_tooltip;

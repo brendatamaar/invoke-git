@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, RenderOnce,
+    App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, RenderOnce, Role,
     SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use tokens::{RADIUS_MD, RADIUS_SM, ROW_LIST, SPACE_1, SPACE_2, TEXT_BODY_MEDIUM, TEXT_SMALL};
@@ -84,6 +84,9 @@ impl RenderOnce for NavTabs {
             let text_color = if active { p.ink } else { p.ink_muted };
             let mut item = div()
                 .id(id)
+                .role(Role::Tab)
+                .aria_selected(active)
+                .aria_label(tab.label.clone())
                 .track_focus(&handle)
                 .tab_stop(true)
                 .relative()

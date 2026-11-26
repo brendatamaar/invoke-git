@@ -140,7 +140,7 @@ impl EventEmitter<BranchPanelEvent> for BranchPanel {}
 
 impl BranchPanel {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
-        let filter = cx.new(|cx| TextEditor::new("Filter branches, tags…", 1, cx).single_line());
+        let filter = cx.new(|cx| TextEditor::new("Filter branches and refs…", 1, cx).single_line());
         let editor = cx.new(|cx| TextEditor::new("Branch name", 1, cx).single_line());
         let message = cx.new(|cx| TextEditor::new("Message (optional)", 1, cx).single_line());
         let tag_name = cx.new(|cx| TextEditor::new("Tag name", 1, cx).single_line());
@@ -173,7 +173,10 @@ impl BranchPanel {
             tag_remote,
             wt_path,
             wt_branch,
-            collapsed: HashSet::new(),
+            collapsed: ["TAGS", "STASHES", "WORKTREES", "SUBMODULES", "LFS"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             menu_open: false,
             form: Form::None,
             _subscriptions: subscriptions,
@@ -798,6 +801,7 @@ impl Render for BranchPanel {
             deferred(menu)
         });
 
+        let lfs_expanded = !self.collapsed.contains("LFS");
         let panel = div()
             .flex()
             .flex_col()
@@ -841,6 +845,7 @@ impl Render for BranchPanel {
                                             .flex_none()
                                             .child(
                                                 Button::new("sidebar-more", "")
+                                                    .tooltip("More repository actions")
                                                     .icon(IconName::More)
                                                     .ghost()
                                                     .compact()
@@ -864,6 +869,7 @@ impl Render for BranchPanel {
                             .child(div().flex_1().min_w(px(0.)).child(self.filter.clone()))
                             .children(filtering.then(|| {
                                 Button::new("sidebar-filter-clear", "")
+                                    .tooltip("Clear branch filter")
                                     .icon(IconName::Close)
                                     .ghost()
                                     .compact()
@@ -1276,6 +1282,7 @@ impl Render for BranchPanel {
                                     )
                                     .child(
                                         Button::new("form-dialog-close", "")
+                                            .tooltip("Close dialog")
                                             .icon(IconName::Close)
                                             .ghost()
                                             .compact()
@@ -1300,6 +1307,40 @@ impl Render for BranchPanel {
                     .filtering(filtering),
                 ),
             )
+            .children((has_lfs && !filtering).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(SPACE_1))
+                    .p(px(SPACE_2))
+                    .border_t_1()
+                    .border_color(hsla(p.line))
+                    .child(
+                        Button::new(
+                            "sidebar-lfs-section",
+                            if lfs_expanded {
+                                "▾ Git LFS"
+                            } else {
+                                "▸ Git LFS"
+                            },
+                        )
+                        .full_width()
+                        .ghost()
+                        .compact()
+                        .on_click(cx.listener(|pane, _, _, cx| {
+                            pane.action(SideAction::ToggleSection("LFS".into()), cx)
+                        })),
+                    )
+                    .children(lfs_expanded.then(|| {
+                        Button::new("sidebar-lfs-pull", "Pull LFS objects")
+                            .full_width()
+                            .ghost()
+                            .compact()
+                            .on_click(cx.listener(|pane, _, _, cx| {
+                                pane.deliver(Event::LfsPullRequested { path: None }, cx)
+                            }))
+                    }))
+            }))
             .children(modal)
     }
 }

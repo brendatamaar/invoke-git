@@ -7,9 +7,8 @@ use std::sync::{
 use std::time::Duration;
 
 use gpui::{
-    AppContext, Context, ElementId, Entity, EventEmitter, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, StatefulInteractiveElement, Styled, Task,
-    UniformListScrollHandle, Window, deferred, div, px,
+    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Render, Styled, Task, UniformListScrollHandle, Window, deferred, div, px,
 };
 use invoke_core::search::{QueryError, SearchField, SearchQuery};
 use shell::{
@@ -17,9 +16,7 @@ use shell::{
     history::{CommitId, read_meta},
     search::{SearchEvent, search},
 };
-use tokens::{
-    RADIUS_LG, RADIUS_SM, ROW_DIFF, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_8, TEXT_SMALL,
-};
+use tokens::{RADIUS_LG, ROW_DIFF, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_8, TEXT_SMALL};
 use ui::blame_view::{CommitList, CommitListRow};
 use ui::convert::{hsla, shadows};
 use ui::time::format_date_time;
@@ -312,32 +309,16 @@ impl Render for CommitSearch {
             for (index, (_, label)) in FIELDS.iter().enumerate() {
                 let active = index == self.field;
                 let pick = cx.entity();
-                let hover = hsla(p.bg_hover);
-                let mut item = div()
-                    .id(ElementId::from(("commit-search-opt", index)))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .h(px(ROW_LIST))
-                    .px(px(SPACE_2))
-                    .rounded(px(RADIUS_SM))
-                    .text_style(&TEXT_SMALL, cx)
-                    .text_color(hsla(if active { p.accent } else { p.ink }))
-                    .cursor_pointer()
+                let item = Button::new(("commit-search-opt", index), *label)
+                    .full_width()
                     .on_click(move |_, _, cx| {
                         pick.update(cx, |this, cx| {
                             this.field = index;
                             this.field_menu_open = false;
                             this.refresh(cx);
                         });
-                    })
-                    .child(*label)
-                    .children(active.then_some("✓"));
-                item = if active {
-                    item.bg(hsla(p.accent_soft))
-                } else {
-                    item.hover(move |s| s.bg(hover))
-                };
+                    });
+                let item = if active { item } else { item.ghost() };
                 menu = menu.child(item);
             }
             deferred(menu)
@@ -378,6 +359,7 @@ impl Render for CommitSearch {
                                     "commit-search-field-btn",
                                     format!("{} ▾", FIELDS[self.field].1),
                                 )
+                                .tooltip("Search field")
                                 .compact()
                                 .on_click(move |_, _, cx| {
                                     toggle_field.update(cx, |this, cx| {
@@ -390,6 +372,7 @@ impl Render for CommitSearch {
                     )
                     .child(
                         Button::new("commit-search-close", "")
+                            .tooltip("Close commit search")
                             .icon(IconName::Close)
                             .ghost()
                             .compact()

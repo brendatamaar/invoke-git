@@ -8,7 +8,7 @@ use gpui::{
     Styled, Subscription, Window, div, px,
 };
 use invoke_core::{
-    DiskState, Event, FileChange, Head, Oid, Phase, RebasePause, RebaseState, RepoState, Snapshot,
+    DiskState, Event, FileChange, Head, Oid, Phase, RebasePause, RebaseState, RepoState,
 };
 use shell::rebase::read_rebase_commits;
 use tokens::{
@@ -125,6 +125,7 @@ enum Stage {
     Loading(u64),
     Editing {
         editor: Entity<RebaseEditor>,
+        source: Head,
         _sub: Subscription,
     },
     LoadFailed(String),
@@ -155,11 +156,16 @@ impl RebaseView {
     /// Begin loading commits in `upstream..HEAD` for interactive rebase.
     pub fn open(&mut self, upstream: Oid, cx: &mut Context<Self>) {
         self.confirm_abort = false;
-        let head = match &self.session.read(cx).state.snapshot {
-            Snapshot::Read { disk, .. } => head_oid(&disk.head).cloned(),
-            Snapshot::NotRead => None,
-        };
-        let Some(head) = head else {
+        let disk = self.session.read(cx).state.snapshot.disk();
+        let Some((head, source, source_label)) = disk.and_then(|disk| {
+            head_oid(&disk.head).map(|oid| {
+                let label = match &disk.head {
+                    Head::Branch { name, .. } => name.0.clone(),
+                    _ => format!("HEAD at {}", ui::short_hash(oid.as_hex())),
+                };
+                (oid.clone(), disk.head.clone(), label)
+            })
+        }) else {
             self.stage = Stage::LoadFailed("Interactive rebase needs an existing HEAD.".into());
             cx.notify();
             return;
@@ -187,13 +193,16 @@ impl RebaseView {
                             .collect();
                         let model = RebaseEditorModel::new(upstream.clone(), rows);
                         let initial_plan = model.to_plan();
-                        let hex = upstream.as_hex();
-                        let label = hex[..7.min(hex.len())].to_owned();
-                        let editor = cx.new(|_| RebaseEditor::new(model, label));
+                        let target = ui::short_hash(upstream.as_hex()).to_owned();
+                        let editor = cx.new(|_| RebaseEditor::new(model, source_label, target));
                         let sub = cx.subscribe(&editor, |this, editor, event, cx| {
                             this.editor_event(&editor, event, cx)
                         });
-                        this.stage = Stage::Editing { editor, _sub: sub };
+                        this.stage = Stage::Editing {
+                            editor,
+                            source,
+                            _sub: sub,
+                        };
                         if let Ok(plan) = initial_plan {
                             this.deliver(Event::RebasePlanEdited(plan), cx);
                         }
@@ -222,6 +231,9 @@ impl RebaseView {
             }
             RebaseEditorEvent::PlanChanged(Err(_)) => {}
             RebaseEditorEvent::StartRequested => {
+                if self.editor_start_blocker(cx).is_some() {
+                    return;
+                }
                 if let Ok(plan) = editor.read(cx).model().to_plan() {
                     self.deliver(Event::RebasePlanEdited(plan), cx);
                     self.deliver(Event::RebaseStartRequested, cx);
@@ -248,9 +260,20 @@ impl RebaseView {
 
     fn sync_editor_guard(&self, cx: &mut Context<Self>) {
         if let Stage::Editing { editor, .. } = &self.stage {
-            let reason = start_blocker(&self.session.read(cx).state).map(SharedString::from);
+            let reason = self.editor_start_blocker(cx).map(SharedString::from);
             editor.update(cx, |ed, cx| ed.set_start_disabled_reason(reason, cx));
         }
+    }
+
+    fn editor_start_blocker(&self, cx: &Context<Self>) -> Option<&'static str> {
+        let state = &self.session.read(cx).state;
+        start_blocker(state).or_else(|| {
+            let Stage::Editing { source, .. } = &self.stage else {
+                return Some("Open an interactive rebase plan first.");
+            };
+            (state.snapshot.disk().map(|disk| &disk.head) != Some(source))
+                .then_some("HEAD changed. Reopen the rebase plan to review the current commits.")
+        })
     }
 
     fn session_changed(&mut self, cx: &mut Context<Self>) {
@@ -569,7 +592,7 @@ impl Render for RebaseView {
                             .text_style(&TEXT_BODY, cx)
                             .text_color(hsla(p.ink_muted))
                             .child(
-                                "Select a commit in History and choose Interactive rebase onto…",
+                                "Select the new base commit in History and choose Interactive rebase.",
                             ),
                     )
                     .child(Button::new("rebase-idle-back", "Back to History").on_click(
@@ -587,7 +610,7 @@ impl Render for RebaseView {
 mod tests {
     use invoke_core::{
         BranchName, Conflicts, IndexId, LockState, ReadId, RebaseOrigin, RefsSnapshot, RepoId,
-        RepoPath, StatusEntry, StatusSnapshot,
+        RepoPath, Snapshot, StatusEntry, StatusSnapshot,
     };
     use proptest::prelude::*;
 

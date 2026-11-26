@@ -226,6 +226,7 @@ pub enum RebaseEditorEvent {
 /// GPUI interactive rebase plan editor.
 pub struct RebaseEditor {
     model: RebaseEditorModel,
+    source_label: SharedString,
     upstream_label: SharedString,
     /// Row index whose action picker menu is currently open.
     open_menu: Option<usize>,
@@ -240,9 +241,14 @@ pub struct RebaseEditor {
 impl EventEmitter<RebaseEditorEvent> for RebaseEditor {}
 
 impl RebaseEditor {
-    pub fn new(model: RebaseEditorModel, upstream_label: impl Into<SharedString>) -> Self {
+    pub fn new(
+        model: RebaseEditorModel,
+        source_label: impl Into<SharedString>,
+        upstream_label: impl Into<SharedString>,
+    ) -> Self {
         Self {
             model,
+            source_label: source_label.into(),
             upstream_label: upstream_label.into(),
             open_menu: None,
             dragging: None,
@@ -400,14 +406,17 @@ impl Render for RebaseEditor {
                         div()
                             .text_style(&TEXT_TITLE, cx)
                             .text_color(hsla(p.ink))
-                            .child(format!("Interactive rebase onto {}", self.upstream_label)),
+                            .child(format!(
+                                "Rebase {} onto {}",
+                                self.source_label, self.upstream_label
+                            )),
                     )
                     .child(
                         div()
                             .text_style(&TEXT_SMALL, cx)
                             .text_color(hsla(p.ink_muted))
                             .child(format!(
-                                "Oldest first · drag rows or use arrows to reorder · {}",
+                                "Runs top to bottom · drag rows or use arrows to reorder · {}",
                                 format_counts(counts)
                             )),
                     ),
@@ -471,6 +480,7 @@ impl Render for RebaseEditor {
                 cx.listener(|this, _, _, cx| this.cancel_drag(cx)),
             );
 
+        let mut fold_target: Option<&RebaseRow> = None;
         for (index, row) in self.model.rows().iter().enumerate() {
             let is_dragged = self.dragging == Some(index);
             let is_drop_target = self.dragging.is_some()
@@ -481,6 +491,16 @@ impl Render for RebaseEditor {
             let (badge_bg, badge_fg) = action_colors(row.action, p);
             let is_drop = row.action == RebaseAction::Drop;
             let menu_open = self.open_menu == Some(index);
+            let effect = match row.action {
+                RebaseAction::Pick | RebaseAction::Edit => {
+                    fold_target = Some(row);
+                    None
+                }
+                RebaseAction::Squash | RebaseAction::Fixup => fold_target.map(|target| {
+                    format!("Combines with {} · {}", target.short_hash, target.subject)
+                }),
+                RebaseAction::Drop => Some("Omitted from the rebased branch".to_owned()),
+            };
 
             let (up_ent, down_ent, menu_ent) = (cx.entity(), cx.entity(), cx.entity());
 
@@ -530,6 +550,7 @@ impl Render for RebaseEditor {
                 .flex_none()
                 .items_center()
                 .justify_between()
+                .w(px(SPACE_8 * 3.))
                 .gap(px(SPACE_1))
                 .h(px(ROW_LIST))
                 .px(px(SPACE_2))
@@ -559,12 +580,24 @@ impl Render for RebaseEditor {
                 .child(row.short_hash.clone());
 
             let subject = div()
+                .flex()
+                .flex_col()
                 .flex_1()
                 .min_w(px(0.))
-                .truncate()
-                .text_style(&TEXT_BODY, cx)
-                .text_color(hsla(if is_drop { p.ink_muted } else { p.ink }))
-                .child(row.subject.clone());
+                .child(
+                    div()
+                        .truncate()
+                        .text_style(&TEXT_BODY, cx)
+                        .text_color(hsla(if is_drop { p.ink_muted } else { p.ink }))
+                        .child(row.subject.clone()),
+                )
+                .children(effect.map(|effect| {
+                    div()
+                        .truncate()
+                        .text_style(&TEXT_SMALL, cx)
+                        .text_color(hsla(badge_fg))
+                        .child(effect)
+                }));
 
             let author = div()
                 .flex_none()

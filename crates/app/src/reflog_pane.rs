@@ -270,7 +270,7 @@ impl ReflogPane {
                     .flex_wrap()
                     .gap(px(SPACE_2))
                     .child(
-                        Button::new("reflog-branch", "Create branch here")
+                        Button::new("reflog-branch", "Create branch at this commit")
                             .disabled(!ready)
                             .on_click(move |_, _, cx| {
                                 branch.update(cx, |this, cx| {
@@ -479,7 +479,7 @@ impl Render for ReflogPane {
                 .child(
                     div()
                         .text_style(&TEXT_CODE_SMALL, cx)
-                        .child(format!("{from} → {}", entry.new_oid)),
+                        .child(format!("Ref moved from {from} to {}", entry.new_oid)),
                 )
                 .child(self.recovery_form(entry, cx))
         });
@@ -501,7 +501,10 @@ impl Render for ReflogPane {
         );
         let message = match &self.status {
             Status::Loading => Some("Reading reflog…"),
-            Status::Ready if self.entries.is_empty() => Some("No reflog entries for this ref."),
+            Status::Ready if self.entries.is_empty() => Some("No recorded movements for this ref."),
+            Status::Ready if self.selected.is_none() => {
+                Some("Select an entry to recover its resulting commit.")
+            }
             Status::Ready => None,
             Status::Failed(error) => Some(error.as_str()),
         };
@@ -522,13 +525,16 @@ impl Render for ReflogPane {
                     .border_b_1()
                     .border_color(hsla(p.line))
                     .child(
-                        Button::new("reflog-target-picker", format!("{} ▾", self.target.label()))
-                            .on_click(move |_, _, cx| {
-                                picker.update(cx, |this, cx| {
-                                    this.show_targets = !this.show_targets;
-                                    cx.notify();
-                                })
-                            }),
+                        Button::new(
+                            "reflog-target-picker",
+                            format!("Reflog for {} ▾", self.target.label()),
+                        )
+                        .on_click(move |_, _, cx| {
+                            picker.update(cx, |this, cx| {
+                                this.show_targets = !this.show_targets;
+                                cx.notify();
+                            })
+                        }),
                     )
                     .children(message.map(|text| {
                         div()

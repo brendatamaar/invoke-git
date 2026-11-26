@@ -51,8 +51,9 @@ pub fn progress(conflicts: &Conflicts, operation: Operation, head: &str) -> Stri
         );
     }
     format!(
-        "{resolved} of {} resolved. Resolve every file to continue, or abort to put {head} back exactly as it was.",
-        plural(total, "file", "files")
+        "{resolved} of {} resolved · {} unresolved. Mark every file resolved to continue.",
+        plural(total, "file", "files"),
+        total - resolved
     )
 }
 
@@ -76,10 +77,7 @@ pub fn abort_question(operation: Operation, head: &str) -> String {
 pub fn side_names(operation: Operation, head: &str) -> (String, String) {
     match operation {
         Operation::Merge => (head.to_owned(), "the branch being merged".to_owned()),
-        Operation::Rebase { .. } => (
-            "the branch you rebase onto".to_owned(),
-            "your commit being applied".to_owned(),
-        ),
+        Operation::Rebase { .. } => (head.to_owned(), "the commit being replayed".to_owned()),
         Operation::CherryPick => (head.to_owned(), "the picked commit".to_owned()),
         Operation::Revert => (head.to_owned(), "the revert".to_owned()),
     }
@@ -261,7 +259,7 @@ mod tests {
         let line = |open, done| progress(&conflicts(open, done), Operation::Merge, "main");
         assert_eq!(
             line(1, 1),
-            "1 of 2 files resolved. Resolve every file to continue, or abort to put main back exactly as it was."
+            "1 of 2 files resolved · 1 unresolved. Mark every file resolved to continue."
         );
         assert!(line(0, 2).starts_with("All 2 files resolved. Continue the merge"));
         assert!(line(0, 1).starts_with("All 1 file resolved."));
@@ -312,9 +310,9 @@ mod tests {
             ("main".to_owned(), "the branch being merged".to_owned())
         );
         let (current, incoming) =
-            side_names(Operation::Rebase { step: 1, total: 2 }, "your branch");
-        assert_eq!(current, "the branch you rebase onto");
-        assert_eq!(incoming, "your commit being applied");
+            side_names(Operation::Rebase { step: 1, total: 2 }, "HEAD at 123abcd");
+        assert_eq!(current, "HEAD at 123abcd");
+        assert_eq!(incoming, "the commit being replayed");
     }
 
     #[test]
