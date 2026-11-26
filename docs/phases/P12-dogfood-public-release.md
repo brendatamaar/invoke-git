@@ -1,6 +1,6 @@
 # P12 - Pre-Release Dogfood & Public Release Gate
 Status: todo
-Depends on: P1b, P3, P4b, P5, P6, P7, P9, P10, P11
+Depends on: P12a
 Parallel-safe with: -
 
 ## Goal

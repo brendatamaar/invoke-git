@@ -28,14 +28,13 @@ It is the second tool in the Invoke developer suite, after Invoke (API platform)
 - No Launchpad, issue boards or project-management add-ons
 - No subscription required for core git features
 - No code editor or IDE features (an embedded terminal may come later)
-- No keyboard command palette (mouse-first; a few standard shortcuts only)
 
 ## Product principles and UI/UX
 
 The visual reference is Linear: dense but calm, crisp type, restrained colour, motion only where it explains a change.
 
 - **State is visible.** Branch, ahead/behind counts, in-progress operations (merge, rebase step n/m) and conflicts are always on screen, never buried in a menu.
-- **Mouse-first.** Every action is reachable by clicking, dragging or a context menu. Standard shortcuts only: Ctrl/Cmd+Enter to commit, Ctrl/Cmd+Z for undo, Esc to cancel.
+- **Mouse-first.** Every action is reachable by clicking, dragging or a context menu. Show shortcut hints where they apply. The optional Ctrl+K command palette offers a secondary way to reach visible repository commands.
 - **Safe by default.** Destructive actions show what will change and offer undo. Force push is always `--force-with-lease`.
 - **No blocking spinners.** Long operations run in the background with progress and a cancel button; the UI stays interactive.
 - **Design tokens.** Colours, spacing, type scale, radii and motion come from one tokens file owned by Invoke Git; sharing tokens with Invoke can come later.
