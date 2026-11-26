@@ -534,6 +534,12 @@ impl Workspace {
             .update(cx, |palette, cx| palette.open(items, window, cx));
     }
 
+    fn open_commit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(repo) = self.tabs.active_item().cloned() {
+            repo.update(cx, |view, cx| view.toggle_search(window, cx));
+        }
+    }
+
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(repo) = self.tabs.active_item().cloned() {
             repo.update(cx, |view, cx| view.find_in_view(window, cx));
@@ -750,7 +756,7 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if std::mem::take(&mut self.pending_search) {
-            self.toggle_search(window, cx);
+            self.open_commit_search(window, cx);
         }
         let p = cx.palette();
         let title = self.window_title(cx);

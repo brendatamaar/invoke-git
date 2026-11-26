@@ -200,7 +200,7 @@ impl ReviewPane {
         self.active = true;
         self.pushed = None;
         self.range_changed = false;
-        self.reload(cx);
+        self.reload(false, cx);
     }
 
     pub fn close(&mut self) {
@@ -226,18 +226,18 @@ impl ReviewPane {
             if matches!(state.snapshot, Snapshot::Read { .. })
                 && review::key_of(state) != self.loaded
             {
-                self.reload(cx);
+                self.reload(true, cx);
                 return;
             }
         }
         cx.notify();
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    fn reload(&mut self, mid_review: bool, cx: &mut Context<Self>) {
         let state = &self.session.read(cx).state;
         let key = review::key_of(state);
         if key != self.loaded {
-            self.range_changed |= self.loaded.is_some();
+            self.range_changed |= self.loaded.is_some() && (mid_review || !self.viewed.is_empty());
             self.viewed.clear();
             self.unviewed_only = false;
         }

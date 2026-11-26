@@ -535,7 +535,6 @@ impl DiffView {
                 .flex_none()
                 .child(
                     Button::new("diff-actions-menu", "")
-                        .tooltip("Diff options")
                         .icon(IconName::More)
                         .tooltip("File actions")
                         .ghost()

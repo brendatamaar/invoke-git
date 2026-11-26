@@ -182,6 +182,10 @@ impl Viewed {
         paths.filter(|path| self.is(commit, path)).count()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn clear(&mut self) {
         self.0.clear();
     }

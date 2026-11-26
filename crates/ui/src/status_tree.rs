@@ -167,6 +167,7 @@ type OnAction = Rc<dyn Fn(TreeAction, &mut Window, &mut App)>;
 pub struct StatusTree {
     rows: Rc<[TreeRow]>,
     selected: Option<(Section, SharedString)>,
+    empty_title: Option<SharedString>,
     empty_hint: Option<SharedString>,
     on_action: OnAction,
 }
@@ -180,9 +181,16 @@ impl StatusTree {
         Self {
             rows: rows.into(),
             selected,
+            empty_title: None,
             empty_hint: None,
             on_action: Rc::new(on_action),
         }
+    }
+
+    /// Custom heading shown when the tree has no visible rows.
+    pub fn empty_title(mut self, title: impl Into<SharedString>) -> Self {
+        self.empty_title = Some(title.into());
+        self
     }
 
     /// Custom subtitle shown when there are no changed files.
@@ -196,6 +204,9 @@ impl RenderOnce for StatusTree {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         if self.rows.is_empty() {
             let p = cx.palette();
+            let title = self
+                .empty_title
+                .unwrap_or_else(|| "Working tree clean".into());
             let hint = self
                 .empty_hint
                 .unwrap_or_else(|| "Modified, staged, and untracked files appear here.".into());
@@ -225,7 +236,7 @@ impl RenderOnce for StatusTree {
                         .text_style(&TEXT_BODY_MEDIUM, cx)
                         .text_color(hsla(p.ink))
                         .text_center()
-                        .child("Working tree clean"),
+                        .child(title),
                 )
                 .child(
                     div()

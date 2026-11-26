@@ -1060,6 +1060,7 @@ impl RepoView {
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
+        self.committed = false;
         self.deliver(Event::UndoRequested, cx);
     }
 
@@ -1090,7 +1091,12 @@ impl Render for RepoView {
             name
         };
         let mut summary = RepoSummary::new(summary_state, repo_path.clone()).repository(identity);
-        if matches!(self.page, Page::Conflicts | Page::Rebase) {
+        let has_rebase_banner = session
+            .state
+            .snapshot
+            .disk()
+            .is_some_and(|disk| matches!(disk.phase, Phase::Rebasing { .. }));
+        if matches!(self.page, Page::Conflicts | Page::Rebase) || has_rebase_banner {
             summary = summary.without_phase();
         }
         if let Some(error) = &session.watch_error {
@@ -1445,13 +1451,20 @@ impl Render for RepoView {
                                         StatusTree::new(rows, selected, move |action, _, cx| {
                                             this.update(cx, |this, cx| this.tree_action(action, cx))
                                         })
+                                        .empty_title(if summary_reading {
+                                            "Loading changes"
+                                        } else if filtering {
+                                            "No matching files"
+                                        } else {
+                                            "Working tree clean"
+                                        })
                                         .empty_hint(
                                             if summary_reading {
                                                 "Reading repository status…"
                                             } else if filtering {
-                                                "No changed files match the filter"
+                                                "No changed files match the filter."
                                             } else {
-                                                "No working changes"
+                                                "Modified, staged, and untracked files appear here."
                                             },
                                         ),
                                     ),
