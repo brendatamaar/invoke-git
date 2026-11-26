@@ -11,14 +11,15 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, RenderOnce, Styled,
     UniformListScrollHandle, Window, canvas, div, point, px,
 };
+use tokens::{RADIUS_SM, SPACE_1, SPACE_3, SPACE_6};
 
 use crate::convert::hsla;
 use crate::theme::ThemeExt;
 
 /// Track width in logical pixels.
-pub const WIDTH: f32 = 12.0;
+pub const WIDTH: f32 = SPACE_3;
 /// The thumb never gets shorter than this, so it stays easy to grab.
-pub const MIN_THUMB: f32 = 24.0;
+pub const MIN_THUMB: f32 = SPACE_6;
 
 /// Where the thumb sits for one frame. All values are in pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -135,13 +136,19 @@ impl RenderOnce for Scrollbar {
         let up_state = state.clone();
         let (items, row_height) = (self.items, self.row_height);
 
-        div()
+        let thumb_hover = hsla(p.ink_faint);
+        let scrollable = current.is_some();
+        let thumb_id = ElementId::from((self.id.clone(), "thumb"));
+        let mut track = div()
             .id(self.id)
             .flex_none()
             .w(px(WIDTH))
             .h_full()
-            .relative()
-            .bg(hsla(p.bg_panel))
+            .relative();
+        if scrollable {
+            track = track.cursor_pointer();
+        }
+        track
             .child(
                 canvas(
                     move |bounds, _, cx| {
@@ -187,13 +194,15 @@ impl RenderOnce for Scrollbar {
             )
             .children(current.map(|t| {
                 div()
+                    .id(thumb_id)
                     .absolute()
                     .top(px(t.top))
-                    .left(px(2.))
-                    .w(px(WIDTH - 4.))
+                    .left(px(SPACE_1 / 2.0))
+                    .w(px(WIDTH - SPACE_1))
                     .h(px(t.height))
-                    .rounded(px(4.))
+                    .rounded(px(RADIUS_SM))
                     .bg(hsla(thumb_color))
+                    .hover(move |style| style.bg(thumb_hover))
             }))
             .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
                 down_state.update(cx, |state, cx| {

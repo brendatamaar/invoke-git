@@ -8,7 +8,9 @@ use gpui::{
     Subscription, Window, div, px,
 };
 use invoke_core::{AuthAnswer, AuthKind, AuthPrompt};
-use tokens::{RADIUS_MD, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_SMALL};
+use tokens::{
+    RADIUS_MD, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_CODE_SMALL, TEXT_SMALL,
+};
 use ui::convert::hsla;
 use ui::{Button, EditorEvent, TextEditor, TextStyleExt, ThemeExt};
 
@@ -134,6 +136,22 @@ impl Render for AuthPromptView {
                         },
                     )),
             };
+        let prompt_body = if kind == AuthKind::HostKey {
+            div()
+                .p(px(SPACE_3))
+                .rounded(px(RADIUS_MD))
+                .bg(hsla(p.bg_app))
+                .border_1()
+                .border_color(hsla(p.line))
+                .text_style(&TEXT_CODE_SMALL, cx)
+                .text_color(hsla(p.ink))
+                .child(self.prompt.text.trim().to_owned())
+        } else {
+            div()
+                .text_style(&TEXT_BODY, cx)
+                .text_color(hsla(p.ink_muted))
+                .child(self.prompt.text.trim().to_owned())
+        };
         div()
             .flex()
             .flex_col()
@@ -142,19 +160,14 @@ impl Render for AuthPromptView {
             .rounded(px(RADIUS_MD))
             .bg(hsla(p.bg_raised))
             .border_1()
-            .border_color(hsla(p.line))
+            .border_color(hsla(p.line_control))
             .child(
                 div()
                     .text_style(&TEXT_BODY_MEDIUM, cx)
                     .text_color(hsla(p.ink))
                     .child(title(kind)),
             )
-            .child(
-                div()
-                    .text_style(&TEXT_BODY, cx)
-                    .text_color(hsla(p.ink_muted))
-                    .child(self.prompt.text.trim().to_owned()),
-            )
+            .child(prompt_body)
             .children(self.field.clone())
             .child(
                 div()

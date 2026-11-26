@@ -8,9 +8,11 @@ use gpui::{
     StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use invoke_core::ReflogEntry;
-use tokens::{RADIUS_SM, ROW_LIST, SPACE_2, SPACE_8, TEXT_CODE_SMALL, TEXT_SMALL};
+use tokens::{
+    RADIUS_MD, RADIUS_SM, ROW_LIST, SPACE_1, SPACE_2, SPACE_8, TEXT_CODE_SMALL, TEXT_SMALL,
+};
 
-use crate::{Pill, TextStyleExt, ThemeExt, convert::hsla, focus, scrollbar::Scrollbar};
+use crate::{Pill, PillTone, TextStyleExt, ThemeExt, convert::hsla, focus, scrollbar::Scrollbar};
 
 type Select = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
@@ -55,19 +57,22 @@ impl RenderOnce for ReflogView {
                     let id = ElementId::from(("reflog-entry", index));
                     let handle = focus::handle(&id, window, cx);
                     let hover = hsla(p.bg_hover);
-                    div()
+                    let is_selected = selected == Some(index);
+                    let tone = if action.starts_with("commit") || action.starts_with("checkout") {
+                        PillTone::Accent
+                    } else if action.starts_with("reset") || action.starts_with("rebase") {
+                        PillTone::Warning
+                    } else {
+                        PillTone::Neutral
+                    };
+                    let mut row = div()
                         .id(id)
                         .track_focus(&handle)
                         .tab_stop(true)
+                        .relative()
                         .cursor_pointer()
-                        .rounded(px(RADIUS_SM))
+                        .rounded(px(RADIUS_MD))
                         .focus_visible(move |style| focus::ring(style, ring))
-                        .hover(move |style| style.bg(hover))
-                        .bg(hsla(if selected == Some(index) {
-                            p.bg_raised
-                        } else {
-                            p.bg_panel
-                        }))
                         .on_click(move |_, window, cx| select(index, window, cx))
                         .flex()
                         .items_center()
@@ -88,13 +93,14 @@ impl RenderOnce for ReflogView {
                             div()
                                 .flex_none()
                                 .text_style(&TEXT_CODE_SMALL, cx)
+                                .text_color(hsla(p.ink_muted))
                                 .child(crate::short_hash(entry.new_oid.as_hex()).to_owned()),
                         )
                         .child(
-                            div()
-                                .max_w(px(SPACE_8 * 5.))
-                                .overflow_hidden()
-                                .child(Pill::new(action.to_owned())),
+                            Pill::new(action.to_owned())
+                                .tone(tone)
+                                .compact()
+                                .max_w(SPACE_8 * 5.),
                         )
                         .child(
                             div()
@@ -108,6 +114,7 @@ impl RenderOnce for ReflogView {
                                 .flex_none()
                                 .w(px(SPACE_8 * 3.))
                                 .truncate()
+                                .text_color(hsla(p.ink_muted))
                                 .child(entry.actor.clone()),
                         )
                         .child(
@@ -115,7 +122,22 @@ impl RenderOnce for ReflogView {
                                 .flex_none()
                                 .text_color(hsla(p.ink_muted))
                                 .child(crate::time::format_date_time(entry.seconds, entry.offset)),
+                        );
+                    row = if is_selected {
+                        row.bg(hsla(p.bg_raised)).child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .top(px(SPACE_1))
+                                .bottom(px(SPACE_1))
+                                .w(px(focus::ACCENT_BAR_W))
+                                .rounded(px(RADIUS_SM))
+                                .bg(hsla(p.accent)),
                         )
+                    } else {
+                        row.hover(move |style| style.bg(hover))
+                    };
+                    row
                 })
                 .collect()
         })
@@ -126,6 +148,7 @@ impl RenderOnce for ReflogView {
             .flex()
             .size_full()
             .min_h(px(0.))
+            .px(px(SPACE_2))
             .child(list)
             .child(Scrollbar::new(
                 "reflog-scrollbar",

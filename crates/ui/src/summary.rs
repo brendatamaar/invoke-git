@@ -3,9 +3,9 @@
 
 use gpui::{App, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div, px};
 use invoke_core::{Freshness, Head, LockState, Phase, RebasePause, RepoState, Snapshot, Tracking};
-use tokens::{SPACE_2, SPACE_3, TEXT_BODY, TEXT_SMALL};
+use tokens::{SIDEBAR, SPACE_1, SPACE_2, SPACE_3, TEXT_BODY, TEXT_SMALL, TOOLBAR};
 
-use crate::components::{Banner, BannerKind, Pill};
+use crate::components::{Banner, BannerKind, Divider, Icon, IconName, Pill};
 use crate::convert::hsla;
 use crate::text::TextStyleExt;
 use crate::theme::ThemeExt;
@@ -152,17 +152,15 @@ impl Summary {
 #[derive(IntoElement)]
 pub struct RepoSummary {
     summary: Summary,
-    path: SharedString,
     warning: Option<SharedString>,
     control: Option<gpui::AnyElement>,
     show_phase: bool,
 }
 
 impl RepoSummary {
-    pub fn new(summary: Summary, path: impl Into<SharedString>) -> Self {
+    pub fn new(summary: Summary, _path: impl Into<SharedString>) -> Self {
         Self {
             summary,
-            path: path.into(),
             warning: None,
             control: None,
             show_phase: true,
@@ -197,46 +195,60 @@ impl RenderOnce for RepoSummary {
         let s = self.summary;
         let mut header = div()
             .flex()
+            .flex_wrap()
             .flex_none()
             .items_center()
-            .gap(px(SPACE_3))
+            .gap(px(SPACE_2))
+            .min_h(px(TOOLBAR))
             .w_full()
             .px(px(SPACE_3))
-            .py(px(SPACE_2))
+            .py(px(SPACE_1))
             .bg(hsla(p.bg_panel))
             .border_b_1()
             .border_color(hsla(p.line));
         if s.reading {
             header = header.child(
                 div()
+                    .flex_none()
+                    .whitespace_nowrap()
                     .text_style(&TEXT_BODY, cx)
                     .text_color(hsla(p.ink_muted))
                     .child("Reading the repository…"),
             );
         } else {
-            header = header.child(Pill::new(s.head.clone()));
+            let mut ref_meta = div()
+                .flex()
+                .flex_initial()
+                .min_w(px(0.))
+                .max_w(px(SIDEBAR * 1.5))
+                .items_center()
+                .gap(px(SPACE_2))
+                .overflow_hidden()
+                .child(Icon::new(IconName::Branch).small().color(p.accent))
+                .child(Pill::new(s.head.clone()).max_w(SIDEBAR));
             if let Some(tracking) = &s.tracking {
-                header = header.child(
+                ref_meta = ref_meta.child(
                     div()
+                        .min_w(px(0.))
+                        .truncate()
                         .text_style(&TEXT_SMALL, cx)
                         .text_color(hsla(p.ink_muted))
                         .child(tracking.clone()),
                 );
             }
+            header = header.child(ref_meta);
         }
 
-        // The path takes what is left and is cut with an ellipsis, so a long
-        // path or a wide set of controls never pushes the page past the window.
-        header = header.children(self.control).child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .truncate()
-                .text_right()
-                .text_style(&tokens::TEXT_CODE_SMALL, cx)
-                .text_color(hsla(p.ink_faint))
-                .child(self.path),
-        );
+        if let Some(control) = self.control {
+            header = header.child(Divider::vertical()).child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .items_center()
+                    .child(control),
+            );
+        }
 
         let mut body = div().flex().flex_col().flex_none().gap(px(SPACE_2));
         let mut any = false;

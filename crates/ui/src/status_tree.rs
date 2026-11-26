@@ -12,10 +12,13 @@ use gpui::{
     StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use invoke_core::{FileChange, StatusSnapshot};
-use tokens::{RADIUS_MD, ROW_LIST, SPACE_2, SPACE_3, TEXT_BODY, TEXT_LABEL, TEXT_SMALL};
+use tokens::{
+    LANE, RADIUS_MD, RADIUS_SM, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_6, SPACE_8,
+    TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_LABEL, TEXT_SMALL,
+};
 
 use crate::changes::{Section, letter};
-use crate::components::{Button, CheckState, Checkbox};
+use crate::components::{Button, CheckState, Checkbox, Icon, IconName};
 use crate::convert::hsla;
 use crate::focus;
 use crate::scrollbar::Scrollbar;
@@ -164,6 +167,7 @@ type OnAction = Rc<dyn Fn(TreeAction, &mut Window, &mut App)>;
 pub struct StatusTree {
     rows: Rc<[TreeRow]>,
     selected: Option<(Section, SharedString)>,
+    empty_hint: Option<SharedString>,
     on_action: OnAction,
 }
 
@@ -176,13 +180,62 @@ impl StatusTree {
         Self {
             rows: rows.into(),
             selected,
+            empty_hint: None,
             on_action: Rc::new(on_action),
         }
+    }
+
+    /// Custom subtitle shown when there are no changed files.
+    pub fn empty_hint(mut self, hint: impl Into<SharedString>) -> Self {
+        self.empty_hint = Some(hint.into());
+        self
     }
 }
 
 impl RenderOnce for StatusTree {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        if self.rows.is_empty() {
+            let p = cx.palette();
+            let hint = self
+                .empty_hint
+                .unwrap_or_else(|| "Modified, staged, and untracked files appear here.".into());
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .items_center()
+                .justify_center()
+                .gap(px(SPACE_2))
+                .p(px(SPACE_6))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(SPACE_8))
+                        .rounded(px(RADIUS_MD))
+                        .bg(hsla(p.bg_raised))
+                        .border_1()
+                        .border_color(hsla(p.line))
+                        .child(Icon::new(IconName::Changes).color(p.ink_muted)),
+                )
+                .child(
+                    div()
+                        .text_style(&TEXT_BODY_MEDIUM, cx)
+                        .text_color(hsla(p.ink))
+                        .text_center()
+                        .child("Working tree clean"),
+                )
+                .child(
+                    div()
+                        .max_w(px(SIDEBAR))
+                        .text_style(&TEXT_SMALL, cx)
+                        .text_color(hsla(p.ink_muted))
+                        .text_center()
+                        .child(hint),
+                );
+        }
         let scroll = window
             .use_keyed_state("status-tree-scroll", cx, |_, _| {
                 UniformListScrollHandle::new()
@@ -208,10 +261,14 @@ impl RenderOnce for StatusTree {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap(px(SPACE_1))
                             .h(px(ROW_LIST))
                             .px(px(SPACE_2))
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
                                     .text_style(&TEXT_LABEL, cx)
                                     .text_color(hsla(p.ink_muted))
                                     .child(format!("{title} · {count}")),
@@ -220,21 +277,25 @@ impl RenderOnce for StatusTree {
                                 let discard = on_action.clone();
                                 div()
                                     .flex()
+                                    .flex_none()
                                     .items_center()
-                                    .gap(px(SPACE_2))
+                                    .gap(px(SPACE_1))
                                     .children((section == Section::Unstaged).then(|| {
                                         Button::new(("tree-discard-all", index), "Discard all")
-                                            .ghost()
+                                            .icon(IconName::Trash)
+                                            .danger_ghost()
+                                            .compact()
                                             .on_click(move |_, window, cx| {
                                                 discard(TreeAction::DiscardAll, window, cx)
                                             })
                                     }))
                                     .child(
-                                        Button::new(("tree-all", index), action).ghost().on_click(
-                                            move |_, window, cx| {
+                                        Button::new(("tree-all", index), action)
+                                            .ghost()
+                                            .compact()
+                                            .on_click(move |_, window, cx| {
                                                 on_action(TreeAction::All { section }, window, cx)
-                                            },
-                                        ),
+                                            }),
                                     )
                             })
                             .into_any_element()
@@ -256,6 +317,7 @@ impl RenderOnce for StatusTree {
                         let (toggle_path, fold_path) = (path.clone(), path.clone());
                         let id = ElementId::from(("tree-dir", index));
                         let handle = focus::handle(&id, window, cx);
+                        let hover = hsla(p.bg_hover);
                         div()
                             .id(id)
                             .track_focus(&handle)
@@ -270,6 +332,7 @@ impl RenderOnce for StatusTree {
                             .text_style(&TEXT_BODY, cx)
                             .text_color(hsla(p.ink_muted))
                             .cursor_pointer()
+                            .hover(move |style| style.bg(hover))
                             .focus_visible(move |style| focus::ring(style, ring))
                             .on_click(move |_, window, cx| {
                                 fold(
@@ -281,7 +344,7 @@ impl RenderOnce for StatusTree {
                                     cx,
                                 )
                             })
-                            .child(div().flex_none().w(px(12.)).child(if *expanded {
+                            .child(div().flex_none().w(px(SPACE_3)).child(if *expanded {
                                 "▾"
                             } else {
                                 "▸"
@@ -339,11 +402,12 @@ impl RenderOnce for StatusTree {
                             .id(id)
                             .track_focus(&handle)
                             .tab_stop(true)
+                            .relative()
                             .flex()
                             .items_center()
                             .gap(px(SPACE_2))
                             .h(px(ROW_LIST))
-                            .pl(px(SPACE_2 + 12.0 + SPACE_2 + *depth as f32 * SPACE_3))
+                            .pl(px(SPACE_2 + SPACE_3 + SPACE_2 + *depth as f32 * SPACE_3))
                             .pr(px(SPACE_2))
                             .rounded(px(RADIUS_MD))
                             .text_style(&TEXT_BODY, cx)
@@ -376,7 +440,7 @@ impl RenderOnce for StatusTree {
                             .child(
                                 div()
                                     .flex_none()
-                                    .w(px(14.))
+                                    .w(px(LANE))
                                     .text_style(&TEXT_SMALL, cx)
                                     .font_weight(gpui::FontWeight(600.0))
                                     .text_color(hsla(colour))
@@ -384,7 +448,18 @@ impl RenderOnce for StatusTree {
                             )
                             .child(div().flex_1().min_w(px(0.)).truncate().child(name.clone()));
                         if chosen {
-                            row.bg(hsla(p.bg_raised)).into_any_element()
+                            row.bg(hsla(p.bg_raised))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(0.))
+                                        .top(px(SPACE_1))
+                                        .bottom(px(SPACE_1))
+                                        .w(px(focus::ACCENT_BAR_W))
+                                        .rounded(px(RADIUS_SM))
+                                        .bg(hsla(p.accent)),
+                                )
+                                .into_any_element()
                         } else {
                             row.hover(move |style| style.bg(hover)).into_any_element()
                         }

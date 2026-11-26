@@ -19,8 +19,11 @@ use invoke_core::clone::{CloneEvent, ClonePhase, CloneRequest, CloneState, step_
 use invoke_core::{Failure, OpId, OpOutcome, Progress};
 use shell::forge::{ForgeError, ForgeService};
 use shell::{CloneRunner, Git};
-use tokens::{SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_SMALL, TEXT_TITLE};
-use ui::convert::hsla;
+use tokens::{
+    DIALOG, NAME_COLUMN, RADIUS_LG, SPACE_2, SPACE_3, SPACE_4, SPACE_6, SPACE_8, TEXT_BODY,
+    TEXT_DISPLAY, TEXT_SMALL,
+};
+use ui::convert::{hsla, shadows};
 use ui::{
     Banner, BannerKind, Button, EditorEvent, ProgressBar, Segmented, TextEditor, TextStyleExt,
     ThemeExt,
@@ -463,12 +466,23 @@ impl Render for CloneView {
             cx.entity(),
             cx.entity(),
         );
-        let mut body = div().flex().flex_col().gap(px(SPACE_4)).w(px(520.)).child(
-            div()
-                .text_style(&TEXT_TITLE, cx)
-                .text_color(hsla(p.ink))
-                .child("Clone a repository"),
-        );
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_4))
+            .w(px(DIALOG))
+            .p(px(SPACE_6))
+            .rounded(px(RADIUS_LG))
+            .bg(hsla(p.bg_panel))
+            .border_1()
+            .border_color(hsla(p.line))
+            .shadow(shadows(p.shadow_overlay))
+            .child(
+                div()
+                    .text_style(&TEXT_DISPLAY, cx)
+                    .text_color(hsla(p.ink))
+                    .child("Clone a repository"),
+            );
         if self.helper_missing {
             body = body.child(Banner::new(
                 BannerKind::Warning,
@@ -494,7 +508,7 @@ impl Render for CloneView {
                         if let Some(details) = message.details {
                             banner = banner.action(
                                 div()
-                                    .max_w(px(260.))
+                                    .max_w(px(NAME_COLUMN))
                                     .truncate()
                                     .text_style(&TEXT_SMALL, cx)
                                     .child(crate::notice::headline(&details)),
@@ -650,7 +664,7 @@ impl Render for CloneView {
                                 None => "Cloning".into(),
                             }),
                     )
-                    .child(ProgressBar::new(fraction.unwrap_or(0.0)))
+                    .children(fraction.map(ProgressBar::new))
                     .child(
                         div()
                             .text_style(&TEXT_SMALL, cx)
@@ -696,6 +710,7 @@ impl Render for CloneView {
             .flex_1()
             .items_center()
             .justify_center()
+            .p(px(SPACE_8))
             .child(body)
     }
 }

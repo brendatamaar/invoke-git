@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+    AppContext, Context, ElementId, Entity, EventEmitter, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    div, px,
 };
 use invoke_core::RepoPath;
 use invoke_core::notes::{Note, NoteId, open_todos, relocate};
@@ -20,20 +21,26 @@ use shell::history::CommitId;
 use shell::outgoing::{Outgoing, read_outgoing, read_range_sides};
 use shell::precondition::RepoPaths;
 use tokens::{
-    RADIUS_MD, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_CODE_SMALL, TEXT_LABEL,
-    TEXT_SMALL, TEXT_TITLE,
+    DIALOG, LANE, RADIUS_MD, RADIUS_SM, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4,
+    TEXT_BODY, TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL, TEXT_TITLE,
 };
 use ui::convert::hsla;
+use ui::focus;
 use ui::time::relative;
 use ui::{
-    Button, CheckState, Checkbox, DiffContent, DiffView, Segmented, TextEditor, TextStyleExt,
-    ThemeExt, diff_view, short_hash,
+    Button, CheckState, Checkbox, DiffContent, DiffView, Pill, PillTone, ResizeEdge, ResizeHandle,
+    Segmented, TextEditor, TextStyleExt, ThemeExt, diff_view, short_hash,
 };
 
 use crate::notes_db::{self, NotesDb};
 use crate::review::{self, Key, Scope, Viewed};
 use crate::session::RepoSession;
 use crate::sync;
+
+/// Width bounds of the commits / files / notes aside.
+const ASIDE_W: f32 = SIDEBAR + SPACE_4 * 6.0;
+const ASIDE_MIN: f32 = SIDEBAR;
+const ASIDE_MAX: f32 = DIALOG + SPACE_4 * 2.0;
 
 /// Files whose line counts are worked out for the list; a bigger list shows
 /// counts for the first ones only.
@@ -140,6 +147,7 @@ pub struct ReviewPane {
     /// The file on show and its new side: what a typed line number is
     /// counted in.
     shown: Option<(String, Arc<str>)>,
+    aside_w: f32,
     _observe: Subscription,
 }
 
@@ -168,6 +176,7 @@ impl ReviewPane {
             note_todo: false,
             note_problem: None,
             shown: None,
+            aside_w: ASIDE_W,
             _observe: observe,
         }
     }
@@ -707,8 +716,9 @@ fn rows_of(files: &[shell::commit_detail::ChangedFile]) -> Vec<Row> {
 }
 
 impl Render for ReviewPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
+        let ring = focus::ring_color(cx);
         let back = |cx: &mut Context<Self>| {
             let this = cx.entity();
             Button::new("review-back", "Back to changes")
@@ -861,17 +871,24 @@ impl Render for ReviewPane {
             let chosen = scope == Scope::PerCommit && index == selected_commit;
             let this = cx.entity();
             let hover = hsla(p.bg_hover);
+            let commit_id = ElementId::from(("review-commit", index));
+            let handle = focus::handle(&commit_id, window, cx);
             let mut row = div()
-                .id(("review-commit", index))
+                .id(commit_id)
+                .track_focus(&handle)
+                .tab_stop(true)
+                .relative()
                 .flex()
                 .flex_col()
                 .px(px(SPACE_2))
-                .py(px(SPACE_1 + 2.0))
+                .py(px(SPACE_2))
                 .rounded(px(RADIUS_MD))
                 .cursor_pointer()
+                .focus_visible(move |style| focus::ring(style, ring))
                 .on_click(move |_, _, cx| this.update(cx, |pane, cx| pane.select_commit(index, cx)))
                 .child(
                     div()
+                        .min_w(px(0.))
                         .truncate()
                         .text_style(&TEXT_BODY, cx)
                         .text_color(hsla(p.ink))
@@ -892,7 +909,16 @@ impl Render for ReviewPane {
                         .children(commit.is_merge.then_some("merge")),
                 );
             row = if chosen {
-                row.bg(hsla(p.bg_raised))
+                row.bg(hsla(p.bg_raised)).child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(SPACE_1))
+                        .bottom(px(SPACE_1))
+                        .w(px(focus::ACCENT_BAR_W))
+                        .rounded(px(RADIUS_SM))
+                        .bg(hsla(p.accent)),
+                )
             } else {
                 row.hover(move |style| style.bg(hover))
             };
@@ -928,15 +954,21 @@ impl Render for ReviewPane {
             let ticked = self.viewed.is(scope_key.as_deref(), &row.path);
             let (select, tick) = (cx.entity(), cx.entity());
             let hover = hsla(p.bg_hover);
+            let file_id = ElementId::from(("review-file", index));
+            let handle = focus::handle(&file_id, window, cx);
             let mut line = div()
-                .id(("review-file", index))
+                .id(file_id)
+                .track_focus(&handle)
+                .tab_stop(true)
+                .relative()
                 .flex()
                 .items_center()
                 .gap(px(SPACE_2))
-                .h(px(28.))
+                .h(px(ROW_LIST))
                 .px(px(SPACE_2))
                 .rounded(px(RADIUS_MD))
                 .cursor_pointer()
+                .focus_visible(move |style| focus::ring(style, ring))
                 .on_click(move |_, _, cx| select.update(cx, |pane, cx| pane.select_file(index, cx)))
                 .child(
                     Checkbox::new(
@@ -948,13 +980,14 @@ impl Render for ReviewPane {
                         },
                     )
                     .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
                         tick.update(cx, |pane, cx| pane.toggle_viewed(index, cx))
                     }),
                 )
                 .child(
                     div()
                         .flex_none()
-                        .w(px(14.))
+                        .w(px(LANE))
                         .text_style(&TEXT_CODE_SMALL, cx)
                         .text_color(hsla(match row.change {
                             Change::Added => p.add_ink,
@@ -990,7 +1023,16 @@ impl Render for ReviewPane {
                     );
             }
             line = if chosen {
-                line.bg(hsla(p.bg_raised))
+                line.bg(hsla(p.bg_raised)).child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(SPACE_1))
+                        .bottom(px(SPACE_1))
+                        .w(px(focus::ACCENT_BAR_W))
+                        .rounded(px(RADIUS_SM))
+                        .bg(hsla(p.accent)),
+                )
             } else {
                 line.hover(move |style| style.bg(hover))
             };
@@ -1021,21 +1063,12 @@ impl Render for ReviewPane {
             let (id, todo, resolved) = (note.id, note.todo, note.resolved);
             let mut head = div().flex().items_center().gap(px(SPACE_2));
             if todo {
-                let (text, fg, bg) = if resolved {
-                    ("RESOLVED", p.ink_muted, p.bg_raised)
+                let (text, tone) = if resolved {
+                    ("Resolved", PillTone::Neutral)
                 } else {
-                    ("TO-DO", p.warning, p.warning_soft)
+                    ("To-do", PillTone::Warning)
                 };
-                head = head.child(
-                    div()
-                        .flex_none()
-                        .px(px(SPACE_1 + 2.0))
-                        .rounded(px(RADIUS_MD / 2.0))
-                        .bg(hsla(bg))
-                        .text_style(&TEXT_LABEL, cx)
-                        .text_color(hsla(fg))
-                        .child(text),
-                );
+                head = head.child(Pill::new(text).tone(tone).compact());
             }
             head = head.child(
                 div()
@@ -1055,6 +1088,7 @@ impl Render for ReviewPane {
                         if resolved { "Reopen" } else { "Resolve" },
                     )
                     .ghost()
+                    .compact()
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         toggle.update(cx, |pane, cx| {
@@ -1066,22 +1100,28 @@ impl Render for ReviewPane {
             buttons = buttons.child(
                 Button::new(("review-note-delete", index), "Delete")
                     .ghost()
+                    .compact()
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         change.update(cx, |pane, cx| pane.change_note(id, NoteChange::Delete, cx))
                     }),
             );
+            let note_id = ElementId::from(("review-note", index));
+            let handle = focus::handle(&note_id, window, cx);
             notes = notes.child(
                 div()
-                    .id(("review-note", index))
+                    .id(note_id)
+                    .track_focus(&handle)
+                    .tab_stop(true)
                     .flex()
                     .flex_col()
                     .gap(px(SPACE_1))
                     .px(px(SPACE_2))
-                    .py(px(SPACE_1 + 2.0))
+                    .py(px(SPACE_2))
                     .rounded(px(RADIUS_MD))
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover))
+                    .focus_visible(move |style| focus::ring(style, ring))
                     .on_click(move |_, _, cx| {
                         open_it.update(cx, |pane, cx| pane.open_note(index, cx))
                     })
@@ -1103,13 +1143,11 @@ impl Render for ReviewPane {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(340.))
+            .w(px(self.aside_w))
             .gap(px(SPACE_4))
             .p(px(SPACE_2))
             .overflow_y_scroll()
             .bg(hsla(p.bg_panel))
-            .border_r_1()
-            .border_color(hsla(p.line))
             .child(commits)
             .child(files)
             .child(notes);
@@ -1148,32 +1186,21 @@ impl Render for ReviewPane {
                                 .flex_col()
                                 .gap(px(SPACE_2))
                                 .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(SPACE_2))
-                                        .child(
-                                            Checkbox::new(
-                                                "review-note-todo",
-                                                if self.note_todo {
-                                                    CheckState::Checked
-                                                } else {
-                                                    CheckState::Unchecked
-                                                },
-                                            )
-                                            .on_click(move |_, _, cx| {
-                                                todo.update(cx, |pane, cx| {
-                                                    pane.note_todo = !pane.note_todo;
-                                                    cx.notify();
-                                                })
-                                            }),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_style(&TEXT_SMALL, cx)
-                                                .text_color(hsla(p.ink))
-                                                .child("To-do"),
-                                        ),
+                                    Checkbox::new(
+                                        "review-note-todo",
+                                        if self.note_todo {
+                                            CheckState::Checked
+                                        } else {
+                                            CheckState::Unchecked
+                                        },
+                                    )
+                                    .label("To-do")
+                                    .on_click(move |_, _, cx| {
+                                        todo.update(cx, |pane, cx| {
+                                            pane.note_todo = !pane.note_todo;
+                                            cx.notify();
+                                        })
+                                    }),
                                 )
                                 .child(Button::new("review-note-add", "Add note").on_click(
                                     move |_, _, cx| add.update(cx, |pane, cx| pane.add_note(cx)),
@@ -1219,12 +1246,10 @@ impl Render for ReviewPane {
             .border_t_1()
             .border_color(hsla(p.line))
             .bg(hsla(p.bg_panel))
-            .children(review::todo_warning(open).map(|text| {
-                div()
-                    .text_style(&TEXT_SMALL, cx)
-                    .text_color(hsla(p.warning))
-                    .child(format!("⚠ {text}"))
-            }))
+            .children(
+                review::todo_warning(open)
+                    .map(|text| Pill::new(text).tone(PillTone::Warning).compact()),
+            )
             .child(
                 div()
                     .text_style(&TEXT_SMALL, cx)
@@ -1243,6 +1268,7 @@ impl Render for ReviewPane {
                 .on_click(move |_, _, cx| push_this.update(cx, |pane, cx| pane.push(cx))),
             );
 
+        let resize_aside = cx.entity();
         div()
             .flex()
             .flex_col()
@@ -1251,7 +1277,28 @@ impl Render for ReviewPane {
             .min_h(px(0.))
             .bg(hsla(p.bg_app))
             .child(header)
-            .child(div().flex().flex_1().min_h(px(0.)).child(aside).child(main))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(aside)
+                    .child(ResizeHandle::new(
+                        "review-aside-resize",
+                        self.aside_w,
+                        ASIDE_W,
+                        ASIDE_MIN,
+                        ASIDE_MAX,
+                        ResizeEdge::Right,
+                        move |width, _, cx| {
+                            resize_aside.update(cx, |pane, cx| {
+                                pane.aside_w = width;
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .child(main),
+            )
             .child(footer)
             .into_any_element()
     }

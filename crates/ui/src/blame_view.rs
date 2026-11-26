@@ -8,7 +8,7 @@ use gpui::{
     div, px, uniform_list,
 };
 use tokens::{
-    RADIUS_SM, ROW_DIFF, ROW_LIST, SPACE_2, SPACE_4, SPACE_8, TEXT_CODE_SMALL, TEXT_SMALL,
+    RADIUS_MD, ROW_DIFF, ROW_LIST, SPACE_2, SPACE_4, SPACE_8, TEXT_CODE_SMALL, TEXT_SMALL,
 };
 
 use crate::commit_detail::short_hash;
@@ -128,17 +128,25 @@ impl RenderOnce for BlameView {
                             let open = open.clone();
                             Button::new(("blame-commit", ix), short_hash(&id).to_owned())
                                 .ghost()
+                                .compact()
                                 .on_click(move |_, window, cx| open(id.clone(), window, cx))
                                 .into_any_element()
                         }
-                        None => div().child("Uncommitted").into_any_element(),
+                        None => div()
+                            .px(px(SPACE_2))
+                            .text_color(hsla(p.ink_muted))
+                            .child("Uncommitted")
+                            .into_any_element(),
                     };
+                    let hover = hsla(p.bg_hover);
                     div()
+                        .id(("blame-row", ix))
                         .flex()
                         .items_center()
                         .h(px(ROW_DIFF))
                         .gap(px(SPACE_2))
                         .px(px(SPACE_2))
+                        .hover(move |style| style.bg(hover))
                         .text_style(&TEXT_SMALL, cx)
                         .text_color(hsla(p.ink_muted))
                         .child(div().flex_none().w(px(SPACE_8 * 3.)).child(commit))
@@ -161,6 +169,8 @@ impl RenderOnce for BlameView {
                                 .flex_none()
                                 .w(px(SPACE_4 * 3.))
                                 .text_right()
+                                .text_style(&TEXT_CODE_SMALL, cx)
+                                .text_color(hsla(p.ink_muted))
                                 .child(row.line.to_string()),
                         )
                         .child(
@@ -273,7 +283,7 @@ impl RenderOnce for CommitList {
                         .track_focus(&handle)
                         .tab_stop(true)
                         .cursor_pointer()
-                        .rounded(px(RADIUS_SM))
+                        .rounded(px(RADIUS_MD))
                         .hover(move |style| style.bg(hover))
                         .focus_visible(move |style| focus::ring(style, ring))
                         .on_click(move |_, window, cx| open(id.clone(), window, cx))

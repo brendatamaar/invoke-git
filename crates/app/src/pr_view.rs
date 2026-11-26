@@ -11,7 +11,7 @@
 //!   or network until the user opens this panel.
 
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    AppContext, Context, ElementId, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 use invoke_core::forge::{
@@ -23,13 +23,14 @@ use invoke_core::{Event, Head, Snapshot};
 use shell::forge::{ForgeError, ForgeService};
 use shell::read::{read_branch_upstream, read_remotes};
 use tokens::{
-    DIALOG, RADIUS_MD, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM,
-    TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL, TEXT_TITLE,
+    DIALOG, RADIUS_LG, RADIUS_MD, RADIUS_SM, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_6,
+    TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL, TEXT_TITLE,
 };
-use ui::convert::hsla;
+use ui::convert::{hsla, shadows};
+use ui::focus;
 use ui::{
-    Banner, BannerKind, Button, CheckState, Checkbox, Divider, EditorEvent, Pill, Segmented,
-    TextEditor, TextStyleExt, ThemeExt,
+    Banner, BannerKind, Button, CheckState, Checkbox, Divider, EditorEvent, Pill, PillTone,
+    ResizeEdge, ResizeHandle, Segmented, TextEditor, TextStyleExt, ThemeExt,
 };
 
 use crate::forge_accounts::{AccountsEvent, AccountsView, is_web_url, open_service};
@@ -37,6 +38,8 @@ use crate::session::RepoSession;
 
 /// Width of the PR/MR list column.
 const PR_LIST_W: f32 = SIDEBAR + SPACE_4 * 7.0;
+const PR_LIST_MIN: f32 = SIDEBAR;
+const PR_LIST_MAX: f32 = DIALOG + SPACE_4 * 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -100,6 +103,7 @@ pub struct PrPane {
     create_body: Entity<TextEditor>,
     create_draft: bool,
     create_state: CreateState,
+    list_w: f32,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -141,6 +145,7 @@ impl PrPane {
             create_body,
             create_draft: false,
             create_state: CreateState::Idle,
+            list_w: PR_LIST_W,
             _subscriptions: vec![search_sub, session_sub],
         }
     }
@@ -667,7 +672,7 @@ fn kind_prefix(kind: ForgeKind) -> &'static str {
 }
 
 impl Render for PrPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
 
         if self.mode == Mode::Accounts
@@ -835,6 +840,7 @@ impl Render for PrPane {
                     ready.selected,
                     ready.detail.as_ref(),
                     ready.loading_detail,
+                    window,
                     cx,
                 )
                 .into_any_element(),
@@ -887,9 +893,11 @@ impl PrPane {
         selected: Option<u64>,
         detail: Option<&PullRequest>,
         loading_detail: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let p = cx.palette();
+        let ring = focus::ring_color(cx);
         let query = self.search.read(cx).text();
         let visible = filter_prs(prs, query);
         let prefix = kind_prefix(target.account.kind);
@@ -899,14 +907,12 @@ impl PrPane {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(PR_LIST_W))
+            .w(px(self.list_w))
             .h_full()
             .overflow_y_scroll()
             .gap(px(SPACE_1))
             .p(px(SPACE_2))
             .bg(hsla(p.bg_panel))
-            .border_r_1()
-            .border_color(hsla(p.line))
             .child(
                 div()
                     .px(px(SPACE_2))
@@ -938,8 +944,13 @@ impl PrPane {
             let num = pr.number;
             let sel_entity = cx.entity();
             let hover = hsla(p.bg_hover);
+            let row_id = ElementId::from(("pr-row", idx));
+            let handle = focus::handle(&row_id, window, cx);
             let mut row = div()
-                .id(("pr-row", idx))
+                .id(row_id)
+                .track_focus(&handle)
+                .tab_stop(true)
+                .relative()
                 .flex()
                 .flex_col()
                 .gap(px(SPACE_1))
@@ -947,6 +958,7 @@ impl PrPane {
                 .py(px(SPACE_2))
                 .rounded(px(RADIUS_MD))
                 .cursor_pointer()
+                .focus_visible(move |style| focus::ring(style, ring))
                 .on_click(move |_, _, cx| {
                     sel_entity.update(cx, |pane, cx| pane.load_detail(num, cx))
                 })
@@ -979,17 +991,31 @@ impl PrPane {
                         .gap(px(SPACE_2))
                         .text_style(&TEXT_SMALL, cx)
                         .text_color(hsla(p.ink_muted))
-                        .child(pr.author.clone())
-                        .child("·")
+                        .child(div().flex_none().child(pr.author.clone()))
+                        .child(div().flex_none().child("·"))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .truncate()
-                                .child(format!("{} -> {}", pr.head_branch, pr.base_branch)),
+                                .child(format!("{} → {}", pr.head_branch, pr.base_branch)),
                         )
-                        .children(pr.draft.then(|| Pill::new("Draft"))),
+                        .children(
+                            pr.draft
+                                .then(|| Pill::new("Draft").tone(PillTone::Neutral).compact()),
+                        ),
                 );
             row = if is_sel {
-                row.bg(hsla(p.bg_raised))
+                row.bg(hsla(p.bg_raised)).child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(SPACE_1))
+                        .bottom(px(SPACE_1))
+                        .w(px(focus::ACCENT_BAR_W))
+                        .rounded(px(RADIUS_SM))
+                        .bg(hsla(p.accent)),
+                )
             } else {
                 row.hover(move |s| s.bg(hover))
             };
@@ -1035,15 +1061,28 @@ impl PrPane {
                 let web_url = pr.web_url.clone();
                 let can_open = is_web_url(&web_url);
 
-                let state_pill = Pill::new(pr.state.label());
-                let review_pill = Pill::new(pr.review_status.label());
+                let state_label = pr.state.label();
+                let state_tone = match state_label {
+                    "Open" => PillTone::Success,
+                    "Merged" => PillTone::Accent,
+                    "Closed" => PillTone::Danger,
+                    _ => PillTone::Neutral,
+                };
+                let review_label = pr.review_status.label();
+                let review_tone = match review_label {
+                    "Approved" => PillTone::Success,
+                    "Changes requested" => PillTone::Warning,
+                    _ => PillTone::Neutral,
+                };
+                let state_pill = Pill::new(state_label).tone(state_tone);
+                let review_pill = Pill::new(review_label).tone(review_tone);
                 let mut meta = div()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .gap(px(SPACE_2))
                     .child(state_pill)
-                    .children(pr.draft.then(|| Pill::new("Draft")))
+                    .children(pr.draft.then(|| Pill::new("Draft").tone(PillTone::Neutral)))
                     .child(review_pill);
                 if let Some(count) = pr.comments_count {
                     meta = meta.child(
@@ -1099,6 +1138,7 @@ impl PrPane {
                     .min_w(px(0.))
                     .h_full()
                     .overflow_y_scroll()
+                    .bg(hsla(p.bg_panel))
                     .gap(px(SPACE_3))
                     .p(px(SPACE_4))
                     .child(
@@ -1117,7 +1157,7 @@ impl PrPane {
                                     .text_style(&TEXT_SMALL, cx)
                                     .text_color(hsla(p.ink_muted))
                                     .child(format!(
-                                        "by {} · {} -> {}",
+                                        "by {} · {} → {}",
                                         pr.author, head_label, pr.base_branch
                                     )),
                             ),
@@ -1149,12 +1189,27 @@ impl PrPane {
             }
         };
 
+        let resize_list = cx.entity();
         div()
             .flex()
             .flex_1()
             .min_h(px(0.))
             .min_w(px(0.))
             .child(list)
+            .child(ResizeHandle::new(
+                "pr-list-resize",
+                self.list_w,
+                PR_LIST_W,
+                PR_LIST_MIN,
+                PR_LIST_MAX,
+                ResizeEdge::Right,
+                move |width, _, cx| {
+                    resize_list.update(cx, |pane, cx| {
+                        pane.list_w = width;
+                        cx.notify();
+                    });
+                },
+            ))
             .child(detail_pane)
     }
 
@@ -1176,11 +1231,12 @@ impl PrPane {
             .flex_col()
             .w(px(DIALOG))
             .gap(px(SPACE_3))
-            .p(px(SPACE_4))
+            .p(px(SPACE_6))
             .bg(hsla(p.bg_panel))
             .border_1()
             .border_color(hsla(p.line))
-            .rounded(px(RADIUS_MD))
+            .rounded(px(RADIUS_LG))
+            .shadow(shadows(p.shadow_overlay))
             .child(
                 div()
                     .flex()
@@ -1294,7 +1350,7 @@ impl PrPane {
         if let CreateState::Created(pr) = &self.create_state {
             let url = pr.web_url.clone();
             let mut banner = Banner::new(
-                BannerKind::Warning,
+                BannerKind::Success,
                 format!("Created #{}: {}", pr.number, pr.title),
             );
             if is_web_url(&url) {
@@ -1355,32 +1411,21 @@ impl PrPane {
                     .items_center()
                     .justify_between()
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_2))
-                            .child(
-                                Checkbox::new(
-                                    "pr-create-draft",
-                                    if self.create_draft {
-                                        CheckState::Checked
-                                    } else {
-                                        CheckState::Unchecked
-                                    },
-                                )
-                                .on_click(move |_, _, cx| {
-                                    draft_entity.update(cx, |pane, cx| {
-                                        pane.create_draft = !pane.create_draft;
-                                        cx.notify();
-                                    })
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .text_style(&TEXT_SMALL, cx)
-                                    .text_color(hsla(p.ink))
-                                    .child("Create as draft"),
-                            ),
+                        Checkbox::new(
+                            "pr-create-draft",
+                            if self.create_draft {
+                                CheckState::Checked
+                            } else {
+                                CheckState::Unchecked
+                            },
+                        )
+                        .label("Create as draft")
+                        .on_click(move |_, _, cx| {
+                            draft_entity.update(cx, |pane, cx| {
+                                pane.create_draft = !pane.create_draft;
+                                cx.notify();
+                            })
+                        }),
                     )
                     .child(
                         Button::new(

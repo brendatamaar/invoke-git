@@ -1,7 +1,7 @@
 //! Pure conversions from the `tokens` crate to GPUI values. No window or
 //! app is needed, so these are unit and property tested.
 
-use gpui::{Hsla, Pixels, SharedString, px};
+use gpui::{BoxShadow, Hsla, Pixels, SharedString, point, px};
 
 /// A token colour as a GPUI `Rgba` (channels `0.0..=1.0`).
 pub fn rgba(color: tokens::Rgba) -> gpui::Rgba {
@@ -16,6 +16,21 @@ pub fn rgba(color: tokens::Rgba) -> gpui::Rgba {
 /// A token colour as a GPUI `Hsla`.
 pub fn hsla(color: tokens::Rgba) -> Hsla {
     rgba(color).into()
+}
+
+/// A token shadow (one or more CSS-style layers) as GPUI `BoxShadow`s.
+pub fn shadows(shadow: tokens::Shadow) -> Vec<BoxShadow> {
+    shadow
+        .layers
+        .iter()
+        .map(|layer| BoxShadow {
+            color: hsla(layer.color),
+            offset: point(px(layer.offset_x), px(layer.offset_y)),
+            blur_radius: px(layer.blur),
+            spread_radius: px(layer.spread),
+            inset: false,
+        })
+        .collect()
 }
 
 /// A token size (logical pixels) as GPUI pixels.
@@ -69,6 +84,25 @@ mod tests {
                 for channel in [c.r, c.g, c.b, c.a] {
                     assert!((0.0..=1.0).contains(&channel), "{name}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_shadow_converts_all_layers() {
+        for theme in tokens::Theme::ALL {
+            let token_shadow = theme.palette().shadow_overlay;
+            let converted = shadows(token_shadow);
+            assert_eq!(converted.len(), token_shadow.layers.len());
+            assert!(!converted.is_empty());
+            for (gpui_layer, tok_layer) in converted.iter().zip(token_shadow.layers) {
+                assert_eq!(
+                    gpui_layer.offset,
+                    point(px(tok_layer.offset_x), px(tok_layer.offset_y))
+                );
+                assert_eq!(gpui_layer.blur_radius, px(tok_layer.blur));
+                assert_eq!(gpui_layer.spread_radius, px(tok_layer.spread));
+                assert!(!gpui_layer.inset);
             }
         }
     }

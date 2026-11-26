@@ -6,17 +6,18 @@
 //! The model (`RebaseEditorModel`) is pure and tested independently of GPUI.
 
 use gpui::{
-    Context, CursorStyle, EventEmitter, InteractiveElement, IntoElement, MouseButton,
+    Context, CursorStyle, ElementId, EventEmitter, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use invoke_core::{Oid, PlanError, RebaseAction, RebasePlan};
 use tokens::{
-    RADIUS_MD, RADIUS_SM, ROW_LIST, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_6, TEXT_BODY,
-    TEXT_BODY_MEDIUM, TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL, TEXT_TITLE,
+    RADIUS_MD, RADIUS_SM, ROW_LIST, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_6, SPACE_8,
+    TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_CODE_SMALL, TEXT_SMALL, TEXT_TITLE,
 };
 
-use crate::components::{Banner, BannerKind, Button};
+use crate::components::{Banner, BannerKind, Button, Pill, PillTone};
 use crate::convert::hsla;
+use crate::focus;
 use crate::text::TextStyleExt;
 use crate::theme::ThemeExt;
 
@@ -369,8 +370,9 @@ fn format_counts(counts: ActionCounts) -> String {
 }
 
 impl Render for RebaseEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
+        let ring = focus::ring_color(cx);
         let validation = self.model.validation_error();
         let counts = self.model.counts();
         let row_count = self.model.rows().len();
@@ -482,8 +484,12 @@ impl Render for RebaseEditor {
 
             let (up_ent, down_ent, menu_ent) = (cx.entity(), cx.entity(), cx.entity());
 
+            let drag_id = ElementId::from(("rebase-drag", index));
+            let drag_focus = focus::handle(&drag_id, window, cx);
             let handle = div()
-                .id(("rebase-drag", index))
+                .id(drag_id)
+                .track_focus(&drag_focus)
+                .tab_stop(true)
                 .flex()
                 .flex_none()
                 .items_center()
@@ -499,6 +505,7 @@ impl Render for RebaseEditor {
                 .text_style(&TEXT_BODY_MEDIUM, cx)
                 .text_color(hsla(p.ink_faint))
                 .hover(|style| style.bg(hsla(p.bg_hover)).text_color(hsla(p.ink)))
+                .focus_visible(move |style| focus::ring(style, ring))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| this.start_drag(index, cx)),
@@ -513,8 +520,12 @@ impl Render for RebaseEditor {
                 .text_color(hsla(p.ink_faint))
                 .child(format!("{}", index + 1));
 
+            let action_id = ElementId::from(("rebase-action", index));
+            let action_focus = focus::handle(&action_id, window, cx);
             let action_btn = div()
-                .id(("rebase-action", index))
+                .id(action_id)
+                .track_focus(&action_focus)
+                .tab_stop(true)
                 .flex()
                 .flex_none()
                 .items_center()
@@ -531,6 +542,8 @@ impl Render for RebaseEditor {
                     p.line_control
                 }))
                 .cursor_pointer()
+                .hover(|style| style.opacity(0.9))
+                .focus_visible(move |style| focus::ring(style, ring))
                 .text_style(&TEXT_BODY_MEDIUM, cx)
                 .text_color(hsla(badge_fg))
                 .on_click(move |_, _, cx| {
@@ -555,21 +568,13 @@ impl Render for RebaseEditor {
 
             let author = div()
                 .flex_none()
+                .max_w(px(SPACE_8 * 4.))
+                .truncate()
                 .text_style(&TEXT_SMALL, cx)
                 .text_color(hsla(p.ink_faint))
                 .child(row.author.clone());
 
-            let warn_pill = row_warn.map(|msg| {
-                div()
-                    .flex_none()
-                    .px(px(SPACE_2))
-                    .py(px(SPACE_1))
-                    .rounded(px(RADIUS_SM))
-                    .bg(hsla(p.warning_soft))
-                    .text_style(&TEXT_LABEL, cx)
-                    .text_color(hsla(p.warning))
-                    .child(msg)
-            });
+            let warn_pill = row_warn.map(|msg| Pill::new(msg).tone(PillTone::Warning).compact());
 
             let arrows = div()
                 .flex()
@@ -655,38 +660,48 @@ impl Render for RebaseEditor {
                     let chosen = row.action == action;
                     let (abg, afg) = action_colors(action, p);
                     let pick_ent = cx.entity();
-                    menu = menu.child(
-                        div()
-                            .id(("rebase-pick-action", index * 8 + action as usize))
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_1))
-                            .px(px(SPACE_2))
-                            .py(px(SPACE_1))
-                            .rounded(px(RADIUS_SM))
-                            .border_1()
-                            .border_color(hsla(if chosen { p.accent } else { p.line_control }))
-                            .bg(hsla(abg))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(hsla(p.bg_hover)))
-                            .on_click(move |_, _, cx| {
-                                pick_ent.update(cx, |this, cx| {
-                                    this.set_action(index, action, cx);
-                                });
-                            })
-                            .child(
-                                div()
-                                    .text_style(&TEXT_BODY_MEDIUM, cx)
-                                    .text_color(hsla(afg))
-                                    .child(action_label(action)),
-                            )
-                            .child(
-                                div()
-                                    .text_style(&TEXT_SMALL, cx)
-                                    .text_color(hsla(p.ink_muted))
-                                    .child(action_description(action)),
-                            ),
-                    );
+                    let pick_id =
+                        ElementId::from(("rebase-pick-action", index * 8 + action as usize));
+                    let pick_focus = focus::handle(&pick_id, window, cx);
+                    let hover_bg = hsla(p.bg_hover);
+                    let mut pick_item = div()
+                        .id(pick_id)
+                        .track_focus(&pick_focus)
+                        .tab_stop(true)
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_1))
+                        .px(px(SPACE_2))
+                        .py(px(SPACE_1))
+                        .rounded(px(RADIUS_SM))
+                        .border_1()
+                        .border_color(hsla(if chosen { p.accent } else { p.line_control }))
+                        .bg(hsla(abg))
+                        .cursor_pointer()
+                        .focus_visible(move |style| focus::ring(style, ring))
+                        .on_click(move |_, _, cx| {
+                            pick_ent.update(cx, |this, cx| {
+                                this.set_action(index, action, cx);
+                            });
+                        })
+                        .child(
+                            div()
+                                .text_style(&TEXT_BODY_MEDIUM, cx)
+                                .text_color(hsla(afg))
+                                .child(action_label(action)),
+                        )
+                        .child(
+                            div()
+                                .text_style(&TEXT_SMALL, cx)
+                                .text_color(hsla(p.ink_muted))
+                                .child(action_description(action)),
+                        );
+                    pick_item = if chosen {
+                        pick_item.hover(|style| style.opacity(0.9))
+                    } else {
+                        pick_item.hover(move |style| style.bg(hover_bg))
+                    };
+                    menu = menu.child(pick_item);
                 }
                 row_card = row_card.child(menu);
             }

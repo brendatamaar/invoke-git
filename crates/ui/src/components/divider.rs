@@ -1,5 +1,5 @@
 use gpui::{App, IntoElement, RenderOnce, Styled, Window, div, px};
-use tokens::SPACE_4;
+use tokens::ROW_DIFF;
 
 use crate::convert::hsla;
 use crate::theme::ThemeExt;
@@ -25,7 +25,7 @@ impl RenderOnce for Divider {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let line = div().flex_none().bg(hsla(cx.palette().line));
         if self.vertical {
-            line.w(px(1.)).h(px(SPACE_4 + 4.0))
+            line.w(px(1.)).h(px(ROW_DIFF))
         } else {
             line.h(px(1.)).w_full()
         }

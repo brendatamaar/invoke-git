@@ -5,6 +5,7 @@
 mod auth_prompt;
 mod branch_panel;
 mod clone_view;
+mod command_palette;
 mod commit_box;
 mod commit_pane;
 mod commit_search;
@@ -39,7 +40,8 @@ use gpui::{
 };
 
 use workspace::{
-    CloseTab, InitRepository, NewTab, NextTab, OpenRepository, PreviousTab, Refresh, Workspace,
+    CloseTab, FocusNext, FocusPrev, InitRepository, NewTab, NextTab, OpenPalette, OpenRepository,
+    PreviousTab, Refresh, ToggleSearch, Workspace,
 };
 
 fn main() {
@@ -54,9 +56,13 @@ fn main() {
             KeyBinding::new("ctrl-shift-o", InitRepository, None),
             KeyBinding::new("ctrl-t", NewTab, None),
             KeyBinding::new("ctrl-w", CloseTab, None),
+            KeyBinding::new("ctrl-k", OpenPalette, None),
+            KeyBinding::new("ctrl-f", ToggleSearch, None),
             KeyBinding::new("f5", Refresh, None),
             KeyBinding::new("ctrl-tab", NextTab, None),
             KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+            KeyBinding::new("tab", FocusNext, None),
+            KeyBinding::new("shift-tab", FocusPrev, None),
         ]);
         let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
         let restore = persist::load();

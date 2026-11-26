@@ -290,7 +290,7 @@ impl Render for CommitPane {
                 .size_full()
                 .items_center()
                 .justify_center()
-                .p(px(16.))
+                .p(px(tokens::SPACE_4))
                 .bg(hsla(p.bg_panel))
                 .text_style(&TEXT_BODY, cx)
                 .text_color(hsla(p.ink_muted))

@@ -1,5 +1,5 @@
-use gpui::{App, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div, px};
-use tokens::{SPACE_2, TEXT_LABEL};
+use gpui::{App, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div};
+use tokens::TEXT_LABEL;
 
 use crate::convert::hsla;
 use crate::text::TextStyleExt;
@@ -23,7 +23,6 @@ impl SectionLabel {
 impl RenderOnce for SectionLabel {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         div()
-            .px(px(SPACE_2))
             .text_style(&TEXT_LABEL, cx)
             .text_color(hsla(cx.palette().ink_muted))
             .child(self.text)

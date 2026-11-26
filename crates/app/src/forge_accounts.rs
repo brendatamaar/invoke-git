@@ -20,9 +20,10 @@ use invoke_core::forge::{
 };
 use shell::forge::{ForgeError, ForgeService, KeyringStore, ServiceConfig, SignInRunner};
 use tokens::{
-    DIALOG, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_SMALL, TEXT_TITLE,
+    DIALOG, FontFamily, RADIUS_LG, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_6, SPACE_8, TEXT_BODY,
+    TEXT_BODY_MEDIUM, TEXT_SMALL, TEXT_TITLE,
 };
-use ui::convert::hsla;
+use ui::convert::{hsla, shadows};
 use ui::{
     Banner, BannerKind, Button, Divider, EditorEvent, Pill, Segmented, TextEditor, TextStyleExt,
     ThemeExt,
@@ -426,7 +427,7 @@ impl AccountsView {
                         this.token.update(cx, |token, cx| token.set_text("", cx));
                         this.panel = Panel::List;
                         this.notice = Some((
-                            BannerKind::Warning,
+                            BannerKind::Success,
                             format!("Connected {}.", account.label()),
                         ));
                         cx.emit(AccountsEvent::Changed);
@@ -521,6 +522,12 @@ impl Render for AccountsView {
             .flex_col()
             .gap(px(SPACE_4))
             .w(px(DIALOG))
+            .p(px(SPACE_6))
+            .rounded(px(RADIUS_LG))
+            .bg(hsla(p.bg_panel))
+            .border_1()
+            .border_color(hsla(p.line))
+            .shadow(shadows(p.shadow_overlay))
             .child(
                 div()
                     .text_style(&TEXT_TITLE, cx)
@@ -541,6 +548,7 @@ impl Render for AccountsView {
                 .flex_1()
                 .items_center()
                 .justify_center()
+                .p(px(SPACE_8))
                 .child(body);
         }
 
@@ -571,6 +579,7 @@ impl Render for AccountsView {
                         .child(
                             div()
                                 .text_style(&TEXT_TITLE, cx)
+                                .font_family(cx.ui_theme().family(FontFamily::Mono))
                                 .text_color(hsla(p.ink))
                                 .child(user_code),
                         )
@@ -694,6 +703,7 @@ impl Render for AccountsView {
             .flex_1()
             .items_center()
             .justify_center()
+            .p(px(SPACE_8))
             .child(body)
     }
 }

@@ -23,6 +23,7 @@ pub mod graph_view;
 pub mod rebase_editor;
 pub mod ref_labels;
 pub mod reflog_view;
+pub mod resize;
 pub mod scrollbar;
 pub mod sidebar;
 pub mod status_tree;
@@ -37,8 +38,8 @@ pub mod welcome;
 pub use changes::{ChangeList, ListRow, Section, list_rows};
 pub use commit_detail::{CommitDetail, CommitFile, CommitInfo, short_hash, split_message};
 pub use components::{
-    Banner, BannerKind, Button, ButtonKind, CheckState, Checkbox, Divider, Pill, ProgressBar,
-    SectionLabel, Segmented,
+    Banner, BannerKind, Button, ButtonKind, ButtonSize, CheckState, Checkbox, Divider, Icon,
+    IconName, NavTab, NavTabs, Pill, PillTone, ProgressBar, SectionLabel, Segmented,
 };
 pub use diff_view::{
     Around, Content as DiffContent, DiffData, DiffEvent, DiffView, InputsMeta, LfsDiffInfo,
@@ -49,11 +50,14 @@ pub use rebase_editor::{
     ALL_ACTIONS, ActionCounts, RebaseEditor, RebaseEditorEvent, RebaseEditorModel, RebaseRow,
     action_description, action_label, plan_error_message,
 };
-pub use sidebar::{SideAction, SideRow, Sidebar, sidebar_rows};
+pub use resize::{ResizeEdge, ResizeHandle};
+pub use sidebar::{
+    SideAction, SideRow, Sidebar, filter_and_collapse_rows, section_counts, sidebar_rows,
+};
 pub use status_tree::{StatusTree, TreeAction, TreeRow, tree_rows};
 pub use summary::{RepoSummary, Summary};
 pub use tabs::{TabBar, TabItem};
 pub use text::TextStyleExt;
 pub use text_editor::{EditorEvent, TextEditor, bind_keys as bind_editor_keys};
 pub use theme::{ThemeExt, UiTheme, init, set_theme};
-pub use welcome::Welcome;
+pub use welcome::{RecentRepo, Welcome};

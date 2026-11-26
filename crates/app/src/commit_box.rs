@@ -10,7 +10,7 @@ use gpui::{
 use invoke_core::message::{SubjectLevel, subject_hint};
 use invoke_core::{Event, Head, Notice, OpOutcome, Phase, Snapshot};
 use shell::{head_message, merge_message};
-use tokens::{SPACE_2, SPACE_3, TEXT_LABEL, TEXT_SMALL};
+use tokens::{SPACE_2, SPACE_3, TEXT_SMALL};
 use ui::convert::hsla;
 use ui::{
     Button, CheckState, Checkbox, EditorEvent, SectionLabel, TextEditor, TextStyleExt, ThemeExt,
@@ -227,37 +227,27 @@ impl Render for CommitBox {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap(px(SPACE_2))
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_2))
-                            .text_style(&TEXT_LABEL, cx)
-                            .child(
-                                Checkbox::new(
-                                    "amend",
-                                    if self.amend {
-                                        CheckState::Checked
-                                    } else {
-                                        CheckState::Unchecked
-                                    },
-                                )
-                                .on_click(move |_, _, cx| {
-                                    check.update(cx, |this, cx| {
-                                        let next = !this.amend;
-                                        this.set_amend(next, cx)
-                                    })
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .text_style(&TEXT_SMALL, cx)
-                                    .text_color(hsla(p.ink_muted))
-                                    .child("Amend last commit"),
-                            ),
+                        Checkbox::new(
+                            "amend",
+                            if self.amend {
+                                CheckState::Checked
+                            } else {
+                                CheckState::Unchecked
+                            },
+                        )
+                        .label("Amend last commit")
+                        .on_click(move |_, _, cx| {
+                            check.update(cx, |this, cx| {
+                                let next = !this.amend;
+                                this.set_amend(next, cx)
+                            })
+                        }),
                     )
                     .child(
                         div()
+                            .flex_none()
                             .text_style(&TEXT_SMALL, cx)
                             .text_color(hsla(counter_ink))
                             .child(format!("Subject {} / 72", hint.chars)),
@@ -266,6 +256,7 @@ impl Render for CommitBox {
             .child(
                 Button::new("commit", label)
                     .primary()
+                    .full_width()
                     .disabled(!enabled)
                     .on_click(move |_, _, cx| commit.update(cx, |this, cx| this.commit(cx))),
             )

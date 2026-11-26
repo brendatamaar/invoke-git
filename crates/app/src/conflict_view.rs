@@ -12,7 +12,7 @@
 
 use diff::markers::{Block, Take, accept, find_blocks, has_blocks};
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    AppContext, Context, ElementId, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 use invoke_core::{
@@ -21,14 +21,20 @@ use invoke_core::{
 };
 use shell::{read_worktree_file, write_worktree_file};
 use tokens::{
-    RADIUS_MD, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_CODE_SMALL,
-    TEXT_LABEL, TEXT_SMALL,
+    DIALOG, LANE, RADIUS_MD, RADIUS_SM, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4,
+    TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL,
 };
 use ui::convert::hsla;
-use ui::{Button, EditorEvent, TextEditor, TextStyleExt, ThemeExt};
+use ui::focus;
+use ui::{Button, EditorEvent, ResizeEdge, ResizeHandle, TextEditor, TextStyleExt, ThemeExt};
 
 use crate::conflict::{self, Eol, Mode, Why};
 use crate::session::RepoSession;
+
+/// Width bounds of the conflicted-files aside.
+const ASIDE_W: f32 = SIDEBAR + SPACE_4 * 4.0;
+const ASIDE_MIN: f32 = SIDEBAR - SPACE_4;
+const ASIDE_MAX: f32 = DIALOG - SPACE_4 * 2.0;
 
 /// The paused operation, its files and the checked-out branch's name.
 type Paused = (Operation, Vec<(String, FileState)>, String);
@@ -70,6 +76,7 @@ pub struct ConflictPane {
     key: Option<Key>,
     /// Numbers each file read; an answer for an older one is dropped.
     request: u64,
+    aside_w: f32,
     _observe: Subscription,
     _edits: Subscription,
 }
@@ -93,6 +100,7 @@ impl ConflictPane {
             problem: None,
             key: None,
             request: 0,
+            aside_w: ASIDE_W,
             _observe: observe,
             _edits: edits,
         };
@@ -376,6 +384,8 @@ fn code_lines(
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.))
                         .text_color(hsla(p.ink))
                         .whitespace_nowrap()
                         .overflow_hidden()
@@ -387,8 +397,9 @@ fn code_lines(
 }
 
 impl Render for ConflictPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
+        let ring = focus::ring_color(cx);
         let Some((operation, files, head)) = self.paused(cx) else {
             return div()
                 .flex()
@@ -417,7 +428,7 @@ impl Render for ConflictPane {
             .as_ref()
             .map(|c| conflict::progress(c, operation, &head))
             .unwrap_or_default();
-        let mut actions = div().flex().items_center().gap(px(SPACE_2));
+        let mut actions = div().flex().flex_wrap().items_center().gap(px(SPACE_2));
         if self.confirm_abort {
             let (yes, no) = (cx.entity(), cx.entity());
             actions = actions
@@ -527,15 +538,21 @@ impl Render for ConflictPane {
                 FileState::Resolved => ("✓", p.add_ink, "Resolved"),
             };
             let (this, hover, target) = (cx.entity(), hsla(p.bg_hover), path.clone());
+            let row_id = ElementId::from(("conflict-file", index));
+            let handle = focus::handle(&row_id, window, cx);
             let mut row = div()
-                .id(("conflict-file", index))
+                .id(row_id)
+                .track_focus(&handle)
+                .tab_stop(true)
+                .relative()
                 .flex()
                 .items_center()
                 .gap(px(SPACE_2))
-                .h(px(28.))
+                .h(px(ROW_LIST))
                 .px(px(SPACE_2))
                 .rounded(px(RADIUS_MD))
                 .cursor_pointer()
+                .focus_visible(move |style| focus::ring(style, ring))
                 .on_click(move |_, _, cx| {
                     let target = target.clone();
                     this.update(cx, |pane, cx| pane.select(target, cx))
@@ -543,7 +560,7 @@ impl Render for ConflictPane {
                 .child(
                     div()
                         .flex_none()
-                        .w(px(14.))
+                        .w(px(LANE))
                         .text_style(&TEXT_SMALL, cx)
                         .text_color(hsla(mark_colour))
                         .child(mark),
@@ -569,7 +586,16 @@ impl Render for ConflictPane {
                         .child(note),
                 );
             row = if chosen {
-                row.bg(hsla(p.bg_raised))
+                row.bg(hsla(p.bg_raised)).child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(SPACE_1))
+                        .bottom(px(SPACE_1))
+                        .w(px(focus::ACCENT_BAR_W))
+                        .rounded(px(RADIUS_SM))
+                        .bg(hsla(p.accent)),
+                )
             } else {
                 row.hover(move |style| style.bg(hover))
             };
@@ -578,12 +604,10 @@ impl Render for ConflictPane {
         let aside = div()
             .id("conflict-aside")
             .flex_none()
-            .w(px(300.))
+            .w(px(self.aside_w))
             .p(px(SPACE_2))
             .overflow_y_scroll()
             .bg(hsla(p.bg_panel))
-            .border_r_1()
-            .border_color(hsla(p.line))
             .child(list);
 
         // The resolver.
@@ -876,6 +900,7 @@ impl Render for ConflictPane {
             );
         }
 
+        let resize_aside = cx.entity();
         div()
             .flex()
             .flex_col()
@@ -884,7 +909,28 @@ impl Render for ConflictPane {
             .min_h(px(0.))
             .bg(hsla(p.bg_app))
             .child(banner)
-            .child(div().flex().flex_1().min_h(px(0.)).child(aside).child(main))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(aside)
+                    .child(ResizeHandle::new(
+                        "conflict-aside-resize",
+                        self.aside_w,
+                        ASIDE_W,
+                        ASIDE_MIN,
+                        ASIDE_MAX,
+                        ResizeEdge::Right,
+                        move |width, _, cx| {
+                            resize_aside.update(cx, |pane, cx| {
+                                pane.aside_w = width;
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .child(main),
+            )
             .into_any_element()
     }
 }

@@ -12,10 +12,10 @@ use gpui::{
 };
 use shell::blame::{BlameReader, ReadError};
 use shell::history::CommitId;
-use tokens::{SPACE_2, SPACE_3, TEXT_SMALL};
+use tokens::{SPACE_2, SPACE_3, TEXT_BODY_MEDIUM, TEXT_SMALL, TOOLBAR};
 use ui::blame_view::{BlameData, BlameRow, BlameView, CommitList, CommitListRow};
 use ui::time::format_date_time;
-use ui::{Button, Segmented, TextStyleExt, ThemeExt, convert::hsla};
+use ui::{Button, Divider, Segmented, TextStyleExt, ThemeExt, convert::hsla};
 
 #[derive(Clone, Copy)]
 pub enum FileMode {
@@ -215,16 +215,21 @@ impl Render for FileInsights {
             .flex_col()
             .size_full()
             .min_h(px(0.))
+            .bg(hsla(p.bg_panel))
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
                     .gap(px(SPACE_2))
-                    .p(px(SPACE_2))
+                    .h(px(TOOLBAR))
+                    .px(px(SPACE_3))
+                    .border_b_1()
+                    .border_color(hsla(p.line))
                     .child(Button::new("file-insights-back", "Back").ghost().on_click(
                         move |_, _, cx| back.update(cx, |_, cx| cx.emit(FileInsightsEvent::Back)),
                     ))
+                    .child(Divider::vertical())
                     .child(Segmented::new(
                         "file-insight-mode",
                         vec!["Blame".into(), "File history".into()],
@@ -250,8 +255,10 @@ impl Render for FileInsights {
                     ))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .truncate()
-                            .text_style(&TEXT_SMALL, cx)
+                            .text_style(&TEXT_BODY_MEDIUM, cx)
                             .text_color(hsla(p.ink))
                             .child(heading),
                     ),
