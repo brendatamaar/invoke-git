@@ -12,6 +12,14 @@ This is the design system for Invoke Git: colours, type, spacing, radii and fixe
 4. **Dense but readable.** 13px text on 28px rows. Nothing smaller than 11px, and 11px only for uppercase section labels.
 5. **Dark first.** Dark is the default theme and the first one defined; light mirrors every token.
 
+## Repository workspace
+
+- Changes, History, and Pull Requests are the main views. Keep the current repository, worktree, branch, and upstream visible above them.
+- In Changes, keep the staged and unstaged lists and commit composer together. The diff header identifies the selected file and what is being compared.
+- History groups the commit graph and the resizable commit inspector. Commit search, the branch scope, and reflog recovery belong in this view.
+- The toolbar opens Review & push. The review owns the final Push action and shows its destination, remaining files, and unresolved local notes.
+- Show keyboard shortcuts on their controls. Icon-only buttons carry a tooltip and an accessible name.
+
 ## Content fundamentals
 
 - **Plain git words, used exactly.** Stage, unstage, commit, amend, push, pull, fetch, rebase, cherry-pick, stash. Never invent synonyms ("save", "sync", "upload").

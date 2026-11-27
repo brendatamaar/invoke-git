@@ -9,7 +9,9 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, px, uniform_list,
 };
 use invoke_core::{FileChange, StatusSnapshot};
-use tokens::{RADIUS_MD, ROW_LIST, SPACE_2, TEXT_BODY, TEXT_LABEL, TEXT_SMALL};
+use tokens::{
+    LANE, RADIUS_MD, RADIUS_SM, ROW_LIST, SPACE_1, SPACE_2, TEXT_BODY, TEXT_LABEL, TEXT_SMALL,
+};
 
 use crate::convert::hsla;
 use crate::focus;
@@ -167,6 +169,7 @@ impl RenderOnce for ChangeList {
                             .id(id)
                             .track_focus(&handle)
                             .tab_stop(true)
+                            .relative()
                             .flex()
                             .items_center()
                             .gap(px(SPACE_2))
@@ -180,7 +183,7 @@ impl RenderOnce for ChangeList {
                             .child(
                                 div()
                                     .flex_none()
-                                    .w(px(14.))
+                                    .w(px(LANE))
                                     .text_style(&TEXT_SMALL, cx)
                                     .font_weight(gpui::FontWeight(600.0))
                                     .text_color(hsla(colour))
@@ -191,7 +194,18 @@ impl RenderOnce for ChangeList {
                                 on_select(section, path.clone(), window, cx)
                             });
                         if chosen {
-                            row.bg(hsla(p.bg_raised)).into_any_element()
+                            row.bg(hsla(p.bg_raised))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(0.))
+                                        .top(px(SPACE_1))
+                                        .bottom(px(SPACE_1))
+                                        .w(px(focus::ACCENT_BAR_W))
+                                        .rounded(px(RADIUS_SM))
+                                        .bg(hsla(p.accent)),
+                                )
+                                .into_any_element()
                         } else {
                             row.hover(move |style| style.bg(hover)).into_any_element()
                         }

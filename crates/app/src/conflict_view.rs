@@ -12,7 +12,7 @@
 
 use diff::markers::{Block, Take, accept, find_blocks, has_blocks};
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    AppContext, Context, ElementId, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 use invoke_core::{
@@ -21,14 +21,20 @@ use invoke_core::{
 };
 use shell::{read_worktree_file, write_worktree_file};
 use tokens::{
-    RADIUS_MD, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_CODE_SMALL,
-    TEXT_LABEL, TEXT_SMALL,
+    DIALOG, LANE, RADIUS_MD, RADIUS_SM, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4,
+    TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL,
 };
 use ui::convert::hsla;
-use ui::{Button, EditorEvent, TextEditor, TextStyleExt, ThemeExt};
+use ui::focus;
+use ui::{Button, EditorEvent, ResizeEdge, ResizeHandle, TextEditor, TextStyleExt, ThemeExt};
 
 use crate::conflict::{self, Eol, Mode, Why};
 use crate::session::RepoSession;
+
+/// Width bounds of the conflicted-files aside.
+const ASIDE_W: f32 = SIDEBAR + SPACE_4 * 4.0;
+const ASIDE_MIN: f32 = SIDEBAR - SPACE_4;
+const ASIDE_MAX: f32 = DIALOG - SPACE_4 * 2.0;
 
 /// The paused operation, its files and the checked-out branch's name.
 type Paused = (Operation, Vec<(String, FileState)>, String);
@@ -70,6 +76,7 @@ pub struct ConflictPane {
     key: Option<Key>,
     /// Numbers each file read; an answer for an older one is dropped.
     request: u64,
+    aside_w: f32,
     _observe: Subscription,
     _edits: Subscription,
 }
@@ -93,6 +100,7 @@ impl ConflictPane {
             problem: None,
             key: None,
             request: 0,
+            aside_w: ASIDE_W,
             _observe: observe,
             _edits: edits,
         };
@@ -114,15 +122,32 @@ impl ConflictPane {
             .map(|file| (file.path.0.clone(), file.state))
             .collect();
         let head = match &disk.head {
-            Head::Branch { name, .. } => name.0.clone(),
-            _ => "your branch".to_owned(),
+            Head::Branch { name, .. } | Head::Unborn(name) => name.0.clone(),
+            Head::Detached(oid) => format!("HEAD at {}", ui::short_hash(oid.as_hex())),
         };
         Some((operation, files, head))
+    }
+
+    fn next_unresolved(&self, files: &[(String, FileState)]) -> Option<String> {
+        let start = self
+            .selected
+            .as_ref()
+            .and_then(|selected| files.iter().position(|(path, _)| path == selected));
+        files
+            .iter()
+            .cycle()
+            .skip(start.map_or(0, |index| index + 1))
+            .take(files.len())
+            .find(|(path, state)| {
+                self.selected.as_ref() != Some(path) && matches!(state, FileState::Unresolved(_))
+            })
+            .map(|(path, _)| path.clone())
     }
 
     /// The file list moved: keep the choice valid and the resolver current.
     fn session_changed(&mut self, cx: &mut Context<Self>) {
         let Some((operation, files, _)) = self.paused(cx) else {
+            self.request += 1;
             self.selected = None;
             self.load = Load::Nothing;
             self.key = None;
@@ -138,14 +163,11 @@ impl ConflictPane {
                     Some(path) == key.path.as_ref() && matches!(state, FileState::Resolved)
                 })
         });
-        let next_open = files
-            .iter()
-            .find(|(_, state)| matches!(state, FileState::Unresolved(_)))
-            .map(|(path, _)| path.clone());
-        let chosen = self
-            .selected
-            .clone()
-            .filter(|_| !(just_resolved && next_open.is_some()))
+        let next_open = just_resolved
+            .then(|| self.next_unresolved(&files))
+            .flatten();
+        let chosen = next_open
+            .or_else(|| self.selected.clone())
             .filter(|path| files.iter().any(|(p, _)| p == path))
             .or_else(|| {
                 files
@@ -169,7 +191,10 @@ impl ConflictPane {
             self.problem = None;
             match (chosen, state) {
                 (Some(path), Some(FileState::Unresolved(kind))) => self.read_file(path, kind, cx),
-                _ => self.load = Load::Nothing,
+                _ => {
+                    self.request += 1;
+                    self.load = Load::Nothing;
+                }
             }
         }
         cx.notify();
@@ -244,10 +269,11 @@ impl ConflictPane {
         if count == 0 {
             return;
         }
+        let shown = self.block.min(count - 1);
         self.block = if forward {
-            (self.block + 1) % count
+            (shown + 1) % count
         } else {
-            (self.block + count - 1) % count
+            (shown + count - 1) % count
         };
         cx.notify();
     }
@@ -376,6 +402,8 @@ fn code_lines(
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.))
                         .text_color(hsla(p.ink))
                         .whitespace_nowrap()
                         .overflow_hidden()
@@ -387,8 +415,9 @@ fn code_lines(
 }
 
 impl Render for ConflictPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
+        let ring = focus::ring_color(cx);
         let Some((operation, files, head)) = self.paused(cx) else {
             return div()
                 .flex()
@@ -401,23 +430,23 @@ impl Render for ConflictPane {
                 .into_any_element();
         };
         let session = self.session.read(cx);
-        let (conflicts, gate) = match &session.state.snapshot {
-            Snapshot::Read { disk, .. } => (
-                disk.phase.conflicts().cloned(),
-                invoke_core::continue_gate(&disk.phase),
-            ),
-            Snapshot::NotRead => (None, invoke_core::ContinueGate::NotInProgress),
-        };
+        let disk = session.state.snapshot.disk();
+        let gate = disk.map_or(invoke_core::ContinueGate::NotInProgress, |disk| {
+            invoke_core::continue_gate(&disk.phase)
+        });
         let busy = session.state.ops.running.is_some();
         let is_rebase = matches!(operation, Operation::Rebase { .. });
+        let operation_head = disk
+            .filter(|_| is_rebase)
+            .map_or_else(|| head.clone(), crate::rebase_view::origin_label);
         let (current_name, incoming_name) = conflict::side_names(operation, &head);
 
         // The banner.
-        let progress = conflicts
-            .as_ref()
-            .map(|c| conflict::progress(c, operation, &head))
+        let progress = disk
+            .and_then(|disk| disk.phase.conflicts())
+            .map(|c| conflict::progress(c, operation, &operation_head))
             .unwrap_or_default();
-        let mut actions = div().flex().items_center().gap(px(SPACE_2));
+        let mut actions = div().flex().flex_wrap().items_center().gap(px(SPACE_2));
         if self.confirm_abort {
             let (yes, no) = (cx.entity(), cx.entity());
             actions = actions
@@ -426,7 +455,7 @@ impl Render for ConflictPane {
                         .max_w(px(420.))
                         .text_style(&TEXT_SMALL, cx)
                         .text_color(hsla(p.ink))
-                        .child(conflict::abort_question(operation, &head)),
+                        .child(conflict::abort_question(operation, &operation_head)),
                 )
                 .child(
                     Button::new("conflict-abort-yes", conflict::abort_label(operation))
@@ -501,7 +530,7 @@ impl Render for ConflictPane {
                         div()
                             .text_style(&TEXT_BODY_MEDIUM, cx)
                             .text_color(hsla(p.warning))
-                            .child(conflict::title(operation, &head)),
+                            .child(conflict::title(operation, &operation_head)),
                     )
                     .child(
                         div()
@@ -520,6 +549,16 @@ impl Render for ConflictPane {
                 .text_color(hsla(p.ink_muted))
                 .child(format!("FILES · {}", files.len())),
         );
+        if let Some(path) = self.next_unresolved(&files) {
+            let pane = cx.entity();
+            list = list.child(
+                Button::new("conflict-next-file", "Next unresolved file")
+                    .ghost()
+                    .on_click(move |_, _, cx| {
+                        pane.update(cx, |pane, cx| pane.select(path.clone(), cx));
+                    }),
+            );
+        }
         for (index, (path, state)) in files.iter().enumerate() {
             let chosen = self.selected.as_deref() == Some(path.as_str());
             let (mark, mark_colour, note) = match state {
@@ -527,15 +566,21 @@ impl Render for ConflictPane {
                 FileState::Resolved => ("✓", p.add_ink, "Resolved"),
             };
             let (this, hover, target) = (cx.entity(), hsla(p.bg_hover), path.clone());
+            let row_id = ElementId::from(("conflict-file", index));
+            let handle = focus::handle(&row_id, window, cx);
             let mut row = div()
-                .id(("conflict-file", index))
+                .id(row_id)
+                .track_focus(&handle)
+                .tab_stop(true)
+                .relative()
                 .flex()
                 .items_center()
                 .gap(px(SPACE_2))
-                .h(px(28.))
+                .h(px(ROW_LIST))
                 .px(px(SPACE_2))
                 .rounded(px(RADIUS_MD))
                 .cursor_pointer()
+                .focus_visible(move |style| focus::ring(style, ring))
                 .on_click(move |_, _, cx| {
                     let target = target.clone();
                     this.update(cx, |pane, cx| pane.select(target, cx))
@@ -543,7 +588,7 @@ impl Render for ConflictPane {
                 .child(
                     div()
                         .flex_none()
-                        .w(px(14.))
+                        .w(px(LANE))
                         .text_style(&TEXT_SMALL, cx)
                         .text_color(hsla(mark_colour))
                         .child(mark),
@@ -569,7 +614,16 @@ impl Render for ConflictPane {
                         .child(note),
                 );
             row = if chosen {
-                row.bg(hsla(p.bg_raised))
+                row.bg(hsla(p.bg_raised)).child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(SPACE_1))
+                        .bottom(px(SPACE_1))
+                        .w(px(focus::ACCENT_BAR_W))
+                        .rounded(px(RADIUS_SM))
+                        .bg(hsla(p.accent)),
+                )
             } else {
                 row.hover(move |style| style.bg(hover))
             };
@@ -578,12 +632,10 @@ impl Render for ConflictPane {
         let aside = div()
             .id("conflict-aside")
             .flex_none()
-            .w(px(300.))
+            .w(px(self.aside_w))
             .p(px(SPACE_2))
             .overflow_y_scroll()
             .bg(hsla(p.bg_panel))
-            .border_r_1()
-            .border_color(hsla(p.line))
             .child(list);
 
         // The resolver.
@@ -666,6 +718,10 @@ impl Render for ConflictPane {
                             );
                         }
                         main = main
+                            .child(note_line(
+                                format!("Current · {current_name}    Incoming · {incoming_name}"),
+                                cx,
+                            ))
                             .child(
                                 div()
                                     .text_style(&TEXT_BODY, cx)
@@ -694,7 +750,7 @@ impl Render for ConflictPane {
                                 head_row = head_row
                                     .child(note_line(
                                         format!(
-                                            "Conflict {} of {} · lines {}–{}",
+                                            "Block {} of {} remaining · lines {}–{}",
                                             shown + 1,
                                             blocks.len(),
                                             block.first_line,
@@ -704,33 +760,38 @@ impl Render for ConflictPane {
                                     ))
                                     .child(div().flex_1())
                                     .child(
-                                        Button::new("conflict-prev", "Previous").ghost().on_click(
-                                            move |_, _, cx| {
+                                        Button::new("conflict-prev", "Previous block")
+                                            .ghost()
+                                            .on_click(move |_, _, cx| {
                                                 prev.update(cx, |t, cx| t.step(false, cx))
-                                            },
-                                        ),
+                                            }),
                                     )
-                                    .child(Button::new("conflict-next", "Next").ghost().on_click(
-                                        move |_, _, cx| next.update(cx, |t, cx| t.step(true, cx)),
-                                    ))
                                     .child(
-                                        Button::new("conflict-current", "Accept current").on_click(
-                                            move |_, _, cx| {
+                                        Button::new("conflict-next", "Next block")
+                                            .ghost()
+                                            .on_click(move |_, _, cx| {
+                                                next.update(cx, |t, cx| t.step(true, cx))
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("conflict-current", "Accept current block")
+                                            .on_click(move |_, _, cx| {
                                                 cur.update(cx, |t, cx| t.take(Take::Current, cx))
-                                            },
-                                        ),
+                                            }),
                                     )
                                     .child(
-                                        Button::new("conflict-incoming", "Accept incoming")
+                                        Button::new("conflict-incoming", "Accept incoming block")
                                             .on_click(move |_, _, cx| {
                                                 inc.update(cx, |t, cx| t.take(Take::Incoming, cx))
                                             }),
                                     )
-                                    .child(Button::new("conflict-both", "Accept both").on_click(
-                                        move |_, _, cx| {
-                                            both.update(cx, |t, cx| t.take(Take::Both, cx))
-                                        },
-                                    ));
+                                    .child(
+                                        Button::new("conflict-both", "Accept both sides").on_click(
+                                            move |_, _, cx| {
+                                                both.update(cx, |t, cx| t.take(Take::Both, cx))
+                                            },
+                                        ),
+                                    );
                             }
                             None => {
                                 head_row = head_row.child(note_line(
@@ -859,7 +920,7 @@ impl Render for ConflictPane {
                                 .child(div().p(px(SPACE_2)).child(self.editor.clone())),
                         );
                         main = main.child(note_line(
-                            "Accept a side, combine both, or edit the result directly. Mark the file resolved when no conflict markers are left."
+                            "Accept updates the result for the selected block. Mark file resolved writes and stages the result."
                                 .to_owned(),
                             cx,
                         ));
@@ -876,6 +937,7 @@ impl Render for ConflictPane {
             );
         }
 
+        let resize_aside = cx.entity();
         div()
             .flex()
             .flex_col()
@@ -884,7 +946,28 @@ impl Render for ConflictPane {
             .min_h(px(0.))
             .bg(hsla(p.bg_app))
             .child(banner)
-            .child(div().flex().flex_1().min_h(px(0.)).child(aside).child(main))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(aside)
+                    .child(ResizeHandle::new(
+                        "conflict-aside-resize",
+                        self.aside_w,
+                        ASIDE_W,
+                        ASIDE_MIN,
+                        ASIDE_MAX,
+                        ResizeEdge::Right,
+                        move |width, _, cx| {
+                            resize_aside.update(cx, |pane, cx| {
+                                pane.aside_w = width;
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .child(main),
+            )
             .into_any_element()
     }
 }

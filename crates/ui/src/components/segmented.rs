@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px,
+    App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, RenderOnce,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
-use tokens::{RADIUS_MD, RADIUS_SM, SPACE_1, SPACE_3, TEXT_SMALL};
+use tokens::{RADIUS_MD, RADIUS_SM, SPACE_1, SPACE_2, SPACE_6, TEXT_SMALL};
 
 use crate::convert::hsla;
 use crate::focus;
@@ -14,7 +14,7 @@ use crate::theme::ThemeExt;
 type OnSelect = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 /// A group of mutually exclusive choices (the Split and Unified switch): a
-/// `bg-app` well with the chosen option raised.
+/// `bg-app` well with a hairline `line` border and the chosen option raised.
 #[derive(IntoElement)]
 pub struct Segmented {
     id: SharedString,
@@ -46,23 +46,29 @@ impl RenderOnce for Segmented {
         let mut group = div()
             .flex()
             .flex_none()
+            .items_center()
+            .gap(px(SPACE_1 / 2.0))
             .p(px(SPACE_1 / 2.0))
             .rounded(px(RADIUS_MD))
-            .bg(hsla(p.bg_app));
+            .bg(hsla(p.bg_app))
+            .border_1()
+            .border_color(hsla(p.line));
         for (index, label) in self.options.into_iter().enumerate() {
             let id = ElementId::from((self.id.clone(), index));
             let handle = focus::handle(&id, window, cx);
             let chosen = index == self.selected;
             let on_select = self.on_select.clone();
             let hover = hsla(p.bg_hover);
+            let ink = hsla(p.ink);
             let mut option = div()
                 .id(id)
                 .track_focus(&handle)
                 .tab_stop(true)
                 .flex()
                 .items_center()
-                .h(px(24.))
-                .px(px(SPACE_3 - 2.0))
+                .whitespace_nowrap()
+                .h(px(SPACE_6))
+                .px(px(SPACE_2))
                 .rounded(px(RADIUS_SM))
                 .text_style(&TEXT_SMALL, cx)
                 .text_color(hsla(if chosen { p.ink } else { p.ink_muted }))
@@ -71,9 +77,9 @@ impl RenderOnce for Segmented {
                 .on_click(move |_, window, cx| on_select(index, window, cx))
                 .child(label);
             option = if chosen {
-                option.bg(hsla(p.bg_raised))
+                option.bg(hsla(p.bg_raised)).font_weight(FontWeight(500.0))
             } else {
-                option.hover(move |style| style.bg(hover))
+                option.hover(move |style| style.bg(hover).text_color(ink))
             };
             group = group.child(option);
         }

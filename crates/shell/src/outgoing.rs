@@ -31,6 +31,9 @@ pub struct OutgoingCommit {
 pub struct Outgoing {
     /// The tip that would be pushed.
     pub head: String,
+    /// The exact target and excluded commits used by this comparison.
+    pub upstream_tip: Option<String>,
+    pub excluded_tips: Vec<String>,
     /// The commit the combined diff starts from: where the branch left what
     /// the remote has. `None` compares with the empty tree.
     pub base: Option<String>,
@@ -141,8 +144,13 @@ pub fn read_outgoing(paths: &RepoPaths, upstream: Option<&str>) -> Result<Outgoi
         None => repo.empty_tree(),
     };
     let files = commit_detail::changed_files(&repo, &old_tree, &new_tree)?;
+    let mut excluded_tips: Vec<_> = hidden.into_iter().map(|id| id.to_string()).collect();
+    excluded_tips.sort_unstable();
+    excluded_tips.dedup();
     Ok(Outgoing {
         head: head.to_string(),
+        upstream_tip: upstream_tip.map(|id| id.to_string()),
+        excluded_tips,
         base: base.map(|id| id.to_string()),
         commits,
         truncated,

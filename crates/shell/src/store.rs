@@ -56,6 +56,74 @@ fn failed(what: &str, error: impl std::fmt::Display) -> String {
     format!("{what}: {error}")
 }
 
+/// UI state for a single worktree, independent of notes and undo schema versions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorktreeUi {
+    pub history: bool,
+    pub sidebar: f32,
+    pub changes: f32,
+    pub details: f32,
+    pub draft: String,
+}
+
+pub fn load_worktree_ui(path: &Path, key: &str) -> Option<WorktreeUi> {
+    let conn =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.busy_timeout(std::time::Duration::from_millis(100))
+        .ok()?;
+    conn.query_row(
+        "SELECT history, sidebar, changes, details, draft FROM worktree_ui WHERE path = ?1",
+        [key],
+        |row| {
+            Ok(WorktreeUi {
+                history: row.get(0)?,
+                sidebar: row.get(1)?,
+                changes: row.get(2)?,
+                details: row.get(3)?,
+                draft: row.get(4)?,
+            })
+        },
+    )
+    .ok()
+}
+
+pub fn save_worktree_ui(path: &Path, key: &str, state: &WorktreeUi) -> Result<(), String> {
+    if let Some(folder) = path.parent() {
+        std::fs::create_dir_all(folder)
+            .map_err(|error| failed("create the UI data folder", error))?;
+    }
+    let conn = Connection::open(path).map_err(|error| failed("open UI preferences", error))?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))
+        .and_then(|()| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS worktree_ui (
+                path TEXT PRIMARY KEY, history INTEGER NOT NULL,
+                sidebar REAL NOT NULL, changes REAL NOT NULL, details REAL NOT NULL,
+                draft TEXT NOT NULL
+            );",
+            )
+        })
+        .and_then(|()| {
+            conn.execute(
+                "INSERT INTO worktree_ui (path, history, sidebar, changes, details, draft)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path) DO UPDATE SET history = excluded.history,
+                sidebar = excluded.sidebar, changes = excluded.changes,
+                details = excluded.details, draft = excluded.draft",
+                params![
+                    key,
+                    state.history,
+                    state.sidebar,
+                    state.changes,
+                    state.details,
+                    state.draft
+                ],
+            )
+        })
+        .map(|_| ())
+        .map_err(|error| failed("save UI preferences", error))
+}
+
 impl Store {
     /// Opens (or creates) the database at `path`, creating its folder too.
     pub fn open(path: &Path) -> Result<Self, String> {

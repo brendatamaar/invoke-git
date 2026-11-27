@@ -10,8 +10,8 @@ use gpui::{
 };
 use invoke_core::FileChange;
 use tokens::{
-    RADIUS_MD, ROW_LIST, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_CODE_SMALL,
-    TEXT_LABEL, TEXT_SMALL, TEXT_TITLE,
+    LANE, RADIUS_MD, RADIUS_SM, ROW_LIST, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY,
+    TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL, TEXT_TITLE,
 };
 
 use crate::changes::letter;
@@ -153,6 +153,7 @@ impl RenderOnce for CommitDetail {
                     div()
                         .flex_1()
                         .min_w(px(0.))
+                        .truncate()
                         .text_style(value_style, cx)
                         .text_color(hsla(p.ink))
                         .child(value),
@@ -216,6 +217,7 @@ impl RenderOnce for CommitDetail {
                         .id(id)
                         .track_focus(&handle)
                         .tab_stop(true)
+                        .relative()
                         .flex()
                         .w_full()
                         .items_center()
@@ -230,7 +232,7 @@ impl RenderOnce for CommitDetail {
                         .child(
                             div()
                                 .flex_none()
-                                .w(px(14.))
+                                .w(px(LANE))
                                 .text_style(&TEXT_SMALL, cx)
                                 .font_weight(gpui::FontWeight(600.0))
                                 .text_color(hsla(change_colour(&file.change, p)))
@@ -245,7 +247,18 @@ impl RenderOnce for CommitDetail {
                         )
                         .on_click(move |_, window, cx| on_select(index, window, cx));
                     if selected == Some(index) {
-                        row.bg(hsla(p.bg_raised)).into_any_element()
+                        row.bg(hsla(p.bg_raised))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(0.))
+                                    .top(px(SPACE_1))
+                                    .bottom(px(SPACE_1))
+                                    .w(px(focus::ACCENT_BAR_W))
+                                    .rounded(px(RADIUS_SM))
+                                    .bg(hsla(p.accent)),
+                            )
+                            .into_any_element()
                     } else {
                         row.hover(move |style| style.bg(hover)).into_any_element()
                     }
@@ -315,6 +328,7 @@ impl RenderOnce for CommitDetail {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .flex_none()
                     .gap(px(SPACE_2))
                     .child(copy_hash)

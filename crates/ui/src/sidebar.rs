@@ -3,6 +3,7 @@
 //! and tags, in sections. The rows are pure (refs in, rows out); the
 //! component draws them and reports what the user asked for.
 
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui::{
@@ -10,8 +11,11 @@ use gpui::{
     StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use invoke_core::{AdvancedSnapshot, Head, RefsSnapshot, StashEntry, SubmoduleState, Tracking};
-use tokens::{RADIUS_MD, RADIUS_SM, ROW_LIST, SPACE_1, SPACE_2, TEXT_BODY, TEXT_LABEL, TEXT_SMALL};
+use tokens::{
+    RADIUS_MD, RADIUS_SM, ROW_DIFF, ROW_LIST, SPACE_1, SPACE_2, TEXT_BODY, TEXT_LABEL, TEXT_SMALL,
+};
 
+use crate::components::{Button, Icon, IconName};
 use crate::convert::hsla;
 use crate::focus;
 use crate::scrollbar::Scrollbar;
@@ -76,6 +80,10 @@ pub enum SideAction {
     /// P10: update (`--init --recursive`) or sync (`--recursive`) a submodule.
     SubmoduleUpdate(Option<String>),
     SubmoduleSync(Option<String>),
+    /// Toggle collapse/expand on a section header.
+    ToggleSection(String),
+    /// Trigger the inline creation/action button on a section header.
+    SectionAction(String),
 }
 
 fn tracking_text(tracking: Tracking) -> String {
@@ -213,11 +221,90 @@ pub fn sidebar_rows(
     rows
 }
 
+/// Count items under each `SideRow::Header`.
+pub fn section_counts(rows: &[SideRow]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    let mut current: Option<&str> = None;
+    for row in rows {
+        match row {
+            SideRow::Header(title) => {
+                current = Some(title.as_str());
+                counts.entry(title.clone()).or_insert(0);
+            }
+            _ => {
+                if let Some(section) = current {
+                    *counts.entry(section.to_owned()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+fn row_matches(row: &SideRow, needle: &str) -> bool {
+    match row {
+        SideRow::Header(_) => false,
+        SideRow::Local { name, .. } => name.to_lowercase().contains(needle),
+        SideRow::Remote(name) | SideRow::Tag(name) => name.to_lowercase().contains(needle),
+        SideRow::Stash { label, .. } => label.to_lowercase().contains(needle),
+        SideRow::Worktree { label, branch, .. } => {
+            label.to_lowercase().contains(needle) || branch.to_lowercase().contains(needle)
+        }
+        SideRow::Submodule { path, name, .. } => {
+            path.to_lowercase().contains(needle) || name.to_lowercase().contains(needle)
+        }
+    }
+}
+
+/// Filters sidebar rows by case-insensitive substring `query` and hides items
+/// under sections listed in `collapsed` when `query` is blank.
+pub fn filter_and_collapse_rows(
+    rows: &[SideRow],
+    query: &str,
+    collapsed: &HashSet<String>,
+) -> Vec<SideRow> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        let mut out = Vec::with_capacity(rows.len());
+        let mut hidden = false;
+        for row in rows {
+            match row {
+                SideRow::Header(title) => {
+                    hidden = collapsed.contains(title);
+                    out.push(row.clone());
+                }
+                _ if !hidden => out.push(row.clone()),
+                _ => {}
+            }
+        }
+        return out;
+    }
+    let mut out = Vec::new();
+    let mut pending_header: Option<SideRow> = None;
+    for row in rows {
+        match row {
+            SideRow::Header(_) => pending_header = Some(row.clone()),
+            _ if row_matches(row, &needle) => {
+                if let Some(header) = pending_header.take() {
+                    out.push(header);
+                }
+                out.push(row.clone());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 type OnAction = Rc<dyn Fn(SideAction, &mut Window, &mut App)>;
 
 #[derive(IntoElement)]
 pub struct Sidebar {
     rows: Rc<[SideRow]>,
+    collapsed: Rc<HashSet<String>>,
+    counts: Rc<HashMap<String, usize>>,
+    section_actions: Rc<HashSet<String>>,
+    filtering: bool,
     on_action: OnAction,
 }
 
@@ -228,8 +315,32 @@ impl Sidebar {
     ) -> Self {
         Self {
             rows: rows.into(),
+            collapsed: Rc::new(HashSet::new()),
+            counts: Rc::new(HashMap::new()),
+            section_actions: Rc::new(HashSet::new()),
+            filtering: false,
             on_action: Rc::new(on_action),
         }
+    }
+
+    pub fn collapsed(mut self, collapsed: HashSet<String>) -> Self {
+        self.collapsed = Rc::new(collapsed);
+        self
+    }
+
+    pub fn counts(mut self, counts: HashMap<String, usize>) -> Self {
+        self.counts = Rc::new(counts);
+        self
+    }
+
+    pub fn section_actions(mut self, actions: HashSet<String>) -> Self {
+        self.section_actions = Rc::new(actions);
+        self
+    }
+
+    pub fn filtering(mut self, filtering: bool) -> Self {
+        self.filtering = filtering;
+        self
     }
 }
 
@@ -267,42 +378,109 @@ fn base_row(
 }
 
 /// The strip of actions at the right end of a row, drawn over the row's text
-/// with the hover colour behind it.
-fn overlay(_background: gpui::Hsla) -> gpui::Div {
-    div()
+/// with the hover colour behind it, positioned left of the always-visible `"···"`
+/// trigger so the trigger stays clickable even while the row is hovered.
+fn overlay(background: gpui::Hsla, open: bool) -> gpui::Div {
+    let base = div()
         .absolute()
-        .left(px(0.))
-        .right(px(0.))
+        .right(px(ROW_DIFF + SPACE_2 + SPACE_1))
         .top(px(0.))
         .h(px(ROW_LIST))
+        .pl(px(SPACE_2))
         .flex()
         .items_center()
         .justify_end()
+        .gap(px(SPACE_1))
+        .bg(background)
+        .rounded(px(RADIUS_MD));
+    if open {
+        base.opacity(1.)
+    } else {
+        base.opacity(0.)
+            .group_hover("side-row", |style| style.opacity(1.))
+    }
 }
 
-/// A small text button that shows only while its row is hovered.
+/// An always-visible, focusable button that opens or closes a row's actions
+/// for keyboard users (and mouse users who prefer clicking a menu trigger).
+fn row_menu_trigger(
+    index: usize,
+    open: bool,
+    open_state: gpui::Entity<Option<usize>>,
+    ring: gpui::Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) -> (gpui::FocusHandle, gpui::Stateful<gpui::Div>) {
+    let p = cx.palette();
+    let id = ElementId::from(("side-menu", index));
+    let handle = focus::handle(&id, window, cx);
+    let hover_bg = hsla(p.bg_raised);
+    let hover_ink = hsla(p.ink);
+    let button = div()
+        .id(id)
+        .track_focus(&handle)
+        .tab_stop(true)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(ROW_DIFF))
+        .rounded(px(RADIUS_SM))
+        .text_style(&TEXT_SMALL, cx)
+        .text_color(hsla(if open { p.ink } else { p.ink_muted }))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover_bg).text_color(hover_ink))
+        .focus_visible(move |style| focus::inset_ring(style, ring))
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            open_state.update(cx, |slot, cx| {
+                *slot = if *slot == Some(index) {
+                    None
+                } else {
+                    Some(index)
+                };
+                cx.notify();
+            });
+        })
+        .child("···");
+    (handle, button)
+}
+
+/// A small text button shown inside a row's action strip (focusable when open).
+#[allow(clippy::too_many_arguments)]
 fn row_action(
     id: ElementId,
     label: &'static str,
     danger: bool,
-    cx: &App,
-    background: gpui::Hsla,
+    open: bool,
+    open_state: gpui::Entity<Option<usize>>,
+    ring: gpui::Hsla,
+    window: &mut Window,
+    cx: &mut App,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let p = cx.palette();
+    let action_hover = hsla(p.bg_raised);
+    let handle = focus::handle_with_tab_stop(&id, open, window, cx);
     div()
         .id(id)
+        .track_focus(&handle)
+        .tab_stop(open)
         .flex_none()
-        .px(px(SPACE_1 + 2.0))
-        .h_full()
+        .px(px(SPACE_2))
+        .h(px(ROW_DIFF))
+        .rounded(px(RADIUS_SM))
         .flex()
         .items_center()
-        .bg(background)
         .text_style(&TEXT_SMALL, cx)
+        .font_weight(FontWeight(500.0))
         .text_color(hsla(if danger { p.danger } else { p.accent }))
         .cursor_pointer()
+        .hover(move |style| style.bg(action_hover))
+        .focus_visible(move |style| focus::inset_ring(style, ring))
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
+            open_state.update(cx, |slot, _| *slot = None);
             on_click(window, cx)
         })
         .child(label)
@@ -314,25 +492,92 @@ impl RenderOnce for Sidebar {
             .use_keyed_state("sidebar-scroll", cx, |_, _| UniformListScrollHandle::new())
             .read(cx)
             .clone();
+        let open_row = window.use_keyed_state("sidebar-open-row", cx, |_, _| None::<usize>);
         let count = self.rows.len();
         let rows = self.rows.clone();
+        let collapsed = self.collapsed.clone();
+        let counts = self.counts.clone();
+        let section_actions = self.section_actions.clone();
+        let filtering = self.filtering;
         let on_action = self.on_action;
         let list = uniform_list("sidebar", count, move |range, window, cx| {
             let p = cx.palette();
             let ring = focus::ring_color(cx);
+            let open_index = *open_row.read(cx);
             range
                 .map(|index| {
                     let hover = hsla(p.bg_hover);
+                    let is_open = open_index == Some(index);
                     match &rows[index] {
-                        SideRow::Header(title) => div()
-                            .flex()
-                            .items_center()
-                            .h(px(ROW_LIST))
-                            .px(px(SPACE_2))
-                            .text_style(&TEXT_LABEL, cx)
-                            .text_color(hsla(p.ink_muted))
-                            .child(title.clone())
-                            .into_any_element(),
+                        SideRow::Header(title) => {
+                            let is_collapsed = !filtering && collapsed.contains(title);
+                            let total = counts.get(title).copied();
+                            let has_action = section_actions.contains(title);
+                            let toggle = on_action.clone();
+                            let action_cb = on_action.clone();
+                            let t1 = title.clone();
+                            let t2 = title.clone();
+                            let header_id = ElementId::from(("side-header", index));
+                            let handle = focus::handle(&header_id, window, cx);
+                            let label_text = match total {
+                                Some(n) => format!("{title} · {n}"),
+                                None => title.clone(),
+                            };
+                            let action_button = has_action.then(|| {
+                                let is_sub = title == "SUBMODULES";
+                                let btn = if is_sub {
+                                    Button::new(("side-sec-act", index), "Update")
+                                        .icon(IconName::Refresh)
+                                        .ghost()
+                                        .compact()
+                                } else {
+                                    Button::new(("side-sec-act", index), "")
+                                        .icon(IconName::Plus)
+                                        .ghost()
+                                        .compact()
+                                };
+                                btn.on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    action_cb(SideAction::SectionAction(t2.clone()), window, cx);
+                                })
+                            });
+                            div()
+                                .id(header_id)
+                                .track_focus(&handle)
+                                .tab_stop(true)
+                                .flex()
+                                .items_center()
+                                .gap(px(SPACE_1))
+                                .h(px(ROW_LIST))
+                                .px(px(SPACE_2))
+                                .rounded(px(RADIUS_MD))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(hover))
+                                .focus_visible(move |style| focus::inset_ring(style, ring))
+                                .on_click(move |_, window, cx| {
+                                    toggle(SideAction::ToggleSection(t1.clone()), window, cx);
+                                })
+                                .child(
+                                    Icon::new(if is_collapsed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .small()
+                                    .color(p.ink_faint),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_style(&TEXT_LABEL, cx)
+                                        .text_color(hsla(p.ink_muted))
+                                        .child(label_text),
+                                )
+                                .children(action_button)
+                                .into_any_element()
+                        }
                         SideRow::Local {
                             name,
                             current,
@@ -346,57 +591,81 @@ impl RenderOnce for Sidebar {
                             );
                             let (n1, n2, n3, n4) =
                                 (name.clone(), name.clone(), name.clone(), name.clone());
+                            let is_current = *current;
                             let dot = div()
                                 .flex_none()
-                                .size(px(8.))
-                                .rounded(px(4.))
-                                .bg(hsla(if *current { p.accent } else { p.line_control }));
+                                .size(px(WORKTREE_DOT_SIZE))
+                                .rounded(px(WORKTREE_DOT_RADIUS))
+                                .bg(hsla(if is_current { p.accent } else { p.line_control }));
                             let mut row =
                                 base_row(ElementId::from(("side-local", index)), window, cx, ring)
                                     .cursor_pointer()
                                     .hover(move |style| style.bg(hover))
                                     .on_click(move |event, window, cx| {
-                                        if event.click_count() >= 2 {
+                                        if (event.click_count() >= 2 || event.is_keyboard())
+                                            && !is_current
+                                        {
                                             open(SideAction::Switch(n4.clone()), window, cx)
                                         }
-                                    })
-                                    .child(dot)
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .truncate()
-                                            .group_hover("side-row", |style| {
-                                                style.pr(px(ROW_ACTIONS_W))
-                                            })
-                                            .font_weight(FontWeight(if *current {
-                                                600.0
-                                            } else {
-                                                400.0
-                                            }))
-                                            .text_color(hsla(p.ink))
-                                            .child(name.clone()),
-                                    );
+                                    });
+                            if is_open {
+                                row = row.bg(hover);
+                            } else if is_current {
+                                row = row.bg(hsla(p.bg_raised));
+                            }
+                            if is_current {
+                                row = row.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(0.))
+                                        .top(px(SPACE_1))
+                                        .bottom(px(SPACE_1))
+                                        .w(px(focus::ACCENT_BAR_W))
+                                        .rounded(px(RADIUS_SM))
+                                        .bg(hsla(p.accent)),
+                                );
+                            }
+                            let mut name_cell = div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .group_hover("side-row", |style| style.pr(px(ROW_ACTIONS_W)))
+                                .font_weight(FontWeight(if is_current { 600.0 } else { 400.0 }))
+                                .text_color(hsla(p.ink))
+                                .child(name.clone());
+                            if is_open {
+                                name_cell = name_cell.pr(px(ROW_ACTIONS_W));
+                            }
+                            row = row.child(dot).child(name_cell);
                             if let Some(text) = tracking {
                                 row = row.child(
                                     div()
                                         .flex_none()
                                         .text_style(&TEXT_SMALL, cx)
-                                        .text_color(hsla(p.ink_faint))
+                                        .text_color(hsla(p.ink_muted))
                                         .child(text.clone()),
                                 );
                             }
-                            let actions = overlay(hover)
-                                .gap(px(SPACE_1))
-                                .opacity(0.)
-                                .group_hover("side-row", |style| style.opacity(1.))
-                                .children((!*current).then(|| {
+                            let (menu_handle, menu_trigger) = row_menu_trigger(
+                                index,
+                                is_open,
+                                open_row.clone(),
+                                ring,
+                                window,
+                                cx,
+                            );
+                            row = row.child(menu_trigger);
+                            let actions = overlay(hover, is_open)
+                                .children((!is_current).then(|| {
                                     row_action(
                                         ElementId::from(("side-switch", index)),
                                         "Switch",
                                         false,
+                                        is_open,
+                                        open_row.clone(),
+                                        ring,
+                                        window,
                                         cx,
-                                        hover,
                                         move |w, c| switch(SideAction::Switch(n1.clone()), w, c),
                                     )
                                 }))
@@ -404,51 +673,107 @@ impl RenderOnce for Sidebar {
                                     ElementId::from(("side-rename", index)),
                                     "Rename",
                                     false,
+                                    is_open,
+                                    open_row.clone(),
+                                    ring,
+                                    window,
                                     cx,
-                                    hover,
                                     move |w, c| rename(SideAction::Rename(n2.clone()), w, c),
                                 ))
-                                .children((!*current).then(|| {
+                                .children((!is_current).then(|| {
                                     row_action(
                                         ElementId::from(("side-delete", index)),
                                         "Delete",
                                         true,
+                                        is_open,
+                                        open_row.clone(),
+                                        ring,
+                                        window,
                                         cx,
-                                        hover,
                                         move |w, c| delete(SideAction::Delete(n3.clone()), w, c),
+                                    )
+                                }))
+                                .children(is_open.then(|| {
+                                    row_action(
+                                        ElementId::from(("side-local-close", index)),
+                                        "×",
+                                        false,
+                                        true,
+                                        open_row.clone(),
+                                        ring,
+                                        window,
+                                        cx,
+                                        move |window, cx| menu_handle.focus(window, cx),
                                     )
                                 }));
                             row.child(actions).into_any_element()
                         }
                         SideRow::Remote(name) => {
-                            let checkout = on_action.clone();
-                            let n = name.clone();
-                            let actions = overlay(hover)
-                                .opacity(0.)
-                                .group_hover("side-row", |style| style.opacity(1.))
+                            let (checkout, activate) = (on_action.clone(), on_action.clone());
+                            let (n1, n2) = (name.clone(), name.clone());
+                            let (menu_handle, menu_trigger) = row_menu_trigger(
+                                index,
+                                is_open,
+                                open_row.clone(),
+                                ring,
+                                window,
+                                cx,
+                            );
+                            let actions = overlay(hover, is_open)
                                 .child(row_action(
                                     ElementId::from(("side-checkout", index)),
                                     "Check out",
                                     false,
+                                    is_open,
+                                    open_row.clone(),
+                                    ring,
+                                    window,
                                     cx,
-                                    hover,
                                     move |w, c| {
-                                        checkout(SideAction::CheckOutRemote(n.clone()), w, c)
+                                        checkout(SideAction::CheckOutRemote(n1.clone()), w, c)
                                     },
-                                ));
-                            base_row(ElementId::from(("side-remote", index)), window, cx, ring)
-                                .hover(move |style| style.bg(hover))
-                                .text_color(hsla(p.ink_muted))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .truncate()
-                                        .group_hover("side-row", |style| {
-                                            style.pr(px(REMOTE_ACTIONS_W))
-                                        })
-                                        .child(name.clone()),
-                                )
+                                ))
+                                .children(is_open.then(|| {
+                                    row_action(
+                                        ElementId::from(("side-remote-close", index)),
+                                        "×",
+                                        false,
+                                        true,
+                                        open_row.clone(),
+                                        ring,
+                                        window,
+                                        cx,
+                                        move |window, cx| menu_handle.focus(window, cx),
+                                    )
+                                }));
+                            let mut row =
+                                base_row(ElementId::from(("side-remote", index)), window, cx, ring)
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(hover))
+                                    .text_color(hsla(p.ink_muted))
+                                    .on_click(move |event, window, cx| {
+                                        if event.click_count() >= 2 || event.is_keyboard() {
+                                            activate(
+                                                SideAction::CheckOutRemote(n2.clone()),
+                                                window,
+                                                cx,
+                                            )
+                                        }
+                                    });
+                            if is_open {
+                                row = row.bg(hover);
+                            }
+                            let mut label_cell = div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .group_hover("side-row", |style| style.pr(px(REMOTE_ACTIONS_W)))
+                                .child(name.clone());
+                            if is_open {
+                                label_cell = label_cell.pr(px(REMOTE_ACTIONS_W));
+                            }
+                            row.child(label_cell)
+                                .child(menu_trigger)
                                 .child(actions)
                                 .into_any_element()
                         }
@@ -469,47 +794,79 @@ impl RenderOnce for Sidebar {
                             let (apply, pop, drop) =
                                 (on_action.clone(), on_action.clone(), on_action.clone());
                             let at = *at;
-                            let actions = overlay(hover)
-                                .gap(px(SPACE_1))
-                                .opacity(0.)
-                                .group_hover("side-row", |style| style.opacity(1.))
+                            let (menu_handle, menu_trigger) = row_menu_trigger(
+                                index,
+                                is_open,
+                                open_row.clone(),
+                                ring,
+                                window,
+                                cx,
+                            );
+                            let actions = overlay(hover, is_open)
                                 .child(row_action(
                                     ElementId::from(("side-apply", index)),
                                     "Apply",
                                     false,
+                                    is_open,
+                                    open_row.clone(),
+                                    ring,
+                                    window,
                                     cx,
-                                    hover,
                                     move |w, c| apply(SideAction::StashApply(at), w, c),
                                 ))
                                 .child(row_action(
                                     ElementId::from(("side-pop", index)),
                                     "Pop",
                                     false,
+                                    is_open,
+                                    open_row.clone(),
+                                    ring,
+                                    window,
                                     cx,
-                                    hover,
                                     move |w, c| pop(SideAction::StashPop(at), w, c),
                                 ))
                                 .child(row_action(
                                     ElementId::from(("side-drop", index)),
                                     "Drop",
                                     true,
+                                    is_open,
+                                    open_row.clone(),
+                                    ring,
+                                    window,
                                     cx,
-                                    hover,
                                     move |w, c| drop(SideAction::StashDrop(at), w, c),
-                                ));
-                            base_row(ElementId::from(("side-stash", index)), window, cx, ring)
-                                .hover(move |style| style.bg(hover))
-                                .text_color(hsla(p.ink_muted))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .truncate()
-                                        .group_hover("side-row", |style| {
-                                            style.pr(px(ROW_ACTIONS_W))
-                                        })
-                                        .child(label.clone()),
-                                )
+                                ))
+                                .children(is_open.then(|| {
+                                    row_action(
+                                        ElementId::from(("side-stash-close", index)),
+                                        "×",
+                                        false,
+                                        true,
+                                        open_row.clone(),
+                                        ring,
+                                        window,
+                                        cx,
+                                        move |window, cx| menu_handle.focus(window, cx),
+                                    )
+                                }));
+                            let mut row =
+                                base_row(ElementId::from(("side-stash", index)), window, cx, ring)
+                                    .hover(move |style| style.bg(hover))
+                                    .text_color(hsla(p.ink_muted));
+                            if is_open {
+                                row = row.bg(hover);
+                            }
+                            let mut label_cell = div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .group_hover("side-row", |style| style.pr(px(ROW_ACTIONS_W)))
+                                .child(label.clone());
+                            if is_open {
+                                label_cell = label_cell.pr(px(ROW_ACTIONS_W));
+                            }
+                            row.child(label_cell)
+                                .child(menu_trigger)
                                 .child(actions)
                                 .into_any_element()
                         }
@@ -547,44 +904,55 @@ impl RenderOnce for Sidebar {
                             .cursor_pointer()
                             .hover(move |style| style.bg(hover))
                             .on_click(move |event, window, cx| {
-                                if event.click_count() >= 2 && can_open {
+                                if (event.click_count() >= 2 || event.is_keyboard()) && can_open {
                                     open_click(SideAction::WorktreeOpen(p1.clone()), window, cx)
                                 }
-                            })
-                            .child(dot)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .group_hover("side-row", |style| style.pr(px(ROW_ACTIONS_W)))
-                                    .font_weight(FontWeight(if *current { 600.0 } else { 400.0 }))
-                                    .text_color(hsla(if *prunable { p.ink_muted } else { p.ink }))
-                                    .child(label.clone()),
-                            )
-                            .child(
+                            });
+                            if is_open {
+                                row = row.bg(hover);
+                            }
+                            let mut label_cell = div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .group_hover("side-row", |style| style.pr(px(ROW_ACTIONS_W)))
+                                .font_weight(FontWeight(if *current { 600.0 } else { 400.0 }))
+                                .text_color(hsla(if *prunable { p.ink_muted } else { p.ink }))
+                                .child(label.clone());
+                            if is_open && (can_open || can_remove) {
+                                label_cell = label_cell.pr(px(ROW_ACTIONS_W));
+                            }
+                            row = row.child(dot).child(label_cell).child(
                                 div()
                                     .flex_none()
                                     .text_style(&TEXT_SMALL, cx)
                                     .text_color(hsla(if *prunable || *locked {
                                         p.warning
                                     } else {
-                                        p.ink_faint
+                                        p.ink_muted
                                     }))
                                     .child(branch.clone()),
                             );
                             if can_open || can_remove {
-                                let actions = overlay(hover)
-                                    .gap(px(SPACE_1))
-                                    .opacity(0.)
-                                    .group_hover("side-row", |style| style.opacity(1.))
+                                let (menu_handle, menu_trigger) = row_menu_trigger(
+                                    index,
+                                    is_open,
+                                    open_row.clone(),
+                                    ring,
+                                    window,
+                                    cx,
+                                );
+                                let actions = overlay(hover, is_open)
                                     .children(can_open.then(|| {
                                         row_action(
                                             ElementId::from(("side-wt-open", index)),
                                             "Open",
                                             false,
+                                            is_open,
+                                            open_row.clone(),
+                                            ring,
+                                            window,
                                             cx,
-                                            hover,
                                             move |w, c| {
                                                 open_btn(SideAction::WorktreeOpen(p2.clone()), w, c)
                                             },
@@ -595,8 +963,11 @@ impl RenderOnce for Sidebar {
                                             ElementId::from(("side-wt-remove", index)),
                                             "Remove",
                                             true,
+                                            is_open,
+                                            open_row.clone(),
+                                            ring,
+                                            window,
                                             cx,
-                                            hover,
                                             move |w, c| {
                                                 remove_btn(
                                                     SideAction::WorktreeRemove(p3.clone()),
@@ -605,8 +976,21 @@ impl RenderOnce for Sidebar {
                                                 )
                                             },
                                         )
+                                    }))
+                                    .children(is_open.then(|| {
+                                        row_action(
+                                            ElementId::from(("side-wt-close", index)),
+                                            "×",
+                                            false,
+                                            true,
+                                            open_row.clone(),
+                                            ring,
+                                            window,
+                                            cx,
+                                            move |window, cx| menu_handle.focus(window, cx),
+                                        )
                                     }));
-                                row = row.child(actions);
+                                row = row.child(menu_trigger).child(actions);
                             }
                             row.into_any_element()
                         }
@@ -619,22 +1003,30 @@ impl RenderOnce for Sidebar {
                             let (update_btn, sync_btn) = (on_action.clone(), on_action.clone());
                             let (p1, p2) = (path.clone(), path.clone());
                             let status_color = match state {
-                                SubmoduleState::Clean => p.ink_faint,
+                                SubmoduleState::Clean => p.ink_muted,
                                 SubmoduleState::MergeConflict => p.danger,
                                 SubmoduleState::Uninitialized
                                 | SubmoduleState::OutOfSync
                                 | SubmoduleState::Dirty => p.warning,
                             };
-                            let actions = overlay(hover)
-                                .gap(px(SPACE_1))
-                                .opacity(0.)
-                                .group_hover("side-row", |style| style.opacity(1.))
+                            let (menu_handle, menu_trigger) = row_menu_trigger(
+                                index,
+                                is_open,
+                                open_row.clone(),
+                                ring,
+                                window,
+                                cx,
+                            );
+                            let actions = overlay(hover, is_open)
                                 .child(row_action(
                                     ElementId::from(("side-sub-update", index)),
                                     "Update",
                                     false,
+                                    is_open,
+                                    open_row.clone(),
+                                    ring,
+                                    window,
                                     cx,
-                                    hover,
                                     move |w, c| {
                                         update_btn(
                                             SideAction::SubmoduleUpdate(Some(p1.clone())),
@@ -647,25 +1039,49 @@ impl RenderOnce for Sidebar {
                                     ElementId::from(("side-sub-sync", index)),
                                     "Sync",
                                     false,
+                                    is_open,
+                                    open_row.clone(),
+                                    ring,
+                                    window,
                                     cx,
-                                    hover,
                                     move |w, c| {
                                         sync_btn(SideAction::SubmoduleSync(Some(p2.clone())), w, c)
                                     },
-                                ));
-                            base_row(ElementId::from(("side-submodule", index)), window, cx, ring)
-                                .hover(move |style| style.bg(hover))
-                                .text_color(hsla(p.ink_muted))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .truncate()
-                                        .group_hover("side-row", |style| {
-                                            style.pr(px(ROW_ACTIONS_W))
-                                        })
-                                        .child(path.clone()),
-                                )
+                                ))
+                                .children(is_open.then(|| {
+                                    row_action(
+                                        ElementId::from(("side-sub-close", index)),
+                                        "×",
+                                        false,
+                                        true,
+                                        open_row.clone(),
+                                        ring,
+                                        window,
+                                        cx,
+                                        move |window, cx| menu_handle.focus(window, cx),
+                                    )
+                                }));
+                            let mut row = base_row(
+                                ElementId::from(("side-submodule", index)),
+                                window,
+                                cx,
+                                ring,
+                            )
+                            .hover(move |style| style.bg(hover))
+                            .text_color(hsla(p.ink_muted));
+                            if is_open {
+                                row = row.bg(hover);
+                            }
+                            let mut path_cell = div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .group_hover("side-row", |style| style.pr(px(ROW_ACTIONS_W)))
+                                .child(path.clone());
+                            if is_open {
+                                path_cell = path_cell.pr(px(ROW_ACTIONS_W));
+                            }
+                            row.child(path_cell)
                                 .child(
                                     div()
                                         .flex_none()
@@ -673,6 +1089,7 @@ impl RenderOnce for Sidebar {
                                         .text_color(hsla(status_color))
                                         .child(status.clone()),
                                 )
+                                .child(menu_trigger)
                                 .child(actions)
                                 .into_any_element()
                         }
@@ -883,5 +1300,55 @@ mod tests {
     fn worktree_dot_uses_design_tokens() {
         assert_eq!(WORKTREE_DOT_SIZE, SPACE_2);
         assert_eq!(WORKTREE_DOT_RADIUS, RADIUS_SM);
+    }
+
+    #[test]
+    fn collapse_hides_section_items_and_filter_auto_expands_matches() {
+        let snapshot = refs(&["refs/heads/main", "refs/heads/feat/login", "refs/tags/v1.0"]);
+        let rows = sidebar_rows(&snapshot, &head("main"), &[], &AdvancedSnapshot::default());
+        let counts = section_counts(&rows);
+        assert_eq!(counts.get("LOCAL"), Some(&2));
+        assert_eq!(counts.get("TAGS"), Some(&1));
+
+        let mut collapsed = HashSet::new();
+        collapsed.insert("LOCAL".to_owned());
+        let hidden = filter_and_collapse_rows(&rows, "", &collapsed);
+        assert_eq!(texts(&hidden), vec!["# LOCAL", "# TAGS", "t v1.0"]);
+
+        // Searching overrides collapsed state and omits non-matching sections.
+        let searched = filter_and_collapse_rows(&rows, "LOGIN", &collapsed);
+        assert_eq!(texts(&searched), vec!["# LOCAL", "feat/login"]);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn filter_never_emits_orphan_headers_and_counts_match_items(
+            branches in proptest::collection::vec("[a-z]{1,8}", 1..8),
+            query in "[a-z]{0,4}",
+        ) {
+            let names: Vec<String> = branches
+                .into_iter()
+                .map(|b| format!("refs/heads/{b}"))
+                .collect();
+            let refs_slice: Vec<&str> = names.iter().map(String::as_str).collect();
+            let snapshot = refs(&refs_slice);
+            let rows = sidebar_rows(&snapshot, &Head::Detached(oid('a')), &[], &AdvancedSnapshot::default());
+            let counts = section_counts(&rows);
+            let item_count = rows.iter().filter(|r| !matches!(r, SideRow::Header(_))).count();
+            let counted: usize = counts.values().sum();
+            proptest::prop_assert_eq!(counted, item_count);
+
+            let filtered = filter_and_collapse_rows(&rows, &query, &HashSet::new());
+            if !query.is_empty() {
+                for pair in filtered.windows(2) {
+                    proptest::prop_assert!(
+                        !(matches!(pair[0], SideRow::Header(_)) && matches!(pair[1], SideRow::Header(_)))
+                    );
+                }
+                if let Some(last) = filtered.last() {
+                    proptest::prop_assert!(!matches!(last, SideRow::Header(_)));
+                }
+            }
+        }
     }
 }

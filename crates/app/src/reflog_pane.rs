@@ -15,8 +15,9 @@ use invoke_core::{
     ResetMode, Snapshot,
 };
 use shell::reflog::{ReflogEvent, list_reflog_targets, read_reflog_async};
-use tokens::{ROW_LIST, SPACE_2, SPACE_3, TEXT_CODE_SMALL, TEXT_SMALL};
+use tokens::{ROW_LIST, SPACE_2, SPACE_3, TEXT_CODE_SMALL, TEXT_SMALL, TOOLBAR};
 use ui::reflog_view::ReflogView;
+use ui::scrollbar::Scrollbar;
 use ui::{
     Button, CheckState, Checkbox, EditorEvent, TextEditor, TextStyleExt, ThemeExt, convert::hsla,
 };
@@ -269,7 +270,7 @@ impl ReflogPane {
                     .flex_wrap()
                     .gap(px(SPACE_2))
                     .child(
-                        Button::new("reflog-branch", "Create branch here")
+                        Button::new("reflog-branch", "Create branch at this commit")
                             .disabled(!ready)
                             .on_click(move |_, _, cx| {
                                 branch.update(cx, |this, cx| {
@@ -396,38 +397,64 @@ impl Drop for ReflogPane {
 }
 
 impl Render for ReflogPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
         let picker = cx.entity();
+        let targets_scroll = window
+            .use_keyed_state("reflog-targets-scroll", cx, |_, _| {
+                UniformListScrollHandle::new()
+            })
+            .read(cx)
+            .clone();
         let targets = self.show_targets.then(|| {
             let targets = self.targets.clone();
             let count = targets.len();
             let choose = cx.entity();
-            div().h(px(count.min(8) as f32 * ROW_LIST)).child(
-                uniform_list("reflog-targets", count, move |range, _, _| {
-                    range
-                        .map(|ix| {
-                            let target = targets[ix].clone();
-                            let choose = choose.clone();
-                            div()
-                                .flex()
-                                .items_center()
-                                .h(px(ROW_LIST))
-                                .px(px(SPACE_2))
-                                .child(
-                                    Button::new(("reflog-target", ix), target.label().to_owned())
+            div()
+                .flex()
+                .flex_none()
+                .h(px(count.min(8) as f32 * ROW_LIST))
+                .bg(hsla(p.bg_raised))
+                .border_b_1()
+                .border_color(hsla(p.line))
+                .child(
+                    uniform_list("reflog-targets", count, move |range, _, _| {
+                        range
+                            .map(|ix| {
+                                let target = targets[ix].clone();
+                                let choose = choose.clone();
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .h(px(ROW_LIST))
+                                    .px(px(SPACE_2))
+                                    .child(
+                                        Button::new(
+                                            ("reflog-target", ix),
+                                            target.label().to_owned(),
+                                        )
                                         .ghost()
-                                        .on_click(move |_, _, cx| {
-                                            choose.update(cx, |this, cx| {
-                                                this.choose_target(target.clone(), cx)
-                                            })
-                                        }),
-                                )
-                        })
-                        .collect()
-                })
-                .h_full(),
-            )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                choose.update(cx, |this, cx| {
+                                                    this.choose_target(target.clone(), cx)
+                                                })
+                                            },
+                                        ),
+                                    )
+                            })
+                            .collect()
+                    })
+                    .track_scroll(&targets_scroll)
+                    .flex_1()
+                    .h_full(),
+                )
+                .child(Scrollbar::new(
+                    "reflog-targets-scrollbar",
+                    targets_scroll,
+                    count,
+                    ROW_LIST,
+                ))
         });
         let selected = self.selected.and_then(|ix| self.entries.get(ix));
         let details = selected.map(|entry| {
@@ -452,7 +479,7 @@ impl Render for ReflogPane {
                 .child(
                     div()
                         .text_style(&TEXT_CODE_SMALL, cx)
-                        .child(format!("{from} → {}", entry.new_oid)),
+                        .child(format!("Ref moved from {from} to {}", entry.new_oid)),
                 )
                 .child(self.recovery_form(entry, cx))
         });
@@ -474,7 +501,10 @@ impl Render for ReflogPane {
         );
         let message = match &self.status {
             Status::Loading => Some("Reading reflog…"),
-            Status::Ready if self.entries.is_empty() => Some("No reflog entries for this ref."),
+            Status::Ready if self.entries.is_empty() => Some("No recorded movements for this ref."),
+            Status::Ready if self.selected.is_none() => {
+                Some("Select an entry to recover its resulting commit.")
+            }
             Status::Ready => None,
             Status::Failed(error) => Some(error.as_str()),
         };
@@ -483,31 +513,41 @@ impl Render for ReflogPane {
             .flex_col()
             .size_full()
             .min_h(px(0.))
+            .bg(hsla(p.bg_panel))
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
                     .gap(px(SPACE_2))
-                    .p(px(SPACE_2))
-                    .flex_none()
+                    .h(px(TOOLBAR))
+                    .px(px(SPACE_3))
+                    .border_b_1()
+                    .border_color(hsla(p.line))
                     .child(
-                        Button::new("reflog-target-picker", format!("{} ▾", self.target.label()))
-                            .on_click(move |_, _, cx| {
-                                picker.update(cx, |this, cx| {
-                                    this.show_targets = !this.show_targets;
-                                    cx.notify();
-                                })
-                            }),
+                        Button::new(
+                            "reflog-target-picker",
+                            format!("Reflog for {} ▾", self.target.label()),
+                        )
+                        .on_click(move |_, _, cx| {
+                            picker.update(cx, |this, cx| {
+                                this.show_targets = !this.show_targets;
+                                cx.notify();
+                            })
+                        }),
                     )
                     .children(message.map(|text| {
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
                             .text_style(&TEXT_SMALL, cx)
                             .text_color(hsla(p.ink_muted))
                             .child(text.to_owned())
                     })),
             )
             .children(targets)
-            .child(div().flex_1().min_h(px(0.)).child(list))
+            .child(div().flex_1().min_h(px(0.)).py(px(SPACE_2)).child(list))
             .children(details)
     }
 }

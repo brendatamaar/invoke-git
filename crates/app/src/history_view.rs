@@ -13,19 +13,29 @@ use gpui::{
     Pixels, Point, Render, Styled, Subscription, Task, Window, anchored, deferred, div, px,
 };
 use invoke_core::{Head, Oid, RefsSnapshot, Snapshot};
-use shell::history::{CommitId, CommitMeta, HistoryEvent, read_meta, walk};
+use shell::history::{CommitId, CommitMeta, HistoryEvent, HistoryScope, read_meta, walk_scoped};
+use tokens::{SPACE_1, SPACE_2, SPACE_3};
+use ui::convert::{hsla, shadows};
 use ui::time::relative;
-use ui::{GraphEvent, GraphView, RowMeta, ref_labels::ref_labels};
-
-use ui::ThemeExt;
-use ui::convert::hsla;
+use ui::{
+    Button, GraphEvent, GraphView, IconName, ResizeEdge, ResizeHandle, RowMeta, Segmented,
+    ThemeExt, ref_labels::ref_labels,
+};
 
 use crate::commit_pane::{CommitPane, InspectFile, StartRebase, rebase_button, replay_buttons};
 use crate::commit_search::{CommitSearch, CommitSelected};
 use crate::session::RepoSession;
 
+pub enum HistoryUiEvent {
+    Changes,
+    Recovery,
+    LayoutChanged,
+}
+
 /// The width of the commit detail beside the graph.
-const DETAIL_W: f32 = 520.0;
+const DETAIL_W: f32 = tokens::DIALOG;
+const DETAIL_MIN: f32 = tokens::SIDEBAR + tokens::SPACE_8 * 2.0 + tokens::SPACE_4;
+const DETAIL_MAX: f32 = tokens::DIALOG + tokens::SIDEBAR + tokens::SPACE_8 * 2.0;
 
 pub struct HistoryPane {
     session: Entity<RepoSession>,
@@ -36,12 +46,16 @@ pub struct HistoryPane {
     started: bool,
     last_refs: Option<(Head, RefsSnapshot)>,
     row_menu: Option<(Oid, Point<Pixels>)>,
+    detail_w: f32,
+    scope: HistoryScope,
+    expanded: bool,
     _walk: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<InspectFile> for HistoryPane {}
 impl EventEmitter<StartRebase> for HistoryPane {}
+impl EventEmitter<HistoryUiEvent> for HistoryPane {}
 
 /// What a row shows for `meta`, with the date relative to `now`.
 pub fn row_meta(meta: &CommitMeta, now: i64) -> RowMeta {
@@ -67,6 +81,7 @@ impl HistoryPane {
         let search = cx.new(|cx| CommitSearch::new(paths, cx));
         let subscriptions = vec![
             cx.subscribe(&search, |this, _, event: &CommitSelected, cx| {
+                this.set_scope(HistoryScope::AllRefs, cx);
                 this.open_commit(event.0, cx)
             }),
             cx.subscribe(&detail, |_, _, event: &InspectFile, cx| {
@@ -103,9 +118,50 @@ impl HistoryPane {
             started: false,
             last_refs: None,
             row_menu: None,
+            detail_w: DETAIL_W,
+            scope: HistoryScope::AllRefs,
+            expanded: false,
             _walk: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    pub fn detail_width(&self) -> f32 {
+        self.detail_w
+    }
+
+    pub fn set_detail_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.detail_w = width.clamp(DETAIL_MIN, DETAIL_MAX);
+        cx.notify();
+    }
+
+    pub fn reset_layout(&mut self, cx: &mut Context<Self>) {
+        self.expanded = false;
+        self.set_detail_width(DETAIL_W, cx);
+    }
+
+    fn set_scope(&mut self, scope: HistoryScope, cx: &mut Context<Self>) {
+        if self.scope != scope {
+            self.scope = scope;
+            self.start_walk(true, cx);
+            cx.notify();
+        }
+    }
+
+    fn head_id(&self, cx: &Context<Self>) -> Option<CommitId> {
+        let head = &self.session.read(cx).state.snapshot.disk()?.head;
+        match head {
+            Head::Branch { oid, .. } | Head::Detached(oid) => {
+                CommitId::from_hex(oid.as_hex().as_bytes()).ok()
+            }
+            Head::Unborn(_) => None,
+        }
+    }
+
+    pub fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search
+            .update(cx, |search, cx| search.toggle(window, cx));
+        cx.notify();
     }
 
     /// Starts the walk the first time the page is shown.
@@ -122,6 +178,7 @@ impl HistoryPane {
         self.graph.update(cx, |graph, cx| graph.reveal(id, cx));
         self.detail
             .update(cx, |detail, cx| detail.show(Some(id), cx));
+        cx.notify();
     }
 
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
@@ -178,7 +235,7 @@ impl HistoryPane {
         self.cancel = Arc::new(AtomicBool::new(false));
         let paths = self.session.read(cx).discovered.paths.clone();
         let cancel = self.cancel.clone();
-        let inbox = walk(paths, None, cancel.clone());
+        let inbox = walk_scoped(paths, None, self.scope, cancel.clone());
         self.graph.update(cx, |graph, cx| {
             if refresh {
                 graph.begin_refresh();
@@ -187,8 +244,15 @@ impl HistoryPane {
             }
         });
         let graph = self.graph.clone();
+        let head_hint = self.refs(cx).and_then(|(head, _)| match head {
+            Head::Branch { oid, .. } | Head::Detached(oid) => {
+                CommitId::from_hex(oid.as_hex().as_bytes()).ok()
+            }
+            Head::Unborn(_) => None,
+        });
         self._walk = Some(cx.spawn(async move |_, cx| {
             let mut inbox = inbox;
+            let mut selected_initial = false;
             loop {
                 let (back, batch) = cx
                     .background_executor()
@@ -214,7 +278,17 @@ impl HistoryPane {
                     for event in batch {
                         match event {
                             HistoryEvent::Started { .. } => {}
-                            HistoryEvent::Page(page) => graph.push_page(&page, cx),
+                            HistoryEvent::Page(page) => {
+                                graph.push_page(&page, cx);
+                                if !selected_initial
+                                    && graph.selected().is_none()
+                                    && let Some(target) =
+                                        head_hint.or_else(|| graph.id_at(0).copied())
+                                {
+                                    graph.reveal(target, cx);
+                                    selected_initial = true;
+                                }
+                            }
                             HistoryEvent::Done { commits } => graph.finish(commits, cx),
                             HistoryEvent::Failed(error) => graph.fail(error, cx),
                         }
@@ -226,6 +300,7 @@ impl HistoryPane {
 
     /// Reads the metadata of rows `range` and hands it to the graph.
     fn load_meta(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        let cancel = self.cancel.clone();
         let ids: Vec<CommitId> = {
             let graph = self.graph.read(cx);
             range
@@ -241,6 +316,9 @@ impl HistoryPane {
                 .spawn(async move { read_meta(&paths, &ids) })
                 .await;
             let Ok(metas) = read else { return };
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let now = now_seconds();
             let rows: Vec<Option<RowMeta>> = metas
                 .iter()
@@ -289,41 +367,170 @@ impl Render for HistoryPane {
                         .occlude()
                         .flex()
                         .flex_col()
+                        .min_w(px(tokens::SIDEBAR - tokens::SPACE_8))
+                        .gap(px(tokens::SPACE_1 / 2.0))
                         .p(px(tokens::SPACE_1))
-                        .rounded(px(tokens::RADIUS_MD))
+                        .rounded(px(tokens::RADIUS_LG))
                         .border_1()
                         .border_color(hsla(p.line))
-                        .bg(hsla(p.bg_panel))
+                        .bg(hsla(p.bg_raised))
+                        .shadow(shadows(p.shadow_overlay))
                         .on_mouse_down_out(cx.listener(|pane, _, _, cx| {
                             pane.row_menu = None;
                             cx.notify();
                         }))
-                        .children(buttons)
-                        .child(rebase),
+                        .children(buttons.into_iter().map(ui::Button::full_width))
+                        .child(rebase.full_width()),
                 ),
             )
         });
-        div()
+
+        let search_open = self.search.read(cx).is_open();
+        let changes = self
+            .session
+            .read(cx)
+            .state
+            .snapshot
+            .disk()
+            .map_or(0, |disk| disk.status.entries.len());
+        let scope_changed = cx.entity();
+        let scope = Segmented::new(
+            "history-scope",
+            vec!["All refs".into(), "Current branch".into()],
+            usize::from(self.scope == HistoryScope::Head),
+            move |index, _, cx| {
+                let scope = if index == 0 {
+                    HistoryScope::AllRefs
+                } else {
+                    HistoryScope::Head
+                };
+                scope_changed.update(cx, |pane, cx| pane.set_scope(scope, cx));
+            },
+        );
+        let header = div()
             .flex()
-            .size_full()
+            .flex_wrap()
+            .flex_none()
+            .items_center()
+            .gap(px(SPACE_2))
+            .px(px(SPACE_3))
+            .py(px(SPACE_1))
+            .bg(hsla(p.bg_panel))
+            .border_b_1()
+            .border_color(hsla(p.line))
+            .child(scope)
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .child(self.search.clone())
-                    .child(div().flex_1().min_h(px(0.)).child(self.graph.clone())),
+                Button::new(
+                    "history-search",
+                    if search_open {
+                        "Hide search"
+                    } else {
+                        "Find commit"
+                    },
+                )
+                .icon(IconName::Search)
+                .shortcut("Ctrl+F")
+                .ghost()
+                .on_click(cx.listener(|pane, _, window, cx| pane.toggle_search(window, cx))),
             )
+            .child(
+                Button::new("history-head", "Jump to HEAD")
+                    .ghost()
+                    .disabled(self.head_id(cx).is_none())
+                    .on_click(cx.listener(|pane, _, _, cx| {
+                        if let Some(id) = pane.head_id(cx) {
+                            pane.open_commit(id, cx);
+                        }
+                    })),
+            )
+            .child(
+                Button::new("history-recovery", "Recovery")
+                    .ghost()
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(HistoryUiEvent::Recovery))),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new(
+                    "history-expand",
+                    if self.expanded {
+                        "Show graph"
+                    } else {
+                        "Expand details"
+                    },
+                )
+                .ghost()
+                .on_click(cx.listener(|pane, _, _, cx| {
+                    pane.expanded = !pane.expanded;
+                    cx.notify();
+                })),
+            );
+        let working = if changes == 0 {
+            "Working changes".to_owned()
+        } else {
+            format!("Working changes · {changes}")
+        };
+        let graph_col = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .child(self.search.clone())
+            .child(
+                div().px(px(SPACE_3)).py(px(SPACE_1)).child(
+                    Button::new("history-changes", working)
+                        .icon(IconName::Changes)
+                        .ghost()
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(HistoryUiEvent::Changes))),
+                ),
+            )
+            .child(div().flex_1().min_h(px(0.)).child(self.graph.clone()));
+
+        if self.expanded {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(header)
+                .child(div().flex_1().min_h(px(0.)).child(self.detail.clone()))
+                .into_any_element();
+        }
+
+        let resize_detail = cx.entity();
+        let panes = div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.))
+            .child(graph_col)
+            .child(ResizeHandle::new(
+                "history-detail-resize",
+                self.detail_w,
+                DETAIL_W,
+                DETAIL_MIN,
+                DETAIL_MAX,
+                ResizeEdge::Left,
+                move |width, _, cx| {
+                    resize_detail.update(cx, |pane, cx| {
+                        pane.set_detail_width(width, cx);
+                        cx.emit(HistoryUiEvent::LayoutChanged);
+                    });
+                },
+            ))
             .child(
                 div()
                     .flex_none()
-                    .w(px(DETAIL_W))
-                    .border_l_1()
-                    .border_color(hsla(p.line))
+                    .w(px(self.detail_w))
+                    .max_w(gpui::relative(0.55))
                     .child(self.detail.clone()),
             )
-            .children(menu)
+            .children(menu);
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(header)
+            .child(panes)
+            .into_any_element()
     }
 }
 

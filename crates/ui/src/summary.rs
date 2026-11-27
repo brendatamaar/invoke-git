@@ -3,9 +3,11 @@
 
 use gpui::{App, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div, px};
 use invoke_core::{Freshness, Head, LockState, Phase, RebasePause, RepoState, Snapshot, Tracking};
-use tokens::{SPACE_2, SPACE_3, TEXT_BODY, TEXT_SMALL};
+use tokens::{
+    SIDEBAR, SPACE_1, SPACE_2, SPACE_3, TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_SMALL, TOOLBAR,
+};
 
-use crate::components::{Banner, BannerKind, Pill};
+use crate::components::{Banner, BannerKind, Divider, Icon, IconName, Pill};
 use crate::convert::hsla;
 use crate::text::TextStyleExt;
 use crate::theme::ThemeExt;
@@ -13,15 +15,16 @@ use crate::theme::ThemeExt;
 /// What the header says about a repo, as plain text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Summary {
-    /// `main`, `Detached at 4f2a9c1` or `main (no commits yet)`.
+    /// `main`, `Detached HEAD at 4f2a9c1` or `main (no commits yet)`.
     pub head: String,
-    /// `↑2 ↓0 vs origin/main`, or `Upstream gone`; none without an upstream.
+    /// Upstream and divergence, or why no upstream is available.
     pub tracking: Option<String>,
     /// `Merging: 2 conflicts`, `Rebasing 3/7: 1 conflict`; none when clean.
     pub phase: Option<String>,
     /// Files with a change in the index, and with a change in the worktree.
     pub staged: usize,
     pub unstaged: usize,
+    changed_files: usize,
     /// `Another git process is running`, when `index.lock` is held by one.
     pub lock: Option<String>,
     /// Nothing has been read yet.
@@ -54,6 +57,7 @@ impl Summary {
                 phase: None,
                 staged: 0,
                 unstaged: 0,
+                changed_files: 0,
                 lock: None,
                 reading: true,
                 stale,
@@ -63,13 +67,16 @@ impl Summary {
             Head::Branch { name, .. } => name.0.clone(),
             Head::Detached(oid) => {
                 let hex = oid.as_hex();
-                format!("Detached at {}", &hex[..SHORT_OID.min(hex.len())])
+                format!("Detached HEAD at {}", &hex[..SHORT_OID.min(hex.len())])
             }
             Head::Unborn(name) => format!("{} (no commits yet)", name.0),
         };
         let tracking = match &disk.head {
-            Head::Branch { name, .. } | Head::Unborn(name) => {
-                disk.refs.upstreams.get(name).map(|upstream| {
+            Head::Branch { name, .. } | Head::Unborn(name) => disk
+                .refs
+                .upstreams
+                .get(name)
+                .map(|upstream| {
                     let remote = upstream
                         .name
                         .0
@@ -78,11 +85,11 @@ impl Summary {
                     match upstream.tracking {
                         Tracking::Gone => format!("Upstream {remote} is gone"),
                         Tracking::Apart { ahead, behind } => {
-                            format!("↑{ahead} ↓{behind} vs {remote}")
+                            format!("{remote} · {ahead} to push · {behind} to pull")
                         }
                     }
                 })
-            }
+                .or_else(|| Some("No upstream".to_owned())),
             Head::Detached(_) => None,
         };
         let phase = match &disk.phase {
@@ -126,25 +133,26 @@ impl Summary {
             phase,
             staged: disk.status.staged().count(),
             unstaged: disk.status.unstaged().count(),
+            changed_files: disk.status.entries.len(),
             lock,
             reading: false,
             stale,
         }
     }
 
-    /// `3 staged · 5 not staged`, or `No changes`.
+    /// `3 staged · 5 unstaged`, or `No changes`.
     pub fn changes(&self) -> String {
         match (self.staged, self.unstaged) {
             (0, 0) => "No changes".to_owned(),
-            (staged, unstaged) => format!("{staged} staged · {unstaged} not staged"),
+            (staged, unstaged) => format!("{staged} staged · {unstaged} unstaged"),
         }
     }
 
     /// The tab badge: the number of files with any change; empty for none.
     pub fn badge(&self) -> String {
-        match self.staged.max(self.unstaged) {
+        match self.changed_files {
             0 => String::new(),
-            _ => (self.staged + self.unstaged).to_string(),
+            count => count.to_string(),
         }
     }
 }
@@ -152,21 +160,26 @@ impl Summary {
 #[derive(IntoElement)]
 pub struct RepoSummary {
     summary: Summary,
-    path: SharedString,
+    repository: Option<SharedString>,
     warning: Option<SharedString>,
     control: Option<gpui::AnyElement>,
     show_phase: bool,
 }
 
 impl RepoSummary {
-    pub fn new(summary: Summary, path: impl Into<SharedString>) -> Self {
+    pub fn new(summary: Summary, _path: impl Into<SharedString>) -> Self {
         Self {
             summary,
-            path: path.into(),
+            repository: None,
             warning: None,
             control: None,
             show_phase: true,
         }
+    }
+
+    pub fn repository(mut self, label: impl Into<SharedString>) -> Self {
+        self.repository = Some(label.into());
+        self
     }
 
     /// A control shown in the header after the branch (the Changes and
@@ -197,46 +210,69 @@ impl RenderOnce for RepoSummary {
         let s = self.summary;
         let mut header = div()
             .flex()
+            .flex_wrap()
             .flex_none()
             .items_center()
-            .gap(px(SPACE_3))
+            .gap(px(SPACE_2))
+            .min_h(px(TOOLBAR))
             .w_full()
             .px(px(SPACE_3))
-            .py(px(SPACE_2))
+            .py(px(SPACE_1))
             .bg(hsla(p.bg_panel))
             .border_b_1()
             .border_color(hsla(p.line));
+        if let Some(repository) = self.repository {
+            header = header.child(
+                div()
+                    .max_w(px(SIDEBAR))
+                    .truncate()
+                    .text_style(&TEXT_BODY_MEDIUM, cx)
+                    .text_color(hsla(p.ink))
+                    .child(repository),
+            );
+        }
         if s.reading {
             header = header.child(
                 div()
+                    .flex_none()
+                    .whitespace_nowrap()
                     .text_style(&TEXT_BODY, cx)
                     .text_color(hsla(p.ink_muted))
                     .child("Reading the repository…"),
             );
         } else {
-            header = header.child(Pill::new(s.head.clone()));
+            let mut ref_meta = div()
+                .flex()
+                .flex_wrap()
+                .min_w(px(0.))
+                .items_center()
+                .gap(px(SPACE_2))
+                .overflow_hidden()
+                .child(Icon::new(IconName::Branch).small().color(p.accent))
+                .child(Pill::new(s.head.clone()).max_w(SIDEBAR));
             if let Some(tracking) = &s.tracking {
-                header = header.child(
+                ref_meta = ref_meta.child(
                     div()
+                        .min_w(px(0.))
+                        .truncate()
                         .text_style(&TEXT_SMALL, cx)
                         .text_color(hsla(p.ink_muted))
                         .child(tracking.clone()),
                 );
             }
+            header = header.child(ref_meta);
         }
 
-        // The path takes what is left and is cut with an ellipsis, so a long
-        // path or a wide set of controls never pushes the page past the window.
-        header = header.children(self.control).child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .truncate()
-                .text_right()
-                .text_style(&tokens::TEXT_CODE_SMALL, cx)
-                .text_color(hsla(p.ink_faint))
-                .child(self.path),
-        );
+        if let Some(control) = self.control {
+            header = header.child(Divider::vertical()).child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .items_center()
+                    .child(control),
+            );
+        }
 
         let mut body = div().flex().flex_col().flex_none().gap(px(SPACE_2));
         let mut any = false;
@@ -351,7 +387,10 @@ mod tests {
         ));
         let s = Summary::of(&state);
         assert_eq!(s.head, "main");
-        assert_eq!(s.tracking.as_deref(), Some("↑2 ↓0 vs origin/main"));
+        assert_eq!(
+            s.tracking.as_deref(),
+            Some("origin/main · 2 to push · 0 to pull")
+        );
         assert_eq!(s.phase, None);
     }
 
@@ -362,7 +401,7 @@ mod tests {
             Phase::Clean,
             RefsSnapshot::default(),
         )));
-        assert_eq!(detached.head, "Detached at 4f2a9c1");
+        assert_eq!(detached.head, "Detached HEAD at 4f2a9c1");
         assert_eq!(detached.tracking, None);
         let unborn = Summary::of(&state_with(disk(
             Head::Unborn(main_branch()),
@@ -435,7 +474,7 @@ mod tests {
                 refs,
             ));
             let text = Summary::of(&state).tracking.unwrap();
-            prop_assert_eq!(text, format!("↑{ahead} ↓{behind} vs origin/main"));
+            prop_assert_eq!(text, format!("origin/main · {ahead} to push · {behind} to pull"));
         }
     }
 }

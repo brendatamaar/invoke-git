@@ -9,31 +9,38 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+    AppContext, Context, ElementId, Entity, EventEmitter, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    div, px,
 };
-use invoke_core::RepoPath;
 use invoke_core::notes::{Note, NoteId, open_todos, relocate};
+use invoke_core::{Event, Freshness, LockState, RepoPath, Snapshot};
 use shell::InputsError;
 use shell::commit_detail::{Change, CommitSides, read_commit, read_commit_sides};
 use shell::history::CommitId;
 use shell::outgoing::{Outgoing, read_outgoing, read_range_sides};
 use shell::precondition::RepoPaths;
 use tokens::{
-    RADIUS_MD, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_CODE_SMALL, TEXT_LABEL,
-    TEXT_SMALL, TEXT_TITLE,
+    DIALOG, LANE, RADIUS_MD, RADIUS_SM, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4,
+    TEXT_BODY, TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL, TEXT_TITLE,
 };
 use ui::convert::hsla;
+use ui::focus;
 use ui::time::relative;
 use ui::{
-    Button, CheckState, Checkbox, DiffContent, DiffView, Segmented, TextEditor, TextStyleExt,
-    ThemeExt, diff_view, short_hash,
+    Button, CheckState, Checkbox, DiffContent, DiffView, Pill, PillTone, ResizeEdge, ResizeHandle,
+    Segmented, TextEditor, TextStyleExt, ThemeExt, diff_view, short_hash,
 };
 
 use crate::notes_db::{self, NotesDb};
 use crate::review::{self, Key, Scope, Viewed};
 use crate::session::RepoSession;
 use crate::sync;
+
+/// Width bounds of the commits / files / notes aside.
+const ASIDE_W: f32 = SIDEBAR + SPACE_4 * 6.0;
+const ASIDE_MIN: f32 = SIDEBAR;
+const ASIDE_MAX: f32 = DIALOG + SPACE_4 * 2.0;
 
 /// Files whose line counts are worked out for the list; a bigger list shows
 /// counts for the first ones only.
@@ -118,6 +125,11 @@ pub struct ReviewPane {
     /// The commit shown in [`Scope::PerCommit`] (index into the list).
     commit: usize,
     viewed: Viewed,
+    unviewed_only: bool,
+    range_changed: bool,
+    can_create_request: bool,
+    push_request: Option<(invoke_core::OpId, Key)>,
+    pushed: Option<Key>,
     /// On screen: only then does a moved head or upstream cause a re-read.
     active: bool,
     loaded: Option<Key>,
@@ -130,6 +142,8 @@ pub struct ReviewPane {
     db: Arc<NotesDb>,
     /// The notes of this repo that belong to this review.
     notes: Vec<Note>,
+    selected_note: Option<NoteId>,
+    notes_loading: bool,
     /// Why the notes could not be read or saved.
     notes_error: Option<String>,
     note_line: Entity<TextEditor>,
@@ -140,6 +154,7 @@ pub struct ReviewPane {
     /// The file on show and its new side: what a typed line number is
     /// counted in.
     shown: Option<(String, Arc<str>)>,
+    aside_w: f32,
     _observe: Subscription,
 }
 
@@ -155,6 +170,11 @@ impl ReviewPane {
             scope: Scope::Combined,
             commit: 0,
             viewed: Viewed::default(),
+            unviewed_only: false,
+            range_changed: false,
+            can_create_request: false,
+            push_request: None,
+            pushed: None,
             active: false,
             loaded: None,
             reads: 0,
@@ -162,12 +182,15 @@ impl ReviewPane {
             requests: 0,
             db: NotesDb::global(),
             notes: Vec::new(),
+            selected_note: None,
+            notes_loading: false,
             notes_error: None,
             note_line: cx.new(|cx| TextEditor::new("Line", 1, cx).single_line()),
             note_text: cx.new(|cx| TextEditor::new("Write a note on this line", 2, cx)),
             note_todo: false,
             note_problem: None,
             shown: None,
+            aside_w: ASIDE_W,
             _observe: observe,
         }
     }
@@ -175,7 +198,9 @@ impl ReviewPane {
     /// The review was opened: read what would be pushed, now.
     pub fn open(&mut self, cx: &mut Context<Self>) {
         self.active = true;
-        self.reload(cx);
+        self.pushed = None;
+        self.range_changed = false;
+        self.reload(false, cx);
     }
 
     pub fn close(&mut self) {
@@ -188,42 +213,81 @@ impl ReviewPane {
 
     fn session_changed(&mut self, cx: &mut Context<Self>) {
         if self.active {
-            let now = review::key_of(&self.session.read(cx).state);
-            if now.is_some() && now != self.loaded {
-                self.reload(cx);
+            let state = &self.session.read(cx).state;
+            if let Some(invoke_core::Notice::OpEnded { op, outcome }) = &state.notice
+                && self.push_request.as_ref().is_some_and(|(id, _)| id == op)
+            {
+                let key = self.push_request.take().map(|(_, key)| key);
+                self.pushed = match outcome {
+                    invoke_core::OpOutcome::Succeeded => key,
+                    _ => None,
+                };
+            }
+            if matches!(state.snapshot, Snapshot::Read { .. })
+                && review::key_of(state) != self.loaded
+            {
+                self.reload(true, cx);
                 return;
             }
         }
         cx.notify();
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    fn reload(&mut self, mid_review: bool, cx: &mut Context<Self>) {
         let state = &self.session.read(cx).state;
-        self.loaded = review::key_of(state);
-        let upstream = sync::plan(state)
-            .and_then(|plan| plan.upstream)
-            .map(|upstream| upstream.tracking_ref().0);
+        let key = review::key_of(state);
+        if key != self.loaded {
+            self.range_changed |= self.loaded.is_some() && (mid_review || !self.viewed.is_empty());
+            self.viewed.clear();
+            self.unviewed_only = false;
+        }
+        self.loaded = key.clone();
         self.reads += 1;
+        self.listings += 1;
+        self.requests += 1;
         let read = self.reads;
-        self.viewed.clear();
         self.scope = Scope::Combined;
         self.commit = 0;
+        self.shown = None;
+        self.selected_note = None;
+        self.notes.clear();
+        self.notes_error = None;
+        self.notes_loading = true;
+        self.can_create_request = false;
+        let Some(key) = key else {
+            self.phase = Phase::Failed("Check out a branch with commits to review a push.".into());
+            cx.notify();
+            return;
+        };
+        let upstream = key.target.tracking_ref();
+        let remote = key.target.remote.clone();
         self.phase = Phase::Loading;
         self.diff
             .update(cx, |diff, cx| diff.set_content(DiffContent::Loading, cx));
         cx.notify();
         let paths = self.session.read(cx).discovered.paths.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx
+            let (result, can_create_request) = cx
                 .background_executor()
-                .spawn(async move { read_outgoing(&paths, upstream.as_deref()) })
+                .spawn(async move {
+                    let result = read_outgoing(&paths, Some(&upstream.0));
+                    let can_create_request =
+                        shell::read::read_remotes(&paths).is_ok_and(|remotes| {
+                            remotes.iter().any(|entry| {
+                                entry.name == remote
+                                    && invoke_core::forge::parse_remote_repo(&entry.url).is_some()
+                            })
+                        });
+                    (result, can_create_request)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if this.reads != read {
                     return;
                 }
                 match result {
-                    Ok(out) => {
+                    Ok(out) if key.matches_outgoing(&out) => {
+                        this.can_create_request = can_create_request;
                         let rows = rows_of(&out.files);
                         this.phase = Phase::Ready(Box::new(Ready {
                             out,
@@ -233,6 +297,12 @@ impl ReviewPane {
                         }));
                         this.files_ready(cx);
                         this.refresh_notes(cx);
+                    }
+                    Ok(_) => {
+                        this.phase = Phase::Failed(
+                            "The outgoing range changed while loading. Open the review again."
+                                .into(),
+                        );
                     }
                     Err(error) => {
                         this.phase =
@@ -276,12 +346,28 @@ impl ReviewPane {
         }
     }
 
-    /// The file list is in place: count its lines and show the first file.
+    /// Count the files and select the note's file or the first visible file.
     fn files_ready(&mut self, cx: &mut Context<Self>) {
         self.listings += 1;
+        let key = self.scope_key();
+        let note = self
+            .selected_note
+            .and_then(|id| self.notes.iter().find(|note| note.id == id));
         let first = match &mut self.phase {
             Phase::Ready(ready) => {
-                ready.selected = (!ready.rows.is_empty()).then_some(0);
+                ready.listing = false;
+                ready.selected = note
+                    .and_then(|note| {
+                        ready
+                            .rows
+                            .iter()
+                            .position(|row| row.path == note.anchor.path)
+                    })
+                    .or_else(|| {
+                        ready.rows.iter().position(|row| {
+                            !self.unviewed_only || !self.viewed.is(key.as_deref(), &row.path)
+                        })
+                    });
                 ready.selected
             }
             _ => return,
@@ -291,17 +377,24 @@ impl ReviewPane {
             Some(index) => self.load_diff(index, cx),
             None => {
                 self.requests += 1;
+                self.shown = None;
                 self.diff.update(cx, |diff, cx| {
-                    diff.set_content(DiffContent::Message("No file to show.".into()), cx)
+                    let message = if self.unviewed_only {
+                        "No unviewed files in this diff."
+                    } else {
+                        "No file to show."
+                    };
+                    diff.set_content(DiffContent::Message(message.into()), cx)
                 });
             }
         }
     }
 
     fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
-        if self.scope == scope && !matches!(scope, Scope::PerCommit) {
+        if self.scope == scope {
             return;
         }
+        self.selected_note = None;
         self.scope = scope;
         match scope {
             Scope::Combined => {
@@ -310,13 +403,13 @@ impl ReviewPane {
                 }
                 self.files_ready(cx);
             }
-            Scope::PerCommit => self.select_commit(self.commit, cx),
+            Scope::PerCommit => self.select_commit(self.commit, None, cx),
         }
         cx.notify();
     }
 
-    /// Shows commit `index` on its own: its files and the first one's diff.
-    fn select_commit(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// Shows commit `index` on its own, optionally selecting a note's file.
+    fn select_commit(&mut self, index: usize, note: Option<NoteId>, cx: &mut Context<Self>) {
         let Phase::Ready(ready) = &mut self.phase else {
             return;
         };
@@ -326,12 +419,14 @@ impl ReviewPane {
         let Some(id) = parse(&commit.id) else { return };
         self.scope = Scope::PerCommit;
         self.commit = index;
+        self.selected_note = note;
         ready.rows.clear();
         ready.listing = true;
         ready.selected = None;
         self.listings += 1;
         let listing = self.listings;
         self.requests += 1;
+        self.shown = None;
         self.diff
             .update(cx, |diff, cx| diff.set_content(DiffContent::Loading, cx));
         let paths = self.session.read(cx).discovered.paths.clone();
@@ -359,6 +454,7 @@ impl ReviewPane {
                                 cx,
                             )
                         });
+                        cx.notify();
                         return;
                     }
                 }
@@ -379,8 +475,7 @@ impl ReviewPane {
             return;
         }
         ready.selected = Some(index);
-        self.diff
-            .update(cx, |diff, cx| diff.set_content(DiffContent::Loading, cx));
+        self.selected_note = None;
         self.load_diff(index, cx);
         cx.notify();
     }
@@ -391,9 +486,54 @@ impl ReviewPane {
             && let Some(row) = ready.rows.get(index)
         {
             let path = row.path.clone();
-            self.viewed.toggle(key.as_deref(), &path);
+            let ticked = self.viewed.toggle(key.as_deref(), &path);
+            if self.unviewed_only && ticked && ready.selected == Some(index) {
+                self.next_unviewed(cx);
+            }
             cx.notify();
         }
+    }
+
+    /// Advance in file order, wrapping to the first remaining file.
+    fn unviewed_after_selection(&self) -> Option<usize> {
+        let Phase::Ready(ready) = &self.phase else {
+            return None;
+        };
+        let key = self.scope_key();
+        let is_unviewed = |index: &usize| !self.viewed.is(key.as_deref(), &ready.rows[*index].path);
+        let start = ready.selected.map_or(0, |index| index + 1);
+        (start..ready.rows.len())
+            .chain(0..ready.selected.unwrap_or(0))
+            .find(is_unviewed)
+    }
+
+    fn next_unviewed(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.unviewed_after_selection() {
+            self.select_file(index, cx);
+        } else if self.unviewed_only {
+            self.selected_note = None;
+            self.files_ready(cx);
+        }
+    }
+
+    fn filter_files(&mut self, unviewed_only: bool, cx: &mut Context<Self>) {
+        self.unviewed_only = unviewed_only;
+        let key = self.scope_key();
+        if let Phase::Ready(ready) = &self.phase
+            && !ready.listing
+            && (ready.selected.is_none()
+                || unviewed_only
+                    && ready.selected.is_some_and(|index| {
+                        self.viewed.is(key.as_deref(), &ready.rows[index].path)
+                    }))
+        {
+            if unviewed_only {
+                self.next_unviewed(cx);
+            } else {
+                self.files_ready(cx);
+            }
+        }
+        cx.notify();
     }
 
     /// Works out added and removed lines for the files of the list, off the
@@ -453,6 +593,9 @@ impl ReviewPane {
             return;
         };
         let path = RepoPath(row.path.clone());
+        self.shown = None;
+        self.diff
+            .update(cx, |diff, cx| diff.set_content(DiffContent::Loading, cx));
         self.requests += 1;
         let request = self.requests;
         let paths = self.session.read(cx).discovered.paths.clone();
@@ -576,6 +719,7 @@ impl ReviewPane {
                 if this.reads != read {
                     return;
                 }
+                this.notes_loading = false;
                 match result {
                     Ok(notes) => {
                         this.notes = notes;
@@ -669,26 +813,72 @@ impl ReviewPane {
         .detach();
     }
 
-    /// Shows the file a note is on, in the combined diff.
-    fn open_note(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(path) = self.notes.get(index).map(|note| note.anchor.path.clone()) else {
+    /// Open the combined diff for tip notes when possible, or their commit's diff.
+    fn open_note(&mut self, id: NoteId, cx: &mut Context<Self>) {
+        let (Phase::Ready(ready), Some(note)) =
+            (&self.phase, self.notes.iter().find(|note| note.id == id))
+        else {
             return;
         };
+        let path = note.anchor.path.clone();
+        let combined = note.anchor.commit == ready.out.head
+            && ready.out.files.iter().any(|file| file.path == path);
+        if !combined
+            && let Some(index) = ready
+                .out
+                .commits
+                .iter()
+                .position(|commit| commit.id == note.anchor.commit)
+        {
+            self.unviewed_only = false;
+            self.select_commit(index, Some(id), cx);
+            return;
+        }
+        self.unviewed_only = false;
         self.set_scope(Scope::Combined, cx);
-        let at = match &self.phase {
-            Phase::Ready(ready) => ready.rows.iter().position(|row| row.path == path),
-            _ => None,
-        };
-        if let Some(at) = at {
-            self.select_file(at, cx);
+        self.selected_note = Some(id);
+        self.files_ready(cx);
+        cx.notify();
+    }
+
+    fn next_unresolved_note(&mut self, cx: &mut Context<Self>) {
+        let start = self
+            .notes
+            .iter()
+            .position(|note| Some(note.id) == self.selected_note)
+            .map_or(0, |index| index + 1);
+        if let Some(note) = self.notes[start..]
+            .iter()
+            .chain(&self.notes[..start])
+            .find(|note| note.todo && !note.resolved)
+        {
+            self.open_note(note.id, cx);
         }
     }
 
-    /// Push, as the header's Push does; the strip under the header shows it
-    /// going, and the list is read again when the upstream moves.
+    fn reviewed_push(&self, cx: &Context<Self>) -> Option<Event> {
+        let state = &self.session.read(cx).state;
+        if !matches!(self.phase, Phase::Ready(_))
+            || self.notes_loading
+            || state.reads.freshness != Freshness::Fresh
+            || state.ops.running.is_some()
+            || !state.ops.queued.is_empty()
+            || state.snapshot.disk()?.lock != LockState::Free
+            || review::key_of(state) != self.loaded
+        {
+            return None;
+        }
+        sync::plan(state)
+            .filter(|plan| plan.behind() == 0 && plan.clean)
+            .and_then(|plan| plan.push(false))
+    }
+
+    /// Submit through the normal guarded push flow.
     fn push(&mut self, cx: &mut Context<Self>) {
-        let event = sync::plan(&self.session.read(cx).state).and_then(|plan| plan.push(false));
-        if let Some(event) = event {
+        if let Some(event) = self.reviewed_push(cx)
+            && let Some(key) = self.loaded.clone()
+        {
+            self.push_request = Some((self.session.read(cx).state.ops.next, key));
             self.session
                 .update(cx, |session, cx| session.deliver(event, cx));
         }
@@ -707,8 +897,9 @@ fn rows_of(files: &[shell::commit_detail::ChangedFile]) -> Vec<Row> {
 }
 
 impl Render for ReviewPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
+        let ring = focus::ring_color(cx);
         let back = |cx: &mut Context<Self>| {
             let this = cx.entity();
             Button::new("review-back", "Back to changes")
@@ -731,7 +922,6 @@ impl Render for ReviewPane {
                 .into_any_element()
         };
         let plan = sync::plan(&self.session.read(cx).state);
-        let busy = self.session.read(cx).state.ops.running.is_some();
         let ready = match &self.phase {
             Phase::Idle | Phase::Loading => {
                 return centered("Reading what would be pushed…".into(), None, cx);
@@ -744,18 +934,16 @@ impl Render for ReviewPane {
         };
         let out = &ready.out;
         let count = out.commits.len();
-        if count == 0 {
-            let target = plan
-                .as_ref()
-                .and_then(sync::Plan::push_target)
-                .map(|target| sync::remote_text(&target))
-                .unwrap_or_else(|| "the remote".to_owned());
+        let key = self.loaded.as_ref().expect("a ready review has a range");
+        let target = sync::remote_text(&key.target);
+        let creates_branch = key.target_tip.is_none();
+        if count == 0 && !creates_branch && !key.sets_upstream {
             let has_upstream = plan
                 .as_ref()
                 .is_some_and(|p| p.local.is_some() && p.upstream.is_some());
             let pr_this = cx.entity();
             let mut actions = div().flex().gap(px(SPACE_2)).child(back(cx));
-            if has_upstream {
+            if has_upstream && self.can_create_request {
                 actions = actions.child(
                     Button::new("review-create-pr", "Create Pull / Merge Request")
                         .primary()
@@ -765,7 +953,15 @@ impl Render for ReviewPane {
                 );
             }
             return centered(
-                format!("Nothing to push. This branch has no commits that {target} lacks."),
+                if self.pushed.as_ref().is_some_and(|pushed| {
+                    pushed.head == key.head
+                        && pushed.local == key.local
+                        && pushed.target == key.target
+                }) {
+                    format!("Pushed to {target}.")
+                } else {
+                    format!("Nothing to push. This branch has no commits to send to {target}.")
+                },
                 Some(actions.into_any_element()),
                 cx,
             );
@@ -775,16 +971,9 @@ impl Render for ReviewPane {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or_default();
-        let publishes = plan.as_ref().is_some_and(sync::Plan::publishes);
-        let subtitle = match (&plan, plan.as_ref().and_then(sync::Plan::push_target)) {
-            (Some(plan), Some(target)) => review::subtitle(
-                plan.local.as_ref().map_or("", |name| name.0.as_str()),
-                &sync::remote_text(&target),
-                plan.behind(),
-                publishes,
-            ),
-            _ => String::new(),
-        };
+        let behind = plan.as_ref().map_or(0, sync::Plan::behind);
+        let subtitle = review::subtitle(&key.local.0, &target, behind, creates_branch);
+        let push_action = review::push_label(count, out.truncated, creates_branch);
         let scope_key = self.scope_key();
         let scope = self.scope;
         let selected_commit = self.commit;
@@ -829,11 +1018,14 @@ impl Render for ReviewPane {
                         div()
                             .text_style(&TEXT_TITLE, cx)
                             .text_color(hsla(p.ink))
-                            .child(review::title(count, out.truncated)),
+                            .child(if count == 0 {
+                                "Review branch before pushing".to_owned()
+                            } else {
+                                review::title(count, out.truncated)
+                            }),
                     )
                     .child(
                         div()
-                            .truncate()
                             .text_style(&TEXT_SMALL, cx)
                             .text_color(hsla(p.ink_muted))
                             .child(subtitle),
@@ -861,17 +1053,26 @@ impl Render for ReviewPane {
             let chosen = scope == Scope::PerCommit && index == selected_commit;
             let this = cx.entity();
             let hover = hsla(p.bg_hover);
+            let commit_id = ElementId::from(("review-commit", index));
+            let handle = focus::handle(&commit_id, window, cx);
             let mut row = div()
-                .id(("review-commit", index))
+                .id(commit_id)
+                .track_focus(&handle)
+                .tab_stop(true)
+                .relative()
                 .flex()
                 .flex_col()
                 .px(px(SPACE_2))
-                .py(px(SPACE_1 + 2.0))
+                .py(px(SPACE_2))
                 .rounded(px(RADIUS_MD))
                 .cursor_pointer()
-                .on_click(move |_, _, cx| this.update(cx, |pane, cx| pane.select_commit(index, cx)))
+                .focus_visible(move |style| focus::ring(style, ring))
+                .on_click(move |_, _, cx| {
+                    this.update(cx, |pane, cx| pane.select_commit(index, None, cx))
+                })
                 .child(
                     div()
+                        .min_w(px(0.))
                         .truncate()
                         .text_style(&TEXT_BODY, cx)
                         .text_color(hsla(p.ink))
@@ -892,7 +1093,16 @@ impl Render for ReviewPane {
                         .children(commit.is_merge.then_some("merge")),
                 );
             row = if chosen {
-                row.bg(hsla(p.bg_raised))
+                row.bg(hsla(p.bg_raised)).child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(SPACE_1))
+                        .bottom(px(SPACE_1))
+                        .w(px(focus::ACCENT_BAR_W))
+                        .rounded(px(RADIUS_SM))
+                        .bg(hsla(p.accent)),
+                )
             } else {
                 row.hover(move |style| style.bg(hover))
             };
@@ -904,16 +1114,44 @@ impl Render for ReviewPane {
             scope_key.as_deref(),
             ready.rows.iter().map(|r| r.path.as_str()),
         );
-        let mut files = div().flex().flex_col().gap(px(SPACE_1)).child(
-            div()
-                .flex()
-                .justify_between()
-                .px(px(SPACE_2))
-                .text_style(&TEXT_LABEL, cx)
-                .text_color(hsla(p.ink_muted))
-                .child(format!("FILES · {}", ready.rows.len()))
-                .child(format!("{done} OF {} VIEWED", ready.rows.len())),
-        );
+        let (filter_this, next_file) = (cx.entity(), cx.entity());
+        let mut files = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_1))
+            .child(
+                div()
+                    .px(px(SPACE_2))
+                    .text_style(&TEXT_LABEL, cx)
+                    .text_color(hsla(p.ink_muted))
+                    .child(format!(
+                        "FILES · {}",
+                        review::viewed_text(done, ready.rows.len())
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(SPACE_2))
+                    .child(Segmented::new(
+                        "review-file-filter",
+                        vec!["All files".into(), "Unviewed".into()],
+                        usize::from(self.unviewed_only),
+                        move |index, _, cx| {
+                            filter_this.update(cx, |pane, cx| pane.filter_files(index == 1, cx))
+                        },
+                    ))
+                    .child(
+                        Button::new("review-next-unviewed", "Next unviewed")
+                            .compact()
+                            .disabled(self.unviewed_after_selection().is_none())
+                            .on_click(move |_, _, cx| {
+                                next_file.update(cx, |pane, cx| pane.next_unviewed(cx))
+                            }),
+                    ),
+            );
         if ready.listing {
             files = files.child(
                 div()
@@ -922,21 +1160,38 @@ impl Render for ReviewPane {
                     .text_color(hsla(p.ink_muted))
                     .child("Reading the files…"),
             );
+        } else if self.unviewed_only && done == ready.rows.len() {
+            files = files.child(
+                div()
+                    .px(px(SPACE_2))
+                    .text_style(&TEXT_SMALL, cx)
+                    .text_color(hsla(p.ink_muted))
+                    .child("No unviewed files in this diff."),
+            );
         }
         for (index, row) in ready.rows.iter().enumerate() {
             let chosen = ready.selected == Some(index);
             let ticked = self.viewed.is(scope_key.as_deref(), &row.path);
+            if self.unviewed_only && ticked {
+                continue;
+            }
             let (select, tick) = (cx.entity(), cx.entity());
             let hover = hsla(p.bg_hover);
+            let file_id = ElementId::from(("review-file", index));
+            let handle = focus::handle(&file_id, window, cx);
             let mut line = div()
-                .id(("review-file", index))
+                .id(file_id)
+                .track_focus(&handle)
+                .tab_stop(true)
+                .relative()
                 .flex()
                 .items_center()
                 .gap(px(SPACE_2))
-                .h(px(28.))
+                .h(px(ROW_LIST))
                 .px(px(SPACE_2))
                 .rounded(px(RADIUS_MD))
                 .cursor_pointer()
+                .focus_visible(move |style| focus::ring(style, ring))
                 .on_click(move |_, _, cx| select.update(cx, |pane, cx| pane.select_file(index, cx)))
                 .child(
                     Checkbox::new(
@@ -948,13 +1203,14 @@ impl Render for ReviewPane {
                         },
                     )
                     .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
                         tick.update(cx, |pane, cx| pane.toggle_viewed(index, cx))
                     }),
                 )
                 .child(
                     div()
                         .flex_none()
-                        .w(px(14.))
+                        .w(px(LANE))
                         .text_style(&TEXT_CODE_SMALL, cx)
                         .text_color(hsla(match row.change {
                             Change::Added => p.add_ink,
@@ -990,7 +1246,16 @@ impl Render for ReviewPane {
                     );
             }
             line = if chosen {
-                line.bg(hsla(p.bg_raised))
+                line.bg(hsla(p.bg_raised)).child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(SPACE_1))
+                        .bottom(px(SPACE_1))
+                        .w(px(focus::ACCENT_BAR_W))
+                        .rounded(px(RADIUS_SM))
+                        .bg(hsla(p.accent)),
+                )
             } else {
                 line.hover(move |style| style.bg(hover))
             };
@@ -1021,21 +1286,12 @@ impl Render for ReviewPane {
             let (id, todo, resolved) = (note.id, note.todo, note.resolved);
             let mut head = div().flex().items_center().gap(px(SPACE_2));
             if todo {
-                let (text, fg, bg) = if resolved {
-                    ("RESOLVED", p.ink_muted, p.bg_raised)
+                let (text, tone) = if resolved {
+                    ("Resolved", PillTone::Neutral)
                 } else {
-                    ("TO-DO", p.warning, p.warning_soft)
+                    ("To-do", PillTone::Warning)
                 };
-                head = head.child(
-                    div()
-                        .flex_none()
-                        .px(px(SPACE_1 + 2.0))
-                        .rounded(px(RADIUS_MD / 2.0))
-                        .bg(hsla(bg))
-                        .text_style(&TEXT_LABEL, cx)
-                        .text_color(hsla(fg))
-                        .child(text),
-                );
+                head = head.child(Pill::new(text).tone(tone).compact());
             }
             head = head.child(
                 div()
@@ -1055,6 +1311,7 @@ impl Render for ReviewPane {
                         if resolved { "Reopen" } else { "Resolve" },
                     )
                     .ghost()
+                    .compact()
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         toggle.update(cx, |pane, cx| {
@@ -1066,25 +1323,29 @@ impl Render for ReviewPane {
             buttons = buttons.child(
                 Button::new(("review-note-delete", index), "Delete")
                     .ghost()
+                    .compact()
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         change.update(cx, |pane, cx| pane.change_note(id, NoteChange::Delete, cx))
                     }),
             );
+            let note_id = ElementId::from(("review-note", index));
+            let handle = focus::handle(&note_id, window, cx);
             notes = notes.child(
                 div()
-                    .id(("review-note", index))
+                    .id(note_id)
+                    .track_focus(&handle)
+                    .tab_stop(true)
                     .flex()
                     .flex_col()
                     .gap(px(SPACE_1))
                     .px(px(SPACE_2))
-                    .py(px(SPACE_1 + 2.0))
+                    .py(px(SPACE_2))
                     .rounded(px(RADIUS_MD))
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover))
-                    .on_click(move |_, _, cx| {
-                        open_it.update(cx, |pane, cx| pane.open_note(index, cx))
-                    })
+                    .focus_visible(move |style| focus::ring(style, ring))
+                    .on_click(move |_, _, cx| open_it.update(cx, |pane, cx| pane.open_note(id, cx)))
                     .child(head)
                     .child(
                         div()
@@ -1103,16 +1364,14 @@ impl Render for ReviewPane {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(340.))
+            .w(px(self.aside_w))
             .gap(px(SPACE_4))
             .p(px(SPACE_2))
             .overflow_y_scroll()
             .bg(hsla(p.bg_panel))
-            .border_r_1()
-            .border_color(hsla(p.line))
-            .child(commits)
             .child(files)
-            .child(notes);
+            .child(notes)
+            .child(commits);
 
         // The form for a new note, on the file on show.
         let form = self.shown.as_ref().map(|(path, _)| {
@@ -1148,32 +1407,21 @@ impl Render for ReviewPane {
                                 .flex_col()
                                 .gap(px(SPACE_2))
                                 .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(SPACE_2))
-                                        .child(
-                                            Checkbox::new(
-                                                "review-note-todo",
-                                                if self.note_todo {
-                                                    CheckState::Checked
-                                                } else {
-                                                    CheckState::Unchecked
-                                                },
-                                            )
-                                            .on_click(move |_, _, cx| {
-                                                todo.update(cx, |pane, cx| {
-                                                    pane.note_todo = !pane.note_todo;
-                                                    cx.notify();
-                                                })
-                                            }),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_style(&TEXT_SMALL, cx)
-                                                .text_color(hsla(p.ink))
-                                                .child("To-do"),
-                                        ),
+                                    Checkbox::new(
+                                        "review-note-todo",
+                                        if self.note_todo {
+                                            CheckState::Checked
+                                        } else {
+                                            CheckState::Unchecked
+                                        },
+                                    )
+                                    .label("To-do")
+                                    .on_click(move |_, _, cx| {
+                                        todo.update(cx, |pane, cx| {
+                                            pane.note_todo = !pane.note_todo;
+                                            cx.notify();
+                                        })
+                                    }),
                                 )
                                 .child(Button::new("review-note-add", "Add note").on_click(
                                     move |_, _, cx| add.update(cx, |pane, cx| pane.add_note(cx)),
@@ -1191,12 +1439,41 @@ impl Render for ReviewPane {
             form
         });
 
+        let note_location = self.selected_note.and_then(|id| {
+            let note = self.notes.iter().find(|note| note.id == id)?;
+            let matching_file = ready
+                .selected
+                .and_then(|index| ready.rows.get(index))
+                .is_some_and(|row| row.path == note.anchor.path);
+            Some(
+                div()
+                    .flex_none()
+                    .max_h(px(ROW_LIST * 3.0))
+                    .overflow_hidden()
+                    .px(px(SPACE_3))
+                    .py(px(SPACE_2))
+                    .border_b_1()
+                    .border_color(hsla(p.line))
+                    .bg(hsla(p.bg_panel))
+                    .text_style(&TEXT_SMALL, cx)
+                    .text_color(hsla(p.ink))
+                    .child(if ready.listing || matching_file {
+                        format!("Note on {} · {}", review::place(note), note.body)
+                    } else {
+                        format!(
+                            "The file for the note on {} is unavailable in this diff.",
+                            review::place(note)
+                        )
+                    }),
+            )
+        });
         let main = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
+            .children(note_location)
             .child(
                 div()
                     .flex_1()
@@ -1206,11 +1483,18 @@ impl Render for ReviewPane {
             )
             .children(form);
 
-        let total = ready.rows.len();
-        let push_this = cx.entity();
-        let can_push = plan.as_ref().is_some_and(sync::Plan::can_push) && !busy;
+        let (push_this, next_note) = (cx.entity(), cx.entity());
+        let can_push = self.reviewed_push(cx).is_some();
+        let push_scope = if count > 0 {
+            format!("All outgoing commits to {target}")
+        } else if creates_branch {
+            format!("Create the remote branch {target}")
+        } else {
+            format!("Set {target} as upstream")
+        };
         let footer = div()
             .flex()
+            .flex_wrap()
             .flex_none()
             .items_center()
             .gap(px(SPACE_3))
@@ -1219,30 +1503,39 @@ impl Render for ReviewPane {
             .border_t_1()
             .border_color(hsla(p.line))
             .bg(hsla(p.bg_panel))
-            .children(review::todo_warning(open).map(|text| {
+            .children(
+                review::todo_warning(open)
+                    .map(|text| Pill::new(text).tone(PillTone::Warning).compact()),
+            )
+            .children((open > 0).then(|| {
+                Button::new("review-next-open-note", "Next to-do")
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        next_note.update(cx, |pane, cx| pane.next_unresolved_note(cx))
+                    })
+            }))
+            .children(self.notes_loading.then(|| {
                 div()
                     .text_style(&TEXT_SMALL, cx)
-                    .text_color(hsla(p.warning))
-                    .child(format!("⚠ {text}"))
+                    .text_color(hsla(p.ink_muted))
+                    .child("Loading review notes…")
             }))
             .child(
                 div()
                     .text_style(&TEXT_SMALL, cx)
                     .text_color(hsla(p.ink_muted))
-                    .child(review::viewed_text(done, total)),
+                    .child(push_scope),
             )
             .child(div().flex_1())
             .child(back(cx))
             .child(
-                Button::new(
-                    "review-push",
-                    review::push_label(count, out.truncated, publishes),
-                )
-                .primary()
-                .disabled(!can_push)
-                .on_click(move |_, _, cx| push_this.update(cx, |pane, cx| pane.push(cx))),
+                Button::new("review-push", push_action)
+                    .primary()
+                    .disabled(!can_push)
+                    .on_click(move |_, _, cx| push_this.update(cx, |pane, cx| pane.push(cx))),
             );
 
+        let resize_aside = cx.entity();
         div()
             .flex()
             .flex_col()
@@ -1251,7 +1544,38 @@ impl Render for ReviewPane {
             .min_h(px(0.))
             .bg(hsla(p.bg_app))
             .child(header)
-            .child(div().flex().flex_1().min_h(px(0.)).child(aside).child(main))
+            .children(self.range_changed.then(|| {
+                div()
+                    .flex_none()
+                    .px(px(SPACE_4))
+                    .py(px(SPACE_2))
+                    .bg(hsla(p.warning_soft))
+                    .text_style(&TEXT_SMALL, cx)
+                    .text_color(hsla(p.warning))
+                    .child("The outgoing range or destination changed. Viewed progress was reset.")
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(aside)
+                    .child(ResizeHandle::new(
+                        "review-aside-resize",
+                        self.aside_w,
+                        ASIDE_W,
+                        ASIDE_MIN,
+                        ASIDE_MAX,
+                        ResizeEdge::Right,
+                        move |width, _, cx| {
+                            resize_aside.update(cx, |pane, cx| {
+                                pane.aside_w = width;
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .child(main),
+            )
             .child(footer)
             .into_any_element()
     }

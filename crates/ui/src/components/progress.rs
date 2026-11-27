@@ -35,6 +35,7 @@ impl RenderOnce for ProgressBar {
             .w_full()
             .h(px(SPACE_1))
             .rounded(px(RADIUS_SM))
+            .overflow_hidden()
             .bg(hsla(p.bg_raised))
             .child(
                 div()

@@ -38,6 +38,12 @@ pub enum HistoryEvent {
     Failed(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryScope {
+    AllRefs,
+    Head,
+}
+
 /// Starts the walk on its own thread. Set `cancel` to stop it (a refresh
 /// replaces the walk). `limit` caps the number of commits (for tests and
 /// for huge repos while the UI is still being tuned).
@@ -46,11 +52,20 @@ pub fn walk(
     limit: Option<usize>,
     cancel: Arc<AtomicBool>,
 ) -> Receiver<HistoryEvent> {
+    walk_scoped(paths, limit, HistoryScope::AllRefs, cancel)
+}
+
+pub fn walk_scoped(
+    paths: RepoPaths,
+    limit: Option<usize>,
+    scope: HistoryScope,
+    cancel: Arc<AtomicBool>,
+) -> Receiver<HistoryEvent> {
     let (tx, rx) = channel();
     let spawned = thread::Builder::new().name("history walk".into()).spawn({
         let tx = tx.clone();
         move || {
-            if let Err(error) = run(&paths, limit, &cancel, &tx) {
+            if let Err(error) = run(&paths, limit, scope, &cancel, &tx) {
                 let _ = tx.send(HistoryEvent::Failed(error));
             }
         }
@@ -217,11 +232,20 @@ fn shallow_order(
 fn run(
     paths: &RepoPaths,
     limit: Option<usize>,
+    scope: HistoryScope,
     cancel: &AtomicBool,
     tx: &Sender<HistoryEvent>,
 ) -> Result<(), String> {
     let repo = precondition::open(paths)?;
-    let tips = tips(&repo)?;
+    let tips = match scope {
+        HistoryScope::AllRefs => tips(&repo)?,
+        HistoryScope::Head => repo
+            .head_id()
+            .ok()
+            .map(|id| id.detach())
+            .into_iter()
+            .collect(),
+    };
     let boundary = shallow(paths, &repo);
     let commit_graph = repo.commit_graph().ok();
     let _ = tx.send(HistoryEvent::Started {

@@ -11,25 +11,26 @@
 //!   or network until the user opens this panel.
 
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    AppContext, Context, ElementId, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 use invoke_core::forge::{
     BranchUpstream, ConfiguredRemote, CreatePrProblem, ForgeKind, PrCreateTarget, PrFilter,
-    PrListTarget, PrTargetError, PullRequest, default_pr_branch, filter_prs, pr_fetch_ref,
+    PrListTarget, PrState, PrTargetError, PullRequest, default_pr_branch, filter_prs, pr_fetch_ref,
     resolve_create_target_with_config, resolve_remote_for_list, validate_create_pr,
 };
-use invoke_core::{Event, Head, Snapshot};
+use invoke_core::{BranchName, Event, Freshness, Head, LockState, Phase, Snapshot};
 use shell::forge::{ForgeError, ForgeService};
 use shell::read::{read_branch_upstream, read_remotes};
 use tokens::{
-    DIALOG, RADIUS_MD, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM,
-    TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL, TEXT_TITLE,
+    DIALOG, RADIUS_LG, RADIUS_MD, RADIUS_SM, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_6,
+    TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_CODE_SMALL, TEXT_LABEL, TEXT_SMALL, TEXT_TITLE,
 };
-use ui::convert::hsla;
+use ui::convert::{hsla, shadows};
+use ui::focus;
 use ui::{
-    Banner, BannerKind, Button, CheckState, Checkbox, Divider, EditorEvent, Pill, Segmented,
-    TextEditor, TextStyleExt, ThemeExt,
+    Banner, BannerKind, Button, CheckState, Checkbox, Divider, EditorEvent, Pill, PillTone,
+    ResizeEdge, ResizeHandle, Segmented, TextEditor, TextStyleExt, ThemeExt,
 };
 
 use crate::forge_accounts::{AccountsEvent, AccountsView, is_web_url, open_service};
@@ -37,6 +38,8 @@ use crate::session::RepoSession;
 
 /// Width of the PR/MR list column.
 const PR_LIST_W: f32 = SIDEBAR + SPACE_4 * 7.0;
+const PR_LIST_MIN: f32 = SIDEBAR;
+const PR_LIST_MAX: f32 = DIALOG + SPACE_4 * 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -59,9 +62,16 @@ struct ReadyState {
     prs: Vec<PullRequest>,
     more: Option<String>,
     loading_more: bool,
+    page_error: Option<String>,
     selected: Option<u64>,
-    detail: Option<PullRequest>,
-    loading_detail: bool,
+    detail: Detail,
+}
+
+enum Detail {
+    Idle,
+    Loading,
+    Ready(Box<PullRequest>),
+    Failed(String),
 }
 
 enum CreateState {
@@ -100,17 +110,20 @@ pub struct PrPane {
     create_body: Entity<TextEditor>,
     create_draft: bool,
     create_state: CreateState,
+    list_w: f32,
     _subscriptions: Vec<Subscription>,
 }
 
 impl PrPane {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| TextEditor::new("Filter pull requests…", 1, cx).single_line());
+        let search =
+            cx.new(|cx| TextEditor::new("Search title, author or branch", 1, cx).single_line());
         let create_title = cx.new(|cx| TextEditor::new("Pull request title", 1, cx).single_line());
         let create_base = cx.new(|cx| TextEditor::new("main", 1, cx).single_line());
         let create_body = cx.new(|cx| TextEditor::new("Describe your changes (optional)", 5, cx));
-        let search_sub = cx.subscribe(&search, |_, _, event: &EditorEvent, cx| {
+        let search_sub = cx.subscribe(&search, |this, _, event: &EditorEvent, cx| {
             if matches!(event, EditorEvent::Changed) {
+                this.clear_hidden_selection(cx);
                 cx.notify();
             }
         });
@@ -141,7 +154,15 @@ impl PrPane {
             create_body,
             create_draft: false,
             create_state: CreateState::Idle,
+            list_w: PR_LIST_W,
             _subscriptions: vec![search_sub, session_sub],
+        }
+    }
+
+    pub fn focus_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == Mode::Browse && matches!(self.phase, LoadPhase::Ready(_)) {
+            self.search
+                .update(cx, |search, cx| search.focus(window, cx));
         }
     }
 
@@ -233,6 +254,10 @@ impl PrPane {
         };
         let preferred = self.preferred_remote.clone();
         let filter = self.filter;
+        let selection = match &self.phase {
+            LoadPhase::Ready(ready) => ready.selected.map(|id| (ready.target.clone(), id)),
+            _ => None,
+        };
         self.phase = LoadPhase::Loading;
         cx.notify();
 
@@ -282,17 +307,24 @@ impl PrPane {
                         this.service = Some(service);
                         this.remotes = remotes;
                         this.configured_upstream = configured_upstream;
-                        let first = listing.prs.first().map(|p| p.number);
+                        let visible = filter_prs(&listing.prs, this.search.read(cx).text());
+                        let selected = selection
+                            .filter(|(previous, id)| {
+                                *previous == target
+                                    && visible.iter().any(|&i| listing.prs[i].number == *id)
+                            })
+                            .map(|(_, id)| id)
+                            .or_else(|| visible.first().map(|&i| listing.prs[i].number));
                         this.phase = LoadPhase::Ready(Box::new(ReadyState {
                             target,
                             prs: listing.prs,
                             more: listing.more,
                             loading_more: false,
-                            selected: first,
-                            detail: None,
-                            loading_detail: false,
+                            page_error: None,
+                            selected,
+                            detail: Detail::Idle,
                         }));
-                        if let Some(num) = first {
+                        if let Some(num) = selected {
                             this.load_detail(num, cx);
                         }
                     }
@@ -338,9 +370,13 @@ impl PrPane {
         };
         let (key, repo_path) = match &mut self.phase {
             LoadPhase::Ready(ready) => {
+                if ready.selected == Some(number)
+                    && matches!(ready.detail, Detail::Loading | Detail::Ready(_))
+                {
+                    return;
+                }
                 ready.selected = Some(number);
-                ready.detail = None;
-                ready.loading_detail = true;
+                ready.detail = Detail::Loading;
                 (ready.target.account.key(), ready.target.repo.path.clone())
             }
             _ => return,
@@ -359,16 +395,29 @@ impl PrPane {
                     return;
                 }
                 if let LoadPhase::Ready(ready) = &mut this.phase {
-                    ready.loading_detail = false;
-                    if let Ok(pr) = result {
-                        ready.detail = Some(pr);
-                    }
+                    ready.detail = match result {
+                        Ok(pr) => Detail::Ready(Box::new(pr)),
+                        Err(error) => Detail::Failed(error.user_message()),
+                    };
                 }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn clear_hidden_selection(&mut self, cx: &Context<Self>) {
+        if let LoadPhase::Ready(ready) = &mut self.phase
+            && let Some(number) = ready.selected
+            && !filter_prs(&ready.prs, self.search.read(cx).text())
+                .iter()
+                .any(|&i| ready.prs[i].number == number)
+        {
+            self.detail_gen += 1;
+            ready.selected = None;
+            ready.detail = Detail::Idle;
+        }
     }
 
     fn load_more(&mut self, cx: &mut Context<Self>) {
@@ -384,6 +433,7 @@ impl PrPane {
                     return;
                 };
                 ready.loading_more = true;
+                ready.page_error = None;
                 (
                     ready.target.account.key(),
                     ready.target.repo.path.clone(),
@@ -409,9 +459,12 @@ impl PrPane {
                 }
                 if let LoadPhase::Ready(ready) = &mut this.phase {
                     ready.loading_more = false;
-                    if let Ok(page) = result {
-                        ready.prs.extend(page.prs);
-                        ready.more = page.next;
+                    match result {
+                        Ok(page) => {
+                            ready.prs.extend(page.prs);
+                            ready.more = page.next;
+                        }
+                        Err(error) => ready.page_error = Some(error.user_message()),
                     }
                 }
                 cx.notify();
@@ -421,13 +474,23 @@ impl PrPane {
         .detach();
     }
 
-    fn checkout_pr(&mut self, pr: &PullRequest, target: &PrListTarget, cx: &mut Context<Self>) {
-        let Some(remote_ref) = pr_fetch_ref(target.account.kind, pr.number) else {
+    fn checkout_pr(&mut self, number: u64, cx: &mut Context<Self>) {
+        let LoadPhase::Ready(ready) = &self.phase else {
             return;
         };
-        let Some(local_branch) = default_pr_branch(target.account.kind, pr.number) else {
+        if ready.selected != Some(number) {
+            return;
+        }
+        let target = &ready.target;
+        let Some(remote_ref) = pr_fetch_ref(target.account.kind, number) else {
             return;
         };
+        let Some(local_branch) = default_pr_branch(target.account.kind, number) else {
+            return;
+        };
+        if self.checkout_blocker(&local_branch, cx).is_some() {
+            return;
+        }
         let event = Event::CheckoutPrRequested {
             remote: target.remote_name.clone(),
             remote_ref,
@@ -435,6 +498,47 @@ impl PrPane {
         };
         self.session
             .update(cx, |session, cx| session.deliver(event, cx));
+    }
+
+    fn checkout_blocker(&self, branch: &BranchName, cx: &Context<Self>) -> Option<String> {
+        let state = &self.session.read(cx).state;
+        let Some(disk) = state.snapshot.disk() else {
+            return Some("Waiting for the repository to finish loading.".into());
+        };
+        if state.reads.freshness != Freshness::Fresh {
+            return Some("Waiting for an up-to-date repository state.".into());
+        }
+        if state.ops.running.is_some()
+            || !state.ops.queued.is_empty()
+            || disk.phase != Phase::Clean
+            || disk.lock != LockState::Free
+        {
+            return Some(
+                "Finish the current Git operation before checking out this request.".into(),
+            );
+        }
+        if !disk.status.entries.is_empty() {
+            return Some(
+                "Commit, stash, or discard your local changes before checking out.".into(),
+            );
+        }
+        let target = branch.to_ref();
+        if disk.refs.refs.contains_key(&target) {
+            return Some(format!(
+                "Local branch {} already exists. Switch to it from Branches.",
+                branch.0
+            ));
+        }
+        let target_prefix = format!("{}/", target.0);
+        disk.refs.refs.keys().find_map(|reference| {
+            let name = reference.0.strip_prefix("refs/heads/")?;
+            (reference.0.starts_with(&target_prefix)
+                || target
+                    .0
+                    .strip_prefix(reference.0.as_str())
+                    .is_some_and(|rest| rest.starts_with('/')))
+            .then(|| format!("Local branch {name} conflicts with the name {}.", branch.0))
+        })
     }
 
     fn prefill_create_form(&mut self, cx: &mut Context<Self>) {
@@ -666,8 +770,26 @@ fn kind_prefix(kind: ForgeKind) -> &'static str {
     }
 }
 
+fn state_pill(state: PrState) -> Pill {
+    let tone = match state {
+        PrState::Open => PillTone::Success,
+        PrState::Merged => PillTone::Accent,
+        PrState::Closed => PillTone::Neutral,
+    };
+    Pill::new(state.label()).tone(tone)
+}
+
+fn source_branch(pr: &PullRequest, target: &PrListTarget) -> String {
+    match &pr.head_repo {
+        Some(repo) if !repo.eq_ignore_ascii_case(&target.repo.path) => {
+            format!("{repo}:{}", pr.head_branch)
+        }
+        _ => pr.head_branch.clone(),
+    }
+}
+
 impl Render for PrPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
 
         if self.mode == Mode::Accounts
@@ -701,12 +823,15 @@ impl Render for PrPane {
             filter_idx,
             move |idx, _, cx| {
                 this.update(cx, |pane, cx| {
-                    pane.filter = match idx {
+                    let filter = match idx {
                         0 => PrFilter::Open,
                         1 => PrFilter::Closed,
                         _ => PrFilter::All,
                     };
-                    pane.ensure_service_and_reload(cx);
+                    if pane.filter != filter {
+                        pane.filter = filter;
+                        pane.ensure_service_and_reload(cx);
+                    }
                 })
             },
         );
@@ -714,6 +839,7 @@ impl Render for PrPane {
         let refresh_entity = cx.entity();
         let accounts_entity = cx.entity();
         let create_entity = cx.entity();
+        let clear_search = self.search.clone();
         let mut toolbar = div()
             .flex()
             .flex_wrap()
@@ -732,7 +858,17 @@ impl Render for PrPane {
                     .min_w(px(SIDEBAR - SPACE_4 * 2.0))
                     .max_w(px(SIDEBAR))
                     .child(self.search.clone()),
-            );
+            )
+            .children((!self.search.read(cx).is_empty()).then(|| {
+                Button::new("pr-clear-search", "Clear search")
+                    .ghost()
+                    .on_click(move |_, window, cx| {
+                        clear_search.update(cx, |editor, cx| {
+                            editor.set_text("", cx);
+                            editor.focus(window, cx);
+                        })
+                    })
+            }));
 
         if self.remotes.len() > 1 {
             let labels: Vec<SharedString> =
@@ -826,18 +962,7 @@ impl Render for PrPane {
                 self.centered_message(message, Some(actions.into_any_element()), cx)
                     .into_any_element()
             }
-            LoadPhase::Ready(ready) => self
-                .render_ready(
-                    &ready.target,
-                    &ready.prs,
-                    ready.more.is_some(),
-                    ready.loading_more,
-                    ready.selected,
-                    ready.detail.as_ref(),
-                    ready.loading_detail,
-                    cx,
-                )
-                .into_any_element(),
+            LoadPhase::Ready(ready) => self.render_ready(ready, window, cx).into_any_element(),
         };
 
         div()
@@ -880,33 +1005,31 @@ impl PrPane {
     #[allow(clippy::too_many_arguments)]
     fn render_ready(
         &self,
-        target: &PrListTarget,
-        prs: &[PullRequest],
-        has_more: bool,
-        loading_more: bool,
-        selected: Option<u64>,
-        detail: Option<&PullRequest>,
-        loading_detail: bool,
+        ready: &ReadyState,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let p = cx.palette();
+        let ring = focus::ring_color(cx);
+        let target = &ready.target;
+        let prs = &ready.prs;
         let query = self.search.read(cx).text();
+        let searching = !query.trim().is_empty();
         let visible = filter_prs(prs, query);
         let prefix = kind_prefix(target.account.kind);
+        let noun = kind_noun(target.account.kind);
 
         let mut list = div()
             .id("pr-list-scroll")
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(PR_LIST_W))
+            .w(px(self.list_w))
             .h_full()
             .overflow_y_scroll()
             .gap(px(SPACE_1))
             .p(px(SPACE_2))
             .bg(hsla(p.bg_panel))
-            .border_r_1()
-            .border_color(hsla(p.line))
             .child(
                 div()
                     .px(px(SPACE_2))
@@ -914,7 +1037,7 @@ impl PrPane {
                     .text_style(&TEXT_LABEL, cx)
                     .text_color(hsla(p.ink_muted))
                     .child(format!(
-                        "{} · {} OF {}",
+                        "{} · {} of {} loaded",
                         target.repo.path,
                         visible.len(),
                         prs.len()
@@ -928,18 +1051,35 @@ impl PrPane {
                     .py(px(SPACE_3))
                     .text_style(&TEXT_SMALL, cx)
                     .text_color(hsla(p.ink_muted))
-                    .child("No matching pull/merge requests."),
+                    .child(if searching && ready.more.is_some() {
+                        "No matches in the loaded requests. Load more to continue searching."
+                            .to_owned()
+                    } else if searching {
+                        "No matching requests.".to_owned()
+                    } else {
+                        match self.filter {
+                            PrFilter::Open => "No open requests.",
+                            PrFilter::Closed => "No closed requests.",
+                            PrFilter::All => "No requests.",
+                        }
+                        .to_owned()
+                    }),
             );
         }
 
         for idx in visible {
             let pr = &prs[idx];
-            let is_sel = selected == Some(pr.number);
+            let is_sel = ready.selected == Some(pr.number);
             let num = pr.number;
             let sel_entity = cx.entity();
             let hover = hsla(p.bg_hover);
+            let row_id = ElementId::from(("pr-row", idx));
+            let handle = focus::handle(&row_id, window, cx);
             let mut row = div()
-                .id(("pr-row", idx))
+                .id(row_id)
+                .track_focus(&handle)
+                .tab_stop(true)
+                .relative()
                 .flex()
                 .flex_col()
                 .gap(px(SPACE_1))
@@ -947,6 +1087,7 @@ impl PrPane {
                 .py(px(SPACE_2))
                 .rounded(px(RADIUS_MD))
                 .cursor_pointer()
+                .focus_visible(move |style| focus::ring(style, ring))
                 .on_click(move |_, _, cx| {
                     sel_entity.update(cx, |pane, cx| pane.load_detail(num, cx))
                 })
@@ -970,7 +1111,8 @@ impl PrPane {
                                 .text_style(&TEXT_BODY_MEDIUM, cx)
                                 .text_color(hsla(p.ink))
                                 .child(pr.title.clone()),
-                        ),
+                        )
+                        .child(state_pill(pr.state).compact()),
                 )
                 .child(
                     div()
@@ -979,36 +1121,68 @@ impl PrPane {
                         .gap(px(SPACE_2))
                         .text_style(&TEXT_SMALL, cx)
                         .text_color(hsla(p.ink_muted))
-                        .child(pr.author.clone())
-                        .child("·")
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .truncate()
-                                .child(format!("{} -> {}", pr.head_branch, pr.base_branch)),
+                                .child(pr.author.clone()),
                         )
-                        .children(pr.draft.then(|| Pill::new("Draft"))),
+                        .children(
+                            pr.draft
+                                .then(|| Pill::new("Draft").tone(PillTone::Neutral).compact()),
+                        ),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_style(&TEXT_CODE_SMALL, cx)
+                        .text_color(hsla(p.ink_muted))
+                        .child(format!(
+                            "{} → {}",
+                            source_branch(pr, target),
+                            pr.base_branch
+                        )),
                 );
             row = if is_sel {
-                row.bg(hsla(p.bg_raised))
+                row.bg(hsla(p.bg_raised)).child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(SPACE_1))
+                        .bottom(px(SPACE_1))
+                        .w(px(focus::ACCENT_BAR_W))
+                        .rounded(px(RADIUS_SM))
+                        .bg(hsla(p.accent)),
+                )
             } else {
                 row.hover(move |s| s.bg(hover))
             };
             list = list.child(row);
         }
 
-        if has_more {
+        if let Some(error) = &ready.page_error {
+            list = list.child(
+                div()
+                    .px(px(SPACE_2))
+                    .text_style(&TEXT_SMALL, cx)
+                    .text_color(hsla(p.warning))
+                    .child(error.clone()),
+            );
+        }
+        if ready.more.is_some() {
             let more_entity = cx.entity();
             list = list.child(
                 div().p(px(SPACE_2)).child(
                     Button::new(
                         "pr-load-more",
-                        if loading_more {
+                        if ready.loading_more {
                             "Loading…"
                         } else {
                             "Load more"
                         },
                     )
-                    .disabled(loading_more)
+                    .disabled(ready.loading_more)
                     .on_click(move |_, _, cx| {
                         more_entity.update(cx, |pane, cx| pane.load_more(cx))
                     }),
@@ -1017,34 +1191,46 @@ impl PrPane {
         }
 
         // Right detail pane
-        let shown_pr =
-            detail.or_else(|| selected.and_then(|num| prs.iter().find(|pr| pr.number == num)));
-        let busy = self.session.read(cx).state.ops.running.is_some();
+        let shown_pr = match &ready.detail {
+            Detail::Ready(pr) => Some(pr.as_ref()),
+            _ => ready
+                .selected
+                .and_then(|num| prs.iter().find(|pr| pr.number == num)),
+        };
 
         let detail_pane = match shown_pr {
             None => self
-                .centered_message("Select a pull/merge request to inspect it.", None, cx)
+                .centered_message(
+                    &format!("Select a {} to inspect it.", noun.to_lowercase()),
+                    None,
+                    cx,
+                )
                 .into_any_element(),
             Some(pr) => {
-                let pr_clone = pr.clone();
-                let target_clone = target.clone();
+                let number = pr.number;
                 let checkout_entity = cx.entity();
-                let branch_label = default_pr_branch(target.account.kind, pr.number)
-                    .map(|b| b.0)
-                    .unwrap_or_else(|| format!("pr/{}", pr.number));
+                let branch = default_pr_branch(target.account.kind, number);
+                let checkout_blocker = branch
+                    .as_ref()
+                    .and_then(|branch| self.checkout_blocker(branch, cx));
                 let web_url = pr.web_url.clone();
                 let can_open = is_web_url(&web_url);
 
-                let state_pill = Pill::new(pr.state.label());
-                let review_pill = Pill::new(pr.review_status.label());
+                let review_label = pr.review_status.label();
+                let review_tone = match review_label {
+                    "Approved" => PillTone::Success,
+                    "Changes requested" => PillTone::Warning,
+                    _ => PillTone::Neutral,
+                };
+                let review_pill = Pill::new(review_label).tone(review_tone);
                 let mut meta = div()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .gap(px(SPACE_2))
-                    .child(state_pill)
-                    .children(pr.draft.then(|| Pill::new("Draft")))
-                    .child(review_pill);
+                    .child(state_pill(pr.state))
+                    .children(pr.draft.then(|| Pill::new("Draft").tone(PillTone::Neutral)))
+                    .children(matches!(ready.detail, Detail::Ready(_)).then_some(review_pill));
                 if let Some(count) = pr.comments_count {
                     meta = meta.child(
                         div()
@@ -1066,23 +1252,19 @@ impl PrPane {
                     );
                 }
 
-                let head_label = match &pr.head_repo {
-                    Some(repo) if !repo.eq_ignore_ascii_case(&target.repo.path) => {
-                        format!("{repo}:{}", pr.head_branch)
-                    }
-                    _ => pr.head_branch.clone(),
-                };
-
-                let mut actions = div().flex().items_center().gap(px(SPACE_2)).child(
-                    Button::new("pr-checkout", format!("Checkout as {branch_label}"))
-                        .primary()
-                        .disabled(busy)
-                        .on_click(move |_, _, cx| {
-                            checkout_entity.update(cx, |pane, cx| {
-                                pane.checkout_pr(&pr_clone, &target_clone, cx)
+                let mut actions = div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(SPACE_2))
+                    .children(branch.map(|branch| {
+                        Button::new("pr-checkout", format!("Checkout as {}", branch.0))
+                            .primary()
+                            .disabled(checkout_blocker.is_some())
+                            .on_click(move |_, _, cx| {
+                                checkout_entity.update(cx, |pane, cx| pane.checkout_pr(number, cx))
                             })
-                        }),
-                );
+                    }));
                 if can_open {
                     actions = actions.child(
                         Button::new("pr-open-web", "Open in browser").on_click(move |_, _, cx| {
@@ -1090,6 +1272,36 @@ impl PrPane {
                         }),
                     );
                 }
+                let detail_status = match &ready.detail {
+                    Detail::Loading => Some(
+                        div()
+                            .text_style(&TEXT_SMALL, cx)
+                            .text_color(hsla(p.ink_muted))
+                            .child("Loading review status…"),
+                    ),
+                    Detail::Failed(error) => {
+                        let retry = cx.entity();
+                        Some(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(SPACE_2))
+                                .text_style(&TEXT_SMALL, cx)
+                                .text_color(hsla(p.warning))
+                                .child(format!("Could not load request details. {error}"))
+                                .child(
+                                    Button::new("pr-detail-retry", "Retry details")
+                                        .compact()
+                                        .on_click(move |_, _, cx| {
+                                            retry
+                                                .update(cx, |pane, cx| pane.load_detail(number, cx))
+                                        }),
+                                ),
+                        )
+                    }
+                    _ => None,
+                };
 
                 div()
                     .id("pr-detail-scroll")
@@ -1099,6 +1311,7 @@ impl PrPane {
                     .min_w(px(0.))
                     .h_full()
                     .overflow_y_scroll()
+                    .bg(hsla(p.bg_panel))
                     .gap(px(SPACE_3))
                     .p(px(SPACE_4))
                     .child(
@@ -1116,20 +1329,28 @@ impl PrPane {
                                 div()
                                     .text_style(&TEXT_SMALL, cx)
                                     .text_color(hsla(p.ink_muted))
-                                    .child(format!(
-                                        "by {} · {} -> {}",
-                                        pr.author, head_label, pr.base_branch
-                                    )),
+                                    .child(format!("Opened by {}", pr.author)),
                             ),
                     )
                     .child(meta)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(SPACE_1))
+                            .text_style(&TEXT_CODE_SMALL, cx)
+                            .text_color(hsla(p.ink_muted))
+                            .child(format!("Source · {}", source_branch(pr, target)))
+                            .child(format!("Target · {}:{}", target.repo.path, pr.base_branch)),
+                    )
                     .child(actions)
-                    .children(loading_detail.then(|| {
+                    .children(checkout_blocker.map(|message| {
                         div()
                             .text_style(&TEXT_SMALL, cx)
                             .text_color(hsla(p.ink_muted))
-                            .child("Loading review status…")
+                            .child(message)
                     }))
+                    .children(detail_status)
                     .child(Divider::horizontal())
                     .child(
                         div()
@@ -1149,12 +1370,27 @@ impl PrPane {
             }
         };
 
+        let resize_list = cx.entity();
         div()
             .flex()
             .flex_1()
             .min_h(px(0.))
             .min_w(px(0.))
             .child(list)
+            .child(ResizeHandle::new(
+                "pr-list-resize",
+                self.list_w,
+                PR_LIST_W,
+                PR_LIST_MIN,
+                PR_LIST_MAX,
+                ResizeEdge::Right,
+                move |width, _, cx| {
+                    resize_list.update(cx, |pane, cx| {
+                        pane.list_w = width;
+                        cx.notify();
+                    });
+                },
+            ))
             .child(detail_pane)
     }
 
@@ -1176,11 +1412,12 @@ impl PrPane {
             .flex_col()
             .w(px(DIALOG))
             .gap(px(SPACE_3))
-            .p(px(SPACE_4))
+            .p(px(SPACE_6))
             .bg(hsla(p.bg_panel))
             .border_1()
             .border_color(hsla(p.line))
-            .rounded(px(RADIUS_MD))
+            .rounded(px(RADIUS_LG))
+            .shadow(shadows(p.shadow_overlay))
             .child(
                 div()
                     .flex()
@@ -1294,7 +1531,7 @@ impl PrPane {
         if let CreateState::Created(pr) = &self.create_state {
             let url = pr.web_url.clone();
             let mut banner = Banner::new(
-                BannerKind::Warning,
+                BannerKind::Success,
                 format!("Created #{}: {}", pr.number, pr.title),
             );
             if is_web_url(&url) {
@@ -1355,32 +1592,21 @@ impl PrPane {
                     .items_center()
                     .justify_between()
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_2))
-                            .child(
-                                Checkbox::new(
-                                    "pr-create-draft",
-                                    if self.create_draft {
-                                        CheckState::Checked
-                                    } else {
-                                        CheckState::Unchecked
-                                    },
-                                )
-                                .on_click(move |_, _, cx| {
-                                    draft_entity.update(cx, |pane, cx| {
-                                        pane.create_draft = !pane.create_draft;
-                                        cx.notify();
-                                    })
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .text_style(&TEXT_SMALL, cx)
-                                    .text_color(hsla(p.ink))
-                                    .child("Create as draft"),
-                            ),
+                        Checkbox::new(
+                            "pr-create-draft",
+                            if self.create_draft {
+                                CheckState::Checked
+                            } else {
+                                CheckState::Unchecked
+                            },
+                        )
+                        .label("Create as draft")
+                        .on_click(move |_, _, cx| {
+                            draft_entity.update(cx, |pane, cx| {
+                                pane.create_draft = !pane.create_draft;
+                                cx.notify();
+                            })
+                        }),
                     )
                     .child(
                         Button::new(

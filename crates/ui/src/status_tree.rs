@@ -12,10 +12,13 @@ use gpui::{
     StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use invoke_core::{FileChange, StatusSnapshot};
-use tokens::{RADIUS_MD, ROW_LIST, SPACE_2, SPACE_3, TEXT_BODY, TEXT_LABEL, TEXT_SMALL};
+use tokens::{
+    LANE, RADIUS_MD, RADIUS_SM, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_6, SPACE_8,
+    TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_LABEL, TEXT_SMALL,
+};
 
 use crate::changes::{Section, letter};
-use crate::components::{Button, CheckState, Checkbox};
+use crate::components::{Button, Icon, IconName};
 use crate::convert::hsla;
 use crate::focus;
 use crate::scrollbar::Scrollbar;
@@ -65,10 +68,13 @@ pub enum TreeAction {
     DiscardAll,
 }
 
-/// The rows for `status`: unstaged first, then staged; a section with no
-/// files has no rows. Folders in `collapsed` hide what is below them.
+/// The rows for `status`: unstaged first, then staged. Show both section
+/// counts while any files are changed. Folders in `collapsed` hide their files.
 pub fn tree_rows(status: &StatusSnapshot, collapsed: &HashSet<(Section, String)>) -> Vec<TreeRow> {
     let mut rows = Vec::new();
+    if status.entries.is_empty() {
+        return rows;
+    }
     for section in [Section::Unstaged, Section::Staged] {
         let files: Vec<(&str, &FileChange)> = match section {
             Section::Unstaged => status
@@ -80,9 +86,6 @@ pub fn tree_rows(status: &StatusSnapshot, collapsed: &HashSet<(Section, String)>
                 .map(|(path, change)| (path.0.as_str(), change))
                 .collect(),
         };
-        if files.is_empty() {
-            continue;
-        }
         rows.push(TreeRow::Header {
             section,
             count: files.len(),
@@ -164,6 +167,8 @@ type OnAction = Rc<dyn Fn(TreeAction, &mut Window, &mut App)>;
 pub struct StatusTree {
     rows: Rc<[TreeRow]>,
     selected: Option<(Section, SharedString)>,
+    empty_title: Option<SharedString>,
+    empty_hint: Option<SharedString>,
     on_action: OnAction,
 }
 
@@ -176,13 +181,72 @@ impl StatusTree {
         Self {
             rows: rows.into(),
             selected,
+            empty_title: None,
+            empty_hint: None,
             on_action: Rc::new(on_action),
         }
+    }
+
+    /// Custom heading shown when the tree has no visible rows.
+    pub fn empty_title(mut self, title: impl Into<SharedString>) -> Self {
+        self.empty_title = Some(title.into());
+        self
+    }
+
+    /// Custom subtitle shown when there are no changed files.
+    pub fn empty_hint(mut self, hint: impl Into<SharedString>) -> Self {
+        self.empty_hint = Some(hint.into());
+        self
     }
 }
 
 impl RenderOnce for StatusTree {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        if self.rows.is_empty() {
+            let p = cx.palette();
+            let title = self
+                .empty_title
+                .unwrap_or_else(|| "Working tree clean".into());
+            let hint = self
+                .empty_hint
+                .unwrap_or_else(|| "Modified, staged, and untracked files appear here.".into());
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .items_center()
+                .justify_center()
+                .gap(px(SPACE_2))
+                .p(px(SPACE_6))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(SPACE_8))
+                        .rounded(px(RADIUS_MD))
+                        .bg(hsla(p.bg_raised))
+                        .border_1()
+                        .border_color(hsla(p.line))
+                        .child(Icon::new(IconName::Changes).color(p.ink_muted)),
+                )
+                .child(
+                    div()
+                        .text_style(&TEXT_BODY_MEDIUM, cx)
+                        .text_color(hsla(p.ink))
+                        .text_center()
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .max_w(px(SIDEBAR))
+                        .text_style(&TEXT_SMALL, cx)
+                        .text_color(hsla(p.ink_muted))
+                        .text_center()
+                        .child(hint),
+                );
+        }
         let scroll = window
             .use_keyed_state("status-tree-scroll", cx, |_, _| {
                 UniformListScrollHandle::new()
@@ -198,7 +262,7 @@ impl RenderOnce for StatusTree {
             range
                 .map(|index| match &rows[index] {
                     TreeRow::Header { section, count } => {
-                        let section = *section;
+                        let (section, count) = (*section, *count);
                         let on_action = on_action.clone();
                         let (title, action) = match section {
                             Section::Unstaged => ("UNSTAGED", "Stage all"),
@@ -208,10 +272,14 @@ impl RenderOnce for StatusTree {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap(px(SPACE_1))
                             .h(px(ROW_LIST))
                             .px(px(SPACE_2))
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
                                     .text_style(&TEXT_LABEL, cx)
                                     .text_color(hsla(p.ink_muted))
                                     .child(format!("{title} · {count}")),
@@ -220,22 +288,28 @@ impl RenderOnce for StatusTree {
                                 let discard = on_action.clone();
                                 div()
                                     .flex()
+                                    .flex_none()
                                     .items_center()
-                                    .gap(px(SPACE_2))
-                                    .children((section == Section::Unstaged).then(|| {
-                                        Button::new(("tree-discard-all", index), "Discard all")
+                                    .gap(px(SPACE_1))
+                                    .children((section == Section::Unstaged && count > 0).then(
+                                        || {
+                                            Button::new(("tree-discard-all", index), "Discard all")
+                                                .icon(IconName::Trash)
+                                                .danger_ghost()
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    discard(TreeAction::DiscardAll, window, cx)
+                                                })
+                                        },
+                                    ))
+                                    .children((count > 0).then(|| {
+                                        Button::new(("tree-all", index), action)
                                             .ghost()
+                                            .compact()
                                             .on_click(move |_, window, cx| {
-                                                discard(TreeAction::DiscardAll, window, cx)
+                                                on_action(TreeAction::All { section }, window, cx)
                                             })
                                     }))
-                                    .child(
-                                        Button::new(("tree-all", index), action).ghost().on_click(
-                                            move |_, window, cx| {
-                                                on_action(TreeAction::All { section }, window, cx)
-                                            },
-                                        ),
-                                    )
                             })
                             .into_any_element()
                     }
@@ -248,18 +322,19 @@ impl RenderOnce for StatusTree {
                         files,
                     } => {
                         let (section, path) = (*section, path.clone());
-                        let state = match section {
-                            Section::Staged => CheckState::Checked,
-                            Section::Unstaged => CheckState::Unchecked,
+                        let verb = match section {
+                            Section::Staged => "Unstage",
+                            Section::Unstaged => "Stage",
                         };
+                        let tooltip = format!("{verb} folder: {path}");
+
                         let (toggle, fold) = (on_action.clone(), on_action.clone());
                         let (toggle_path, fold_path) = (path.clone(), path.clone());
                         let id = ElementId::from(("tree-dir", index));
                         let handle = focus::handle(&id, window, cx);
+                        let hover = hsla(p.bg_hover);
                         div()
-                            .id(id)
-                            .track_focus(&handle)
-                            .tab_stop(true)
+                            .relative()
                             .flex()
                             .items_center()
                             .gap(px(SPACE_2))
@@ -267,45 +342,69 @@ impl RenderOnce for StatusTree {
                             .pl(px(SPACE_2 + *depth as f32 * SPACE_3))
                             .pr(px(SPACE_2))
                             .rounded(px(RADIUS_MD))
-                            .text_style(&TEXT_BODY, cx)
-                            .text_color(hsla(p.ink_muted))
-                            .cursor_pointer()
-                            .focus_visible(move |style| focus::ring(style, ring))
-                            .on_click(move |_, window, cx| {
-                                fold(
-                                    TreeAction::Collapse {
-                                        section,
-                                        dir: fold_path.clone(),
-                                    },
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .child(div().flex_none().w(px(12.)).child(if *expanded {
-                                "▾"
-                            } else {
-                                "▸"
-                            }))
-                            .child(Checkbox::new(("tree-dir-check", index), state).on_click(
-                                move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    toggle(
-                                        TreeAction::ToggleDir {
-                                            section,
-                                            dir: toggle_path.clone(),
-                                        },
-                                        window,
-                                        cx,
-                                    )
-                                },
-                            ))
-                            .child(div().flex_1().min_w(px(0.)).truncate().child(name.clone()))
                             .child(
                                 div()
-                                    .flex_none()
-                                    .text_style(&TEXT_SMALL, cx)
-                                    .text_color(hsla(p.ink_faint))
-                                    .child(files.to_string()),
+                                    .id(id)
+                                    .role(gpui::Role::Button)
+                                    .aria_label(format!(
+                                        "{} folder {path}",
+                                        if *expanded { "Collapse" } else { "Expand" }
+                                    ))
+                                    .track_focus(&handle)
+                                    .tab_stop(true)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(SPACE_2))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .h_full()
+                                    .rounded(px(RADIUS_MD))
+                                    .text_style(&TEXT_BODY, cx)
+                                    .text_color(hsla(p.ink_muted))
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(hover))
+                                    .focus_visible(move |style| focus::ring(style, ring))
+                                    .on_click(move |_, window, cx| {
+                                        fold(
+                                            TreeAction::Collapse {
+                                                section,
+                                                dir: fold_path.clone(),
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .child(div().flex_none().w(px(SPACE_3)).child(if *expanded {
+                                        "▾"
+                                    } else {
+                                        "▸"
+                                    }))
+                                    .child(
+                                        div().flex_1().min_w(px(0.)).truncate().child(name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_style(&TEXT_SMALL, cx)
+                                            .text_color(hsla(p.ink_faint))
+                                            .child(files.to_string()),
+                                    ),
+                            )
+                            .child(
+                                Button::new(("tree-dir-stage", index), verb)
+                                    .tooltip(tooltip)
+                                    .compact()
+                                    .ghost()
+                                    .on_click(move |_, window, cx| {
+                                        toggle(
+                                            TreeAction::ToggleDir {
+                                                section,
+                                                dir: toggle_path.clone(),
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                    }),
                             )
                             .into_any_element()
                     }
@@ -320,10 +419,12 @@ impl RenderOnce for StatusTree {
                         let chosen = selected.as_ref().is_some_and(|(s, selected)| {
                             *s == section && selected.as_ref() == path
                         });
-                        let state = match section {
-                            Section::Staged => CheckState::Checked,
-                            Section::Unstaged => CheckState::Unchecked,
+                        let verb = match section {
+                            Section::Staged => "Unstage",
+                            Section::Unstaged => "Stage",
                         };
+                        let tooltip = format!("{verb} file: {path}");
+
                         let (select, toggle) = (on_action.clone(), on_action.clone());
                         let (select_path, toggle_path) = (path.clone(), path.clone());
                         let id = ElementId::from(("tree-file", index));
@@ -336,55 +437,84 @@ impl RenderOnce for StatusTree {
                         };
                         let hover = hsla(p.bg_hover);
                         let row = div()
-                            .id(id)
-                            .track_focus(&handle)
-                            .tab_stop(true)
+                            .relative()
                             .flex()
                             .items_center()
                             .gap(px(SPACE_2))
                             .h(px(ROW_LIST))
-                            .pl(px(SPACE_2 + 12.0 + SPACE_2 + *depth as f32 * SPACE_3))
+                            .pl(px(SPACE_2 + SPACE_3 + SPACE_2 + *depth as f32 * SPACE_3))
                             .pr(px(SPACE_2))
                             .rounded(px(RADIUS_MD))
-                            .text_style(&TEXT_BODY, cx)
-                            .text_color(hsla(p.ink))
-                            .cursor_pointer()
-                            .focus_visible(move |style| focus::ring(style, ring))
-                            .on_click(move |_, window, cx| {
-                                select(
-                                    TreeAction::Select {
-                                        section,
-                                        path: select_path.clone(),
-                                    },
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .child(Checkbox::new(("tree-file-check", index), state).on_click(
-                                move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    toggle(
-                                        TreeAction::ToggleFile {
-                                            section,
-                                            path: toggle_path.clone(),
-                                        },
-                                        window,
-                                        cx,
-                                    )
-                                },
-                            ))
                             .child(
                                 div()
-                                    .flex_none()
-                                    .w(px(14.))
-                                    .text_style(&TEXT_SMALL, cx)
-                                    .font_weight(gpui::FontWeight(600.0))
-                                    .text_color(hsla(colour))
-                                    .child(letter(change)),
+                                    .id(id)
+                                    .role(gpui::Role::Button)
+                                    .aria_label(format!("Open diff for {path}"))
+                                    .track_focus(&handle)
+                                    .tab_stop(true)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(SPACE_2))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .h_full()
+                                    .rounded(px(RADIUS_MD))
+                                    .text_style(&TEXT_BODY, cx)
+                                    .text_color(hsla(p.ink))
+                                    .cursor_pointer()
+                                    .focus_visible(move |style| focus::ring(style, ring))
+                                    .on_click(move |_, window, cx| {
+                                        select(
+                                            TreeAction::Select {
+                                                section,
+                                                path: select_path.clone(),
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .w(px(LANE))
+                                            .text_style(&TEXT_SMALL, cx)
+                                            .font_weight(gpui::FontWeight(600.0))
+                                            .text_color(hsla(colour))
+                                            .child(letter(change)),
+                                    )
+                                    .child(
+                                        div().flex_1().min_w(px(0.)).truncate().child(name.clone()),
+                                    ),
                             )
-                            .child(div().flex_1().min_w(px(0.)).truncate().child(name.clone()));
+                            .child(
+                                Button::new(("tree-file-stage", index), verb)
+                                    .tooltip(tooltip)
+                                    .compact()
+                                    .ghost()
+                                    .on_click(move |_, window, cx| {
+                                        toggle(
+                                            TreeAction::ToggleFile {
+                                                section,
+                                                path: toggle_path.clone(),
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                    }),
+                            );
                         if chosen {
-                            row.bg(hsla(p.bg_raised)).into_any_element()
+                            row.bg(hsla(p.bg_raised))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(0.))
+                                        .top(px(SPACE_1))
+                                        .bottom(px(SPACE_1))
+                                        .w(px(focus::ACCENT_BAR_W))
+                                        .rounded(px(RADIUS_SM))
+                                        .bg(hsla(p.accent)),
+                                )
+                                .into_any_element()
                         } else {
                             row.hover(move |style| style.bg(hover)).into_any_element()
                         }
@@ -470,6 +600,7 @@ mod tests {
                 "  deep/ 1",
                 "    d.rs",
                 "z.rs",
+                "# Staged 0",
             ]
         );
     }
@@ -482,7 +613,10 @@ mod tests {
             &status(&["src/b.rs", "src/deep/d.rs", "z.rs"], false),
             &collapsed,
         );
-        assert_eq!(names(&rows), vec!["# Unstaged 3", "src/ +2", "z.rs"]);
+        assert_eq!(
+            names(&rows),
+            vec!["# Unstaged 3", "src/ +2", "z.rs", "# Staged 0"]
+        );
     }
 
     #[test]

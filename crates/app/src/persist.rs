@@ -10,7 +10,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::paths;
+
 const HEADER: &str = "invoke-git tabs v1";
+const RECENT_HEADER: &str = "invoke-git recent v1";
+
+/// How many recently opened or closed repositories to remember.
+pub const MAX_RECENT: usize = 10;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Saved {
@@ -80,6 +86,74 @@ pub fn notes_file() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("notes.sqlite"))
 }
 
+/// The file remembering recently opened/closed repositories, newest first.
+pub fn recent_file() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("recent.txt"))
+}
+
+/// Pure list update: puts `path` first, deduplicating across platform path
+/// spellings, and caps the list at [`MAX_RECENT`].
+pub fn record_recent(recent: &mut Vec<PathBuf>, path: PathBuf) {
+    recent.retain(|existing| !paths::same_repo(existing, &path));
+    recent.insert(0, path);
+    recent.truncate(MAX_RECENT);
+}
+
+/// Removes every entry matching `path` (by platform path rules).
+pub fn remove_recent(recent: &mut Vec<PathBuf>, path: &Path) {
+    recent.retain(|existing| !paths::same_repo(existing, path));
+}
+
+pub fn encode_recent(recent: &[PathBuf]) -> String {
+    let mut text = format!("{RECENT_HEADER}\n");
+    for path in recent.iter().take(MAX_RECENT) {
+        if let Some(path) = path.to_str().filter(|p| !p.contains(['\n', '\r'])) {
+            text.push_str(path);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+pub fn decode_recent(text: &str) -> Vec<PathBuf> {
+    let mut lines = text.lines();
+    if lines.next() != Some(RECENT_HEADER) {
+        return Vec::new();
+    }
+    let mut recent: Vec<PathBuf> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(line);
+        if !recent
+            .iter()
+            .any(|existing| paths::same_repo(existing, &path))
+        {
+            recent.push(path);
+            if recent.len() >= MAX_RECENT {
+                break;
+            }
+        }
+    }
+    recent
+}
+
+pub fn load_recent() -> Vec<PathBuf> {
+    recent_file()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .map(|text| decode_recent(&text))
+        .unwrap_or_default()
+}
+
+pub fn save_recent(recent: &[PathBuf]) {
+    let Some(file) = recent_file() else { return };
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, encode_recent(recent));
+}
+
 pub fn load() -> Saved {
     file()
         .and_then(|file| std::fs::read_to_string(file).ok())
@@ -94,6 +168,61 @@ pub fn save(saved: &Saved) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(file, encode(saved));
+}
+
+/// A worktree's layout and draft live in the app data folder.
+pub use shell::store::WorktreeUi;
+
+#[derive(Clone)]
+struct PendingUiSave {
+    generation: u64,
+    state: WorktreeUi,
+}
+
+fn pending_ui() -> &'static std::sync::Mutex<std::collections::HashMap<String, PendingUiSave>> {
+    static LATEST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, PendingUiSave>>,
+    > = std::sync::OnceLock::new();
+    LATEST.get_or_init(Default::default)
+}
+
+pub fn load_worktree_ui(workdir: &Path) -> Option<WorktreeUi> {
+    let file = data_dir()?.join("workspace.sqlite");
+    let key = crate::notes_db::repo_key(workdir);
+    if let Some(pending) = pending_ui().lock().ok()?.get(&key) {
+        return Some(pending.state.clone());
+    }
+    shell::store::load_worktree_ui(&file, &key)
+}
+
+pub fn save_worktree_ui(workdir: PathBuf, state: WorktreeUi, cx: &gpui::App) {
+    use std::sync::Mutex;
+
+    let Some(dir) = data_dir() else { return };
+    let file = dir.join("workspace.sqlite");
+    let key = crate::notes_db::repo_key(&workdir);
+    let generation = {
+        let Ok(mut requested) = pending_ui().lock() else {
+            return;
+        };
+        let generation = requested.get(&key).map_or(0, |save| save.generation + 1);
+        requested.insert(key.clone(), PendingUiSave { generation, state });
+        generation
+    };
+    cx.background_executor()
+        .spawn(async move {
+            // Recheck the latest generation after taking the lock that orders writes.
+            static WRITING: Mutex<()> = Mutex::new(());
+            let Ok(_writing) = WRITING.lock() else { return };
+            let newest = pending_ui()
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&key).cloned());
+            if let Some(save) = newest.filter(|save| save.generation == generation) {
+                let _ = shell::store::save_worktree_ui(&file, &key, &save.state);
+            }
+        })
+        .detach();
 }
 
 #[cfg(test)]
@@ -124,6 +253,44 @@ mod tests {
         assert_eq!(decode(&text).paths.len(), 1);
     }
 
+    #[test]
+    fn recent_moves_reopened_to_front_deduplicates_and_caps() {
+        let mut recent: Vec<PathBuf> = Vec::new();
+        for i in 0..15 {
+            record_recent(&mut recent, PathBuf::from(format!(r"C:\work\repo-{i}")));
+        }
+        assert_eq!(recent.len(), MAX_RECENT);
+        assert_eq!(recent[0], PathBuf::from(r"C:\work\repo-14"));
+
+        // Re-recording an existing entry (with trailing slash) moves it to front.
+        record_recent(&mut recent, PathBuf::from(r"C:\work\repo-10\"));
+        assert_eq!(recent.len(), MAX_RECENT);
+        assert_eq!(recent[0], PathBuf::from(r"C:\work\repo-10\"));
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|p| paths::same_repo(p, Path::new(r"C:\work\repo-10")))
+                .count(),
+            1
+        );
+
+        remove_recent(&mut recent, Path::new(r"C:\work\repo-10"));
+        assert_eq!(recent.len(), MAX_RECENT - 1);
+        assert!(
+            !recent
+                .iter()
+                .any(|p| paths::same_repo(p, Path::new(r"C:\work\repo-10")))
+        );
+    }
+
+    #[test]
+    fn recent_round_trips_and_ignores_garbage() {
+        let items = vec![PathBuf::from(r"C:\work\one"), PathBuf::from(r"C:\work\two")];
+        assert_eq!(decode_recent(&encode_recent(&items)), items);
+        assert!(decode_recent("").is_empty());
+        assert!(decode_recent("wrong header\nC:\\work\n").is_empty());
+    }
+
     proptest! {
         #[test]
         fn round_trips_any_single_line_paths(
@@ -137,8 +304,26 @@ mod tests {
         }
 
         #[test]
+        fn recent_never_exceeds_cap_or_duplicates(
+            names in proptest::collection::vec("[a-z]{1,6}", 0..25),
+        ) {
+            let mut recent: Vec<PathBuf> = Vec::new();
+            for name in names {
+                record_recent(&mut recent, PathBuf::from(format!("/work/{name}")));
+                prop_assert!(recent.len() <= MAX_RECENT);
+            }
+            for (i, a) in recent.iter().enumerate() {
+                for b in &recent[i + 1..] {
+                    prop_assert!(!paths::same_repo(a, b));
+                }
+            }
+            prop_assert_eq!(decode_recent(&encode_recent(&recent)), recent);
+        }
+
+        #[test]
         fn decode_never_panics(text in ".{0,200}") {
             let _ = decode(&text);
+            let _ = decode_recent(&text);
         }
     }
 }

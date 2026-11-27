@@ -5,7 +5,9 @@
 use std::collections::HashSet;
 
 use invoke_core::notes::{self, Anchor, Note, NoteProblem};
-use invoke_core::{Head, Oid, RepoState, Snapshot};
+use invoke_core::{BranchName, Head, Oid, RefName, RemoteBranch, RepoState, Snapshot};
+
+use crate::sync;
 
 /// What the diff beside the list shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +61,7 @@ pub fn subtitle(local: &str, target: &str, behind: u32, publishes: bool) -> Stri
 pub fn push_label(count: usize, truncated: bool, publishes: bool) -> String {
     let verb = if publishes { "Publish" } else { "Push" };
     match count {
+        0 if publishes => "Publish branch".to_owned(),
         0 => verb.to_owned(),
         1 if !truncated => format!("{verb} 1 commit"),
         _ => format!("{verb} {} commits", count_text(count, truncated)),
@@ -179,18 +182,46 @@ impl Viewed {
         paths.filter(|path| self.is(commit, path)).count()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn clear(&mut self) {
         self.0.clear();
     }
 }
 
-/// What the outgoing list was read from. When either moves (a fetch, a
-/// commit, a push) the list is read again; never patched (rule 4).
+/// The local branch and remote refs that define the reviewed range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Key {
+    pub local: BranchName,
     pub head: Oid,
-    /// The upstream branch and where it points.
-    pub upstream: Option<(String, Option<Oid>)>,
+    pub target: RemoteBranch,
+    pub target_tip: Option<Oid>,
+    pub sets_upstream: bool,
+    /// With no target tip, the outgoing reader uses all remote-tracking refs.
+    fallback_refs: Vec<(RefName, Oid)>,
+}
+
+impl Key {
+    pub fn matches_outgoing(&self, outgoing: &shell::outgoing::Outgoing) -> bool {
+        if outgoing.head != self.head.as_hex()
+            || outgoing.upstream_tip.as_deref() != self.target_tip.as_ref().map(Oid::as_hex)
+        {
+            return false;
+        }
+        if self.target_tip.is_some() {
+            return true;
+        }
+        let mut exclusions: Vec<_> = self
+            .fallback_refs
+            .iter()
+            .map(|(_, id)| id.as_hex())
+            .collect();
+        exclusions.sort_unstable();
+        exclusions.dedup();
+        exclusions == outgoing.excluded_tips
+    }
 }
 
 pub fn key_of(state: &RepoState) -> Option<Key> {
@@ -200,15 +231,26 @@ pub fn key_of(state: &RepoState) -> Option<Key> {
     let Head::Branch { name, oid } = &disk.head else {
         return None;
     };
-    let upstream = disk.refs.upstreams.get(name).map(|upstream| {
-        (
-            upstream.name.0.clone(),
-            disk.refs.refs.get(&upstream.name).cloned(),
-        )
-    });
+    let plan = sync::plan(state)?;
+    let target = plan.push_target()?;
+    let target_tip = disk.refs.refs.get(&target.tracking_ref()).cloned();
+    let fallback_refs = if target_tip.is_none() {
+        disk.refs
+            .refs
+            .iter()
+            .filter(|(name, _)| name.0.starts_with("refs/remotes/"))
+            .map(|(name, oid)| (name.clone(), oid.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     Some(Key {
+        local: name.clone(),
         head: oid.clone(),
-        upstream,
+        target,
+        target_tip,
+        sets_upstream: plan.publishes(),
+        fallback_refs,
     })
 }
 
@@ -327,6 +369,7 @@ mod tests {
         assert_eq!(push_label(2, false, false), "Push 2 commits");
         assert_eq!(push_label(1, false, true), "Publish 1 commit");
         assert_eq!(push_label(0, false, false), "Push");
+        assert_eq!(push_label(0, false, true), "Publish branch");
         assert_eq!(push_label(1000, true, false), "Push 1000+ commits");
     }
 
@@ -412,6 +455,23 @@ mod tests {
         }
     }
 
+    proptest! {
+        #[test]
+        fn review_rejects_a_result_from_a_moved_target(changes in any::<bool>()) {
+            let key = key_of(&state(Head::Branch {
+                name: BranchName("main".into()), oid: oid('a'),
+            }, refs('b'))).unwrap();
+            let actual_tip = oid(if changes { 'c' } else { 'b' }).as_hex().to_owned();
+            let outgoing = shell::outgoing::Outgoing {
+                head: key.head.as_hex().to_owned(),
+                upstream_tip: Some(actual_tip.clone()),
+                excluded_tips: vec![actual_tip],
+                base: None, commits: Vec::new(), truncated: false, files: Vec::new(),
+            };
+            prop_assert_eq!(key.matches_outgoing(&outgoing), !changes);
+        }
+    }
+
     #[test]
     fn the_list_is_read_again_when_the_head_or_the_upstream_moves() {
         let head = |c| Head::Branch {
@@ -422,6 +482,18 @@ mod tests {
         assert_eq!(base, key_of(&state(head('a'), refs('b'))).unwrap());
         assert_ne!(base, key_of(&state(head('c'), refs('b'))).unwrap());
         assert_ne!(base, key_of(&state(head('a'), refs('d'))).unwrap());
+        let publishing = |tip| {
+            key_of(&state(
+                Head::Branch {
+                    name: BranchName("topic".into()),
+                    oid: oid('a'),
+                },
+                refs(tip),
+            ))
+            .unwrap()
+        };
+        assert_ne!(base, publishing('b'));
+        assert_ne!(publishing('b'), publishing('d'));
         // A detached head has nothing to review.
         assert!(key_of(&state(Head::Detached(oid('a')), refs('b'))).is_none());
     }

@@ -14,18 +14,19 @@ use std::fmt::Display;
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, Context, Corners, Div, Edges, EventEmitter, FontWeight, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, PathBuilder, Pixels, Point,
-    Render, SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
-    canvas, div, fill, point, px, quad, size, uniform_list,
+    AnyElement, BorderStyle, Bounds, Context, Corners, Div, Edges, ElementId, EventEmitter,
+    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, PathBuilder,
+    Pixels, Point, Render, SharedString, StatefulInteractiveElement, Styled,
+    UniformListScrollHandle, Window, canvas, div, fill, point, px, quad, size, uniform_list,
 };
 use graph::{Edge, Layout, Row};
 use tokens::{
-    LANE, RADIUS_SM, ROW_GRAPH, SPACE_2, SPACE_4, TEXT_BODY, TEXT_CODE_SMALL, TEXT_LABEL,
-    TEXT_SMALL,
+    LANE, RADIUS_SM, ROW_DIFF, ROW_GRAPH, SPACE_1, SPACE_2, SPACE_4, TEXT_BODY, TEXT_CODE_SMALL,
+    TEXT_LABEL, TEXT_SMALL,
 };
 
 use crate::convert::hsla;
+use crate::focus;
 use crate::ref_labels::{LabelKind, RefLabel};
 use crate::scrollbar::Scrollbar;
 use crate::text::TextStyleExt;
@@ -351,16 +352,13 @@ impl<I: Copy + Eq + Display + 'static> GraphView<I> {
         &mut self,
         range: Range<usize>,
         graph_w: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         self.request_meta(&range, cx);
         let p = cx.palette();
+        let ring = focus::ring_color(cx);
         let lane_colors: [Hsla; 8] = std::array::from_fn(|i| hsla(p.lane(i)));
-        let palette = Paint {
-            lanes: lane_colors,
-            panel: hsla(p.bg_panel),
-            accent: hsla(p.accent),
-        };
         let hover_color = self
             .hover
             .and_then(|row| self.layout.row(row))
@@ -374,6 +372,11 @@ impl<I: Copy + Eq + Display + 'static> GraphView<I> {
                 let id = self.ids[index];
                 let is_head = self.head == Some(id);
                 let is_selected = self.selected.as_ref().is_some_and(|(r, _)| *r == index);
+                let palette = Paint {
+                    lanes: lane_colors,
+                    panel: hsla(if is_selected { p.bg_raised } else { p.bg_panel }),
+                    accent: hsla(p.accent),
+                };
                 let dot = Dot {
                     row,
                     head: is_head,
@@ -388,14 +391,20 @@ impl<I: Copy + Eq + Display + 'static> GraphView<I> {
                 let meta = self.meta[index].clone();
                 let (select, hover) = (this.clone(), this.clone());
                 let menu = this.clone();
+                let row_id = ElementId::from(("graph-row", index));
+                let handle = focus::handle(&row_id, window, cx);
                 let mut line = div()
-                    .id(("graph-row", index))
+                    .id(row_id)
+                    .track_focus(&handle)
+                    .tab_stop(true)
+                    .relative()
                     .flex()
                     .items_center()
                     .h(px(ROW_GRAPH))
                     .w_full()
                     .px(px(SPACE_2))
                     .cursor_pointer()
+                    .focus_visible(move |style| focus::ring(style, ring))
                     .on_click(move |_, _, cx| select.update(cx, |view, cx| view.select(index, cx)))
                     .on_mouse_down(MouseButton::Right, move |event, _, cx| {
                         menu.update(cx, |view, cx| {
@@ -410,7 +419,16 @@ impl<I: Copy + Eq + Display + 'static> GraphView<I> {
                         hover.update(cx, |view, cx| view.set_hover(index, *hovered, cx))
                     });
                 line = if is_selected {
-                    line.bg(hsla(p.bg_raised))
+                    line.bg(hsla(p.bg_raised)).child(
+                        div()
+                            .absolute()
+                            .left(px(0.))
+                            .top(px(SPACE_1))
+                            .bottom(px(SPACE_1))
+                            .w(px(focus::ACCENT_BAR_W))
+                            .rounded(px(RADIUS_SM))
+                            .bg(hsla(p.accent)),
+                    )
                 } else {
                     let hover_fill = hsla(p.bg_hover);
                     line.hover(move |style| style.bg(hover_fill))
@@ -628,8 +646,8 @@ fn label_pill(label: &RefLabel, p: &tokens::Palette, cx: &gpui::App) -> Div {
         .flex_none()
         .flex()
         .items_center()
-        .h(px(20.))
-        .px(px(6.))
+        .h(px(ROW_DIFF))
+        .px(px(SPACE_2))
         .rounded(px(RADIUS_SM))
         .text_style(&TEXT_SMALL, cx);
     let line = hsla(p.line);
@@ -669,7 +687,7 @@ fn subject_cell(
         .flex_1()
         .min_w(px(0.))
         .items_center()
-        .gap(px(6.))
+        .gap(px(SPACE_1))
         .overflow_hidden()
         .text_style(&TEXT_BODY, cx);
     for label in labels.iter().take(MAX_LABELS) {
@@ -706,8 +724,8 @@ impl<I: Copy + Eq + Display + 'static> Render for GraphView<I> {
                 let list = uniform_list(
                     "graph-rows",
                     self.ids.len(),
-                    cx.processor(move |this, range, _window, cx| {
-                        this.render_rows(range, graph_w, cx)
+                    cx.processor(move |this, range, window, cx| {
+                        this.render_rows(range, graph_w, window, cx)
                     }),
                 )
                 .track_scroll(&self.scroll)

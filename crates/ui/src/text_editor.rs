@@ -15,15 +15,17 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, InteractiveElement,
     IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, ParentElement, Pixels, Point, Render, SharedString, Style, Styled, TextRun,
-    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, px, relative,
-    size,
+    PaintQuad, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
+    Style, Styled, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div,
+    fill, point, px, relative, size,
 };
 
 use crate::convert::hsla;
 use crate::editor_model::Editor;
+use crate::focus;
+use crate::text::TextStyleExt;
 use crate::theme::ThemeExt;
-use tokens::{RADIUS_MD, SPACE_2};
+use tokens::{RADIUS_MD, SPACE_1, SPACE_2, TEXT_BODY};
 
 actions!(
     text_editor,
@@ -195,7 +197,7 @@ impl TextEditor {
     ) -> Self {
         Self {
             editor: Editor::default(),
-            focus: cx.focus_handle(),
+            focus: cx.focus_handle().tab_stop(true),
             placeholder: placeholder.into(),
             cached: None,
             preferred_x: None,
@@ -513,11 +515,11 @@ pub fn mask_text(text: &str) -> String {
 fn shape(
     text: &SharedString,
     marked: Option<Range<usize>>,
+    style: &gpui::TextStyle,
     window: &mut Window,
     wrap: Pixels,
     color: gpui::Hsla,
 ) -> Vec<(usize, WrappedLine)> {
-    let style = window.text_style();
     let run = TextRun {
         len: text.len(),
         font: style.font(),
@@ -601,11 +603,14 @@ impl gpui::Element for EditorElement {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         let input = self.input.clone();
+        // Capture the element's text style now: the measure callback runs
+        // later during layout after `with_text_style` scopes have popped.
+        let text_style = window.text_style();
         let layout = window.request_measured_layout(style, move |known, available, window, cx| {
             let editor = input.read(cx);
             let text: SharedString = editor.editor.text().to_owned().into();
             let rows = editor.min_rows;
-            let line_height = window.line_height();
+            let line_height = text_style.line_height_in_pixels(window.rem_size());
             let width = known.width.unwrap_or(match available.width {
                 gpui::AvailableSpace::Definite(width) => width,
                 _ => px(300.),
@@ -618,7 +623,7 @@ impl gpui::Element for EditorElement {
             } else {
                 text
             };
-            let lines = shape(&shown, None, window, width, color);
+            let lines = shape(&shown, None, &text_style, window, width, color);
             let height = lines
                 .iter()
                 .map(|(_, line)| line.size(line_height).height)
@@ -639,7 +644,8 @@ impl gpui::Element for EditorElement {
     ) -> Self::PrepaintState {
         let p = cx.palette();
         let input = self.input.read(cx);
-        let line_height = window.line_height();
+        let text_style = window.text_style();
+        let line_height = text_style.line_height_in_pixels(window.rem_size());
         let empty = input.editor.is_empty();
         let (text, color): (SharedString, _) = if empty {
             (input.placeholder.clone(), hsla(p.ink_faint))
@@ -655,7 +661,7 @@ impl gpui::Element for EditorElement {
         let marked = input.editor.marked();
         let selection = input.editor.selection();
         let cursor = input.editor.cursor();
-        let lines = shape(&text, marked, window, bounds.size.width, color);
+        let lines = shape(&text, marked, &text_style, window, bounds.size.width, color);
         let cached = Cached {
             lines,
             line_height,
@@ -720,10 +726,11 @@ impl gpui::Element for EditorElement {
             .then(|| {
                 let at = if empty { 0 } else { cursor };
                 cached.position_of(at).map(|pos| {
+                    let inset = px(SPACE_1 / 2.0);
                     fill(
                         Bounds::new(
-                            point(bounds.left() + pos.x, bounds.top() + pos.y),
-                            size(px(2.), line_height),
+                            point(bounds.left() + pos.x, bounds.top() + pos.y + inset),
+                            size(px(2.), (line_height - inset * 2.).max(px(1.))),
                         ),
                         hsla(p.accent),
                     )
@@ -807,21 +814,44 @@ impl Render for TextEditor {
                 ))
             };
         }
-        let root = div()
+        let hover_border = hsla(p.ink_muted);
+        let ring = focus::ring_color(cx);
+        let editor_id = ElementId::from(("text-editor", cx.entity_id().as_u64() as usize));
+        let mut root = div()
+            .id(editor_id)
+            .role(if self.masked {
+                gpui::Role::PasswordInput
+            } else if self.single_line {
+                gpui::Role::TextInput
+            } else {
+                gpui::Role::MultilineTextInput
+            })
+            .aria_label(self.placeholder.clone())
+            .aria_placeholder(self.placeholder.clone())
             .key_context("TextEditor")
             .track_focus(&self.focus)
+            .tab_stop(true)
             .cursor(CursorStyle::IBeam)
             .w_full()
+            .overflow_hidden()
             .px(px(SPACE_2))
-            .py(px(SPACE_2))
+            .py(px(if self.single_line { SPACE_1 } else { SPACE_2 }))
             .rounded(px(RADIUS_MD))
             .border_1()
             .border_color(hsla(if focused { p.accent } else { p.line_control }))
             .bg(hsla(p.bg_app))
+            .text_style(&TEXT_BODY, cx)
+            .focus_visible(move |style| focus::ring(style, ring))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up));
+        if !self.masked && window.is_a11y_active() {
+            root = root.aria_value(self.text().to_owned());
+        }
+        if !focused {
+            root = root.hover(move |style| style.border_color(hover_border));
+        }
         let root = on!(root, Backspace, |this, window, cx| {
             this.editor.backspace();
             this.changed(window, cx)

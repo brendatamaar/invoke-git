@@ -4,13 +4,15 @@
 //! a rejected push. The decisions are in `sync`; the work is the core's.
 
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled,
-    Subscription, Window, div, px,
+    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
+    Render, StatefulInteractiveElement, Styled, Subscription, Window, deferred, div, px,
 };
 use invoke_core::{Event, Notice, OpId, OpPhase, PullMode, RunningOp};
-use tokens::{SPACE_2, SPACE_3, TEXT_SMALL};
-use ui::convert::hsla;
-use ui::{Banner, BannerKind, Button, ProgressBar, TextStyleExt, ThemeExt};
+use tokens::{
+    RADIUS_LG, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_8, TEXT_CODE_SMALL, TEXT_SMALL,
+};
+use ui::convert::{hsla, shadows};
+use ui::{Banner, BannerKind, Button, IconName, ProgressBar, TextStyleExt, ThemeExt};
 
 use crate::auth_prompt::{AuthEvent, AuthPromptView};
 use crate::session::RepoSession;
@@ -34,6 +36,7 @@ pub enum SyncEvent {
 /// review first.
 pub struct SyncButtons {
     session: Entity<RepoSession>,
+    pull_menu_open: bool,
     _observe: Subscription,
 }
 
@@ -41,9 +44,13 @@ impl EventEmitter<SyncEvent> for SyncButtons {}
 
 impl SyncButtons {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
-        let observe = cx.observe(&session, |_, _, cx| cx.notify());
+        let observe = cx.observe(&session, |this, _, cx| {
+            this.pull_menu_open = false;
+            cx.notify();
+        });
         Self {
             session,
+            pull_menu_open: false,
             _observe: observe,
         }
     }
@@ -51,11 +58,11 @@ impl SyncButtons {
 
 impl Render for SyncButtons {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = cx.palette();
         let busy = self.session.read(cx).state.ops.running.is_some();
         let plan = plan_of(&self.session, cx);
         // A paused operation owns the repo: the core refuses these until it ends.
         if plan.as_ref().is_some_and(|plan| !plan.clean) {
-            let p = cx.palette();
             return div()
                 .text_style(&TEXT_SMALL, cx)
                 .text_color(hsla(p.ink_muted))
@@ -71,16 +78,16 @@ impl Render for SyncButtons {
         let ahead = plan.as_ref().map_or(0, Plan::ahead);
         let publishes = plan.as_ref().is_some_and(Plan::publishes);
         let pull_label = if behind > 0 {
-            format!("Pull ↓{behind}")
+            format!("Pull · {behind}")
         } else {
             "Pull".to_owned()
         };
         let push_label = if publishes && can_push {
-            "Review and publish".to_owned()
+            "Review & publish".to_owned()
         } else if ahead > 0 {
-            format!("Review and push ↑{ahead}")
+            format!("Review & push · {ahead}")
         } else {
-            "Push".to_owned()
+            "Review & push".to_owned()
         };
         let run = |plan: &Option<Plan>, make: fn(&Plan) -> Option<Event>| {
             let plan = plan.clone();
@@ -90,44 +97,130 @@ impl Render for SyncButtons {
                 }
             }
         };
-        let (fetch, pull, rebase) = (
+        let (fetch, pull, pull_merge, rebase) = (
             run(&plan, |plan| Some(plan.fetch())),
+            run(&plan, |plan| plan.pull(PullMode::Merge)),
             run(&plan, |plan| plan.pull(PullMode::Merge)),
             run(&plan, |plan| plan.pull(PullMode::Rebase)),
         );
-        let (s1, s2, s3) = (
+        let (s1, s2, s3, s4) = (
+            self.session.clone(),
             self.session.clone(),
             self.session.clone(),
             self.session.clone(),
         );
         let review = cx.entity();
-        let mut row = div()
+        let push_is_primary = ready && can_push && (ahead > 0 || publishes);
+        let pull_is_primary = ready && can_pull && behind > 0 && !push_is_primary;
+
+        let mut pull_btn = Button::new("sync-pull", pull_label)
+            .icon(IconName::Pull)
+            .disabled(!ready || !can_pull)
+            .on_click(move |_, _, cx| pull(&s2, cx));
+        if pull_is_primary {
+            pull_btn = pull_btn.primary();
+        }
+
+        let mut pull_group = div()
+            .relative()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_1 / 2.0))
+            .child(pull_btn);
+        if diverged {
+            let toggle = cx.entity();
+            let close_out = cx.entity();
+            let close_merge = cx.entity();
+            let close_rebase = cx.entity();
+            pull_group = pull_group
+                .child(
+                    Button::new("sync-pull-more", "")
+                        .tooltip("Pull options")
+                        .icon(IconName::ChevronDown)
+                        .disabled(!ready || !can_pull)
+                        .on_click(move |_, _, cx| {
+                            toggle.update(cx, |this, cx| {
+                                this.pull_menu_open = !this.pull_menu_open;
+                                cx.notify();
+                            })
+                        }),
+                )
+                .children((self.pull_menu_open && ready && can_pull).then(|| {
+                    deferred(
+                        div()
+                            .id("sync-pull-popover")
+                            .occlude()
+                            .absolute()
+                            .top(px(ROW_LIST + SPACE_1))
+                            .right(px(0.))
+                            .flex()
+                            .flex_col()
+                            .min_w(px(SIDEBAR - SPACE_8 * 2.0))
+                            .gap(px(SPACE_1 / 2.0))
+                            .p(px(SPACE_1))
+                            .rounded(px(RADIUS_LG))
+                            .border_1()
+                            .border_color(hsla(p.line))
+                            .bg(hsla(p.bg_raised))
+                            .shadow(shadows(p.shadow_overlay))
+                            .on_mouse_down_out(move |_, _, cx| {
+                                cx.stop_propagation();
+                                close_out.update(cx, |this, cx| {
+                                    this.pull_menu_open = false;
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                Button::new("sync-pull-merge", "Pull (merge)")
+                                    .icon(IconName::Pull)
+                                    .ghost()
+                                    .full_width()
+                                    .on_click(move |_, _, cx| {
+                                        close_merge.update(cx, |this, cx| {
+                                            this.pull_menu_open = false;
+                                            cx.notify();
+                                        });
+                                        pull_merge(&s3, cx);
+                                    }),
+                            )
+                            .child(
+                                Button::new("sync-rebase", "Pull with rebase")
+                                    .icon(IconName::Branch)
+                                    .ghost()
+                                    .full_width()
+                                    .on_click(move |_, _, cx| {
+                                        close_rebase.update(cx, |this, cx| {
+                                            this.pull_menu_open = false;
+                                            cx.notify();
+                                        });
+                                        rebase(&s4, cx);
+                                    }),
+                            ),
+                    )
+                }));
+        }
+
+        let mut push_btn = Button::new("sync-push", push_label)
+            .icon(IconName::Push)
+            .disabled(!ready || !can_push)
+            .on_click(move |_, _, cx| review.update(cx, |_, cx| cx.emit(SyncEvent::Review)));
+        if push_is_primary {
+            push_btn = push_btn.primary();
+        }
+
+        div()
             .flex()
             .items_center()
             .gap(px(SPACE_2))
             .child(
                 Button::new("sync-fetch", "Fetch")
+                    .icon(IconName::Fetch)
                     .disabled(!ready)
                     .on_click(move |_, _, cx| fetch(&s1, cx)),
             )
-            .child(
-                Button::new("sync-pull", pull_label)
-                    .disabled(!ready || !can_pull)
-                    .on_click(move |_, _, cx| pull(&s2, cx)),
-            );
-        if diverged {
-            row = row.child(
-                Button::new("sync-rebase", "Pull with rebase")
-                    .disabled(!ready || !can_pull)
-                    .on_click(move |_, _, cx| rebase(&s3, cx)),
-            );
-        }
-        row.child(
-            Button::new("sync-push", push_label)
-                .disabled(!ready || !can_push)
-                .on_click(move |_, _, cx| review.update(cx, |_, cx| cx.emit(SyncEvent::Review))),
-        )
-        .into_any_element()
+            .child(pull_group)
+            .child(push_btn)
+            .into_any_element()
     }
 }
 
@@ -140,6 +233,7 @@ pub struct SyncStrip {
     focus_prompt: bool,
     /// The user pressed "Force push…" and has not answered yet.
     confirm_force: bool,
+    show_rejection_output: bool,
     /// The user pressed "Remove lock file…" and has not answered yet.
     confirm_lock: bool,
     _observe: Subscription,
@@ -153,6 +247,7 @@ impl SyncStrip {
             auth: None,
             focus_prompt: false,
             confirm_force: false,
+            show_rejection_output: false,
             confirm_lock: false,
             _observe: observe,
         }
@@ -168,6 +263,7 @@ impl SyncStrip {
     fn session_changed(&mut self, cx: &mut Context<Self>) {
         if !self.rejected(cx) {
             self.confirm_force = false;
+            self.show_rejection_output = false;
         }
         if !sync::lock_to_offer(&self.session.read(cx).state) {
             self.confirm_lock = false;
@@ -269,11 +365,11 @@ impl Render for SyncStrip {
                                     .text_color(hsla(p.ink))
                                     .child(what),
                             )
-                            .child(
+                            .children(fraction.map(|fraction| {
                                 div()
-                                    .w(px(200.))
-                                    .child(ProgressBar::new(fraction.unwrap_or(0.0))),
-                            )
+                                    .w(px(tokens::SIDEBAR))
+                                    .child(ProgressBar::new(fraction))
+                            }))
                             .child(
                                 div()
                                     .flex_1()
@@ -302,7 +398,7 @@ impl Render for SyncStrip {
 
         if let Some(Notice::PushRejected { failure, .. }) = &state.notice {
             any = true;
-            let details = crate::notice::headline(&failure.details);
+            let details = &failure.details;
             let target = plan.as_ref().and_then(Plan::push_target);
             if self.confirm_force {
                 let (yes, no) = (cx.entity(), cx.entity());
@@ -335,10 +431,14 @@ impl Render for SyncStrip {
                 let fetch_event = plan.as_ref().map(Plan::fetch);
                 let rebase_event = plan.as_ref().and_then(|plan| plan.pull(PullMode::Rebase));
                 let can_rebase = rebase_event.is_some();
+                let target_name = target
+                    .as_ref()
+                    .map(sync::remote_text)
+                    .unwrap_or_else(|| "the remote branch".into());
                 column = column.child(
                     Banner::new(
                         BannerKind::Warning,
-                        "Push rejected: the remote has new commits. Fetch and rebase to continue.",
+                        format!("Push rejected. {target_name} has changed. Fetch to refresh the comparison."),
                     )
                     .action(
                         Button::new("rejected-fetch", "Fetch").on_click(move |_, _, cx| {
@@ -369,13 +469,28 @@ impl Render for SyncStrip {
                         },
                     ))
                     .action(
-                        div()
-                            .max_w(px(320.))
-                            .truncate()
-                            .text_style(&TEXT_SMALL, cx)
-                            .child(details),
+                        Button::new("rejected-output", if self.show_rejection_output { "Hide Git output" } else { "Git output" })
+                            .ghost()
+                            .tooltip(crate::notice::headline(details))
+                            .disabled(details.is_empty())
+                            .on_click(cx.listener(|strip, _, _, cx| {
+                                strip.show_rejection_output = !strip.show_rejection_output;
+                                cx.notify();
+                            })),
                     ),
                 );
+                if self.show_rejection_output {
+                    column = column.child(
+                        div()
+                            .id("push-rejected-output")
+                            .overflow_y_scroll()
+                            .max_h(px(SIDEBAR))
+                            .px(px(SPACE_3))
+                            .py(px(SPACE_2))
+                            .text_style(&TEXT_CODE_SMALL, cx)
+                            .child(details.clone()),
+                    );
+                }
             }
         }
 
@@ -426,6 +541,7 @@ impl Render for SyncStrip {
         if any {
             div()
                 .p(px(SPACE_2))
+                .bg(hsla(p.bg_panel))
                 .border_b_1()
                 .border_color(hsla(p.line))
                 .child(column)

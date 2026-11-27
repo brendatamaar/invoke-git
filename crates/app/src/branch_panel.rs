@@ -4,21 +4,26 @@
 //! cannot run (an existing name, the checked-out branch, a busy repo), and
 //! the repo view shows the refusal.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled,
-    Subscription, Window, div, px,
+    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, ParentElement, Render, Styled, Subscription, Window, deferred, div, px,
 };
 use invoke_core::{
     BranchName, BranchStart, CommitMessage, Event, NameProblem, Oid, RefName, RepoPath, Snapshot,
     SubmoduleOp, TagName, WorktreeEntry, WorktreeSpec, same_worktree_path, validate_worktree_path,
 };
-use tokens::{SPACE_2, SPACE_3, TEXT_SMALL};
-use ui::convert::hsla;
+use tokens::{
+    DIALOG, RADIUS_LG, ROW_DIFF, Rgba, SIDEBAR, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_6,
+    SPACE_8, TEXT_SMALL, TEXT_TITLE,
+};
+use ui::convert::{hsla, shadows};
 use ui::{
-    Button, CheckState, Checkbox, EditorEvent, SectionLabel, SideAction, Sidebar, TextEditor,
-    TextStyleExt, ThemeExt, sidebar_rows,
+    Button, CheckState, Checkbox, Divider, EditorEvent, Icon, IconName, SectionLabel, SideAction,
+    Sidebar, TextEditor, TextStyleExt, ThemeExt, filter_and_collapse_rows, section_counts,
+    sidebar_rows,
 };
 
 use crate::session::RepoSession;
@@ -116,6 +121,7 @@ pub fn stash_hint(has_changes: bool, untracked: bool) -> &'static str {
 
 pub struct BranchPanel {
     session: Entity<RepoSession>,
+    filter: Entity<TextEditor>,
     editor: Entity<TextEditor>,
     /// The stash message.
     message: Entity<TextEditor>,
@@ -124,6 +130,8 @@ pub struct BranchPanel {
     tag_remote: Entity<TextEditor>,
     wt_path: Entity<TextEditor>,
     wt_branch: Entity<TextEditor>,
+    collapsed: HashSet<String>,
+    menu_open: bool,
     form: Form,
     _subscriptions: Vec<Subscription>,
 }
@@ -132,6 +140,7 @@ impl EventEmitter<BranchPanelEvent> for BranchPanel {}
 
 impl BranchPanel {
     pub fn new(session: Entity<RepoSession>, cx: &mut Context<Self>) -> Self {
+        let filter = cx.new(|cx| TextEditor::new("Filter branches and refs…", 1, cx).single_line());
         let editor = cx.new(|cx| TextEditor::new("Branch name", 1, cx).single_line());
         let message = cx.new(|cx| TextEditor::new("Message (optional)", 1, cx).single_line());
         let tag_name = cx.new(|cx| TextEditor::new("Tag name", 1, cx).single_line());
@@ -140,6 +149,7 @@ impl BranchPanel {
         let wt_path = cx.new(|cx| TextEditor::new("Worktree folder path", 1, cx).single_line());
         let wt_branch = cx.new(|cx| TextEditor::new("Branch name", 1, cx).single_line());
         let mut subscriptions = vec![
+            cx.subscribe(&filter, |_, _, _: &EditorEvent, cx| cx.notify()),
             cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| match event {
                 EditorEvent::Changed => cx.notify(),
                 EditorEvent::Submit => this.submit(false, cx),
@@ -155,6 +165,7 @@ impl BranchPanel {
         }
         Self {
             session,
+            filter,
             editor,
             message,
             tag_name,
@@ -162,9 +173,29 @@ impl BranchPanel {
             tag_remote,
             wt_path,
             wt_branch,
+            collapsed: ["TAGS", "STASHES", "WORKTREES", "SUBMODULES", "LFS"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            menu_open: false,
             form: Form::None,
             _subscriptions: subscriptions,
         }
+    }
+
+    pub fn open_create_branch(&mut self, cx: &mut Context<Self>) {
+        self.menu_open = false;
+        self.open(Form::Create, "", cx);
+    }
+
+    pub fn open_stash(&mut self, cx: &mut Context<Self>) {
+        self.menu_open = false;
+        self.ask_to_stash(cx);
+    }
+
+    pub fn open_create_tag(&mut self, cx: &mut Context<Self>) {
+        self.menu_open = false;
+        self.open_tag(Form::CreateTag { annotated: false }, "", cx);
     }
 
     fn deliver(&self, event: Event, cx: &mut Context<Self>) {
@@ -249,6 +280,26 @@ impl BranchPanel {
                 },
                 cx,
             ),
+            SideAction::ToggleSection(title) => {
+                if !self.collapsed.remove(&title) {
+                    self.collapsed.insert(title);
+                }
+                cx.notify();
+            }
+            SideAction::SectionAction(title) => match title.as_str() {
+                "LOCAL" => self.open_create_branch(cx),
+                "TAGS" => self.open_create_tag(cx),
+                "STASHES" => self.open_stash(cx),
+                "WORKTREES" => self.open_add_worktree(cx),
+                "SUBMODULES" => self.deliver(
+                    Event::SubmoduleRequested {
+                        op: SubmoduleOp::UpdateInitRecursive,
+                        path: None,
+                    },
+                    cx,
+                ),
+                _ => {}
+            },
         }
     }
 
@@ -327,34 +378,29 @@ impl BranchPanel {
                             .map(|problem| label(name_problem_text(*problem).into())),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_2))
-                            .child(
-                                Checkbox::new(
-                                    "tag-annotated",
-                                    if annotated {
-                                        CheckState::Checked
-                                    } else {
-                                        CheckState::Unchecked
-                                    },
-                                )
-                                .on_click(move |_, _, cx| {
-                                    toggle.update(cx, |pane, cx| {
-                                        pane.form = Form::CreateTag {
-                                            annotated: !annotated,
-                                        };
-                                        cx.notify();
-                                    })
-                                }),
-                            )
-                            .child(label("Annotated tag".into())),
+                        Checkbox::new(
+                            "tag-annotated",
+                            if annotated {
+                                CheckState::Checked
+                            } else {
+                                CheckState::Unchecked
+                            },
+                        )
+                        .label("Annotated tag")
+                        .on_click(move |_, _, cx| {
+                            toggle.update(cx, |pane, cx| {
+                                pane.form = Form::CreateTag {
+                                    annotated: !annotated,
+                                };
+                                cx.notify();
+                            })
+                        }),
                     )
                     .children(annotated.then_some(self.tag_message.clone()))
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(SPACE_2))
                             .child(
                                 Button::new("tag-create", "Create")
@@ -369,6 +415,7 @@ impl BranchPanel {
                     .child(
                         Button::new("tag-manage-open", "Manage tags")
                             .ghost()
+                            .compact()
                             .on_click(move |_, _, cx| {
                                 manage.update(cx, |pane, cx| {
                                     pane.form = Form::ManageTag;
@@ -399,6 +446,7 @@ impl BranchPanel {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(SPACE_2))
                             .child(
                                 Button::new("tag-push", "Push")
@@ -431,6 +479,7 @@ impl BranchPanel {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(SPACE_2))
                             .child(
                                 Button::new("tag-remote-delete", "Delete remote")
@@ -460,6 +509,7 @@ impl BranchPanel {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap(px(SPACE_2))
                         .child(
                             Button::new("tag-confirm-delete", "Delete remote")
@@ -614,95 +664,223 @@ enum StashOp {
 impl Render for BranchPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
-        let (rows, has_submodules, has_lfs) = match &self.session.read(cx).state.snapshot {
-            Snapshot::Read { disk, .. } => (
-                sidebar_rows(&disk.refs, &disk.head, &disk.stashes, &disk.advanced),
-                !disk.advanced.submodules.is_empty(),
-                disk.advanced.lfs.detected,
-            ),
-            Snapshot::NotRead => (Vec::new(), false, false),
-        };
+        let (all_rows, has_changes, has_submodules, has_lfs) =
+            match &self.session.read(cx).state.snapshot {
+                Snapshot::Read { disk, .. } => (
+                    sidebar_rows(&disk.refs, &disk.head, &disk.stashes, &disk.advanced),
+                    disk.status.unstaged().next().is_some()
+                        || disk.status.staged().next().is_some(),
+                    !disk.advanced.submodules.is_empty(),
+                    disk.advanced.lfs.detected,
+                ),
+                Snapshot::NotRead => (Vec::new(), false, false, false),
+            };
+        let query = self.filter.read(cx).text().to_owned();
+        let filtering = !query.trim().is_empty();
+        let counts = section_counts(&all_rows);
+        let rows = filter_and_collapse_rows(&all_rows, &query, &self.collapsed);
+        let section_actions: HashSet<String> =
+            ["LOCAL", "TAGS", "STASHES", "WORKTREES", "SUBMODULES"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+
         let this = cx.entity();
         let new = cx.entity();
-        let stash = cx.entity();
-        let tag = cx.entity();
-        let wt_add = cx.entity();
-        let sub_update = cx.entity();
-        let lfs_pull = cx.entity();
-        let mut panel = div()
+        let toggle_menu = cx.entity();
+        let close_menu = cx.entity();
+        let menu_branch = cx.entity();
+        let menu_tag = cx.entity();
+        let menu_stash = cx.entity();
+        let menu_wt = cx.entity();
+        let menu_sub = cx.entity();
+        let menu_lfs = cx.entity();
+        let clear_filter = cx.entity();
+
+        let overflow_popover = self.menu_open.then(|| {
+            let mut menu = div()
+                .id("sidebar-overflow-popover")
+                .occlude()
+                .absolute()
+                .top(px(ROW_DIFF + SPACE_1))
+                .right(px(0.))
+                .flex()
+                .flex_col()
+                .min_w(px(SIDEBAR - SPACE_8))
+                .gap(px(SPACE_1 / 2.0))
+                .p(px(SPACE_1))
+                .rounded(px(RADIUS_LG))
+                .border_1()
+                .border_color(hsla(p.line))
+                .bg(hsla(p.bg_raised))
+                .shadow(shadows(p.shadow_overlay))
+                .on_mouse_down_out(move |_, _, cx| {
+                    cx.stop_propagation();
+                    close_menu.update(cx, |pane, cx| {
+                        pane.menu_open = false;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Button::new("menu-new-branch", "New branch…")
+                        .icon(IconName::Branch)
+                        .ghost()
+                        .full_width()
+                        .on_click(move |_, _, cx| {
+                            menu_branch.update(cx, |pane, cx| pane.open_create_branch(cx));
+                        }),
+                )
+                .child(
+                    Button::new("menu-new-tag", "New tag…")
+                        .icon(IconName::Tag)
+                        .ghost()
+                        .full_width()
+                        .on_click(move |_, _, cx| {
+                            menu_tag.update(cx, |pane, cx| pane.open_create_tag(cx));
+                        }),
+                )
+                .child(
+                    Button::new("menu-stash", "Stash changes…")
+                        .icon(IconName::Stash)
+                        .ghost()
+                        .full_width()
+                        .disabled(!has_changes)
+                        .on_click(move |_, _, cx| {
+                            menu_stash.update(cx, |pane, cx| pane.open_stash(cx));
+                        }),
+                )
+                .child(
+                    Button::new("menu-new-worktree", "Add worktree…")
+                        .icon(IconName::Worktree)
+                        .ghost()
+                        .full_width()
+                        .on_click(move |_, _, cx| {
+                            menu_wt.update(cx, |pane, cx| {
+                                pane.menu_open = false;
+                                pane.open_add_worktree(cx);
+                            });
+                        }),
+                );
+            if has_submodules || has_lfs {
+                menu = menu.child(div().py(px(SPACE_1 / 2.0)).child(Divider::horizontal()));
+            }
+            if has_submodules {
+                menu = menu.child(
+                    Button::new("submodules-update-all", "Update submodules")
+                        .icon(IconName::Refresh)
+                        .ghost()
+                        .full_width()
+                        .on_click(move |_, _, cx| {
+                            menu_sub.update(cx, |pane, cx| {
+                                pane.menu_open = false;
+                                pane.deliver(
+                                    Event::SubmoduleRequested {
+                                        op: SubmoduleOp::UpdateInitRecursive,
+                                        path: None,
+                                    },
+                                    cx,
+                                );
+                            });
+                        }),
+                );
+            }
+            if has_lfs {
+                menu = menu.child(
+                    Button::new("lfs-pull-all", "Pull LFS objects")
+                        .icon(IconName::Fetch)
+                        .ghost()
+                        .full_width()
+                        .on_click(move |_, _, cx| {
+                            menu_lfs.update(cx, |pane, cx| {
+                                pane.menu_open = false;
+                                pane.deliver(Event::LfsPullRequested { path: None }, cx);
+                            });
+                        }),
+                );
+            }
+            deferred(menu)
+        });
+
+        let lfs_expanded = !self.collapsed.contains("LFS");
+        let panel = div()
             .flex()
             .flex_col()
             .size_full()
             .bg(hsla(p.bg_panel))
-            .py(px(SPACE_2))
             .child(
                 div()
                     .flex()
+                    .flex_col()
                     .flex_none()
-                    .items_center()
-                    .justify_between()
+                    .gap(px(SPACE_2))
                     .px(px(SPACE_3))
-                    .pb(px(SPACE_2))
-                    .child(SectionLabel::new("Branches"))
+                    .py(px(SPACE_2))
+                    .border_b_1()
+                    .border_color(hsla(p.line))
                     .child(
                         div()
                             .flex()
-                            .gap(px(SPACE_2))
-                            .child(Button::new("stash-open", "Stash").ghost().on_click(
-                                move |_, _, cx| stash.update(cx, |this, cx| this.ask_to_stash(cx)),
-                            ))
-                            .child(Button::new("new-branch", "+ Branch").ghost().on_click(
-                                move |_, _, cx| {
-                                    new.update(cx, |this, cx| this.open(Form::Create, "", cx))
-                                },
-                            )),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(SPACE_2))
-                    .px(px(SPACE_3))
-                    .pb(px(SPACE_2))
-                    .child(
-                        Button::new("new-tag", "+ Tag")
-                            .ghost()
-                            .on_click(move |_, _, cx| {
-                                tag.update(cx, |pane, cx| {
-                                    pane.open_tag(Form::CreateTag { annotated: false }, "", cx)
-                                });
-                            }),
-                    )
-                    .child(Button::new("new-worktree", "+ Worktree").ghost().on_click(
-                        move |_, _, cx| {
-                            wt_add.update(cx, |pane, cx| pane.open_add_worktree(cx));
-                        },
-                    ))
-                    .children(has_submodules.then(|| {
-                        Button::new("submodules-update-all", "Update submodules")
-                            .ghost()
-                            .on_click(move |_, _, cx| {
-                                sub_update.update(cx, |pane, cx| {
-                                    pane.deliver(
-                                        Event::SubmoduleRequested {
-                                            op: SubmoduleOp::UpdateInitRecursive,
-                                            path: None,
-                                        },
-                                        cx,
+                            .items_center()
+                            .justify_between()
+                            .gap(px(SPACE_1))
+                            .child(SectionLabel::new("Repository"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(SPACE_1))
+                                    .child(
+                                        Button::new("new-branch", "Branch")
+                                            .icon(IconName::Plus)
+                                            .compact()
+                                            .on_click(move |_, _, cx| {
+                                                new.update(cx, |this, cx| {
+                                                    this.open_create_branch(cx)
+                                                })
+                                            }),
                                     )
-                                });
-                            })
-                    }))
-                    .children(has_lfs.then(|| {
-                        Button::new("lfs-pull-all", "LFS Pull")
-                            .ghost()
-                            .on_click(move |_, _, cx| {
-                                lfs_pull.update(cx, |pane, cx| {
-                                    pane.deliver(Event::LfsPullRequested { path: None }, cx)
-                                });
-                            })
-                    })),
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .flex_none()
+                                            .child(
+                                                Button::new("sidebar-more", "")
+                                                    .tooltip("More repository actions")
+                                                    .icon(IconName::More)
+                                                    .ghost()
+                                                    .compact()
+                                                    .on_click(move |_, _, cx| {
+                                                        toggle_menu.update(cx, |pane, cx| {
+                                                            pane.menu_open = !pane.menu_open;
+                                                            cx.notify();
+                                                        });
+                                                    }),
+                                            )
+                                            .children(overflow_popover),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_1))
+                            .child(Icon::new(IconName::Search).small().color(p.ink_faint))
+                            .child(div().flex_1().min_w(px(0.)).child(self.filter.clone()))
+                            .children(filtering.then(|| {
+                                Button::new("sidebar-filter-clear", "")
+                                    .tooltip("Clear branch filter")
+                                    .icon(IconName::Close)
+                                    .ghost()
+                                    .compact()
+                                    .on_click(move |_, _, cx| {
+                                        clear_filter.update(cx, |pane, cx| {
+                                            pane.filter.update(cx, |ed, cx| ed.set_text("", cx));
+                                            cx.notify();
+                                        });
+                                    })
+                            })),
+                    ),
             );
 
         let text = self.editor.read(cx).text().trim().to_owned();
@@ -738,6 +916,7 @@ impl Render for BranchPanel {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(SPACE_2))
                             .child(
                                 Button::new("form-create", "Create")
@@ -781,6 +960,7 @@ impl Render for BranchPanel {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(SPACE_2))
                             .child(
                                 Button::new("form-rename", "Rename")
@@ -809,36 +989,23 @@ impl Render for BranchPanel {
                         .gap(px(SPACE_2))
                         .child(self.message.clone())
                         .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(SPACE_2))
-                                .child(
-                                    Checkbox::new(
-                                        "stash-untracked",
-                                        if untracked {
-                                            CheckState::Checked
-                                        } else {
-                                            CheckState::Unchecked
-                                        },
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            toggle.update(cx, |this, cx| {
-                                                if let Form::Stash { untracked } = &mut this.form {
-                                                    *untracked = !*untracked;
-                                                }
-                                                cx.notify();
-                                            })
-                                        },
-                                    ),
-                                )
-                                .child(
-                                    div()
-                                        .text_style(&TEXT_SMALL, cx)
-                                        .text_color(hsla(p.ink_muted))
-                                        .child("Include untracked files"),
-                                ),
+                            Checkbox::new(
+                                "stash-untracked",
+                                if untracked {
+                                    CheckState::Checked
+                                } else {
+                                    CheckState::Unchecked
+                                },
+                            )
+                            .label("Include untracked files")
+                            .on_click(move |_, _, cx| {
+                                toggle.update(cx, |this, cx| {
+                                    if let Form::Stash { untracked } = &mut this.form {
+                                        *untracked = !*untracked;
+                                    }
+                                    cx.notify();
+                                })
+                            }),
                         )
                         .child(
                             div()
@@ -849,6 +1016,7 @@ impl Render for BranchPanel {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap(px(SPACE_2))
                                 .child(
                                     Button::new("form-stash", "Stash changes")
@@ -876,6 +1044,7 @@ impl Render for BranchPanel {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(SPACE_2))
                             .child(
                                 Button::new("form-drop-stash", "Drop stash")
@@ -904,38 +1073,28 @@ impl Render for BranchPanel {
                                 )),
                         )
                         .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(SPACE_2))
-                                .child(
-                                    Checkbox::new(
-                                        "form-force",
-                                        if force {
-                                            CheckState::Checked
-                                        } else {
-                                            CheckState::Unchecked
-                                        },
-                                    )
-                                    .on_click(move |_, _, cx| {
-                                        toggle.update(cx, |this, cx| {
-                                            if let Form::Delete { force, .. } = &mut this.form {
-                                                *force = !*force;
-                                            }
-                                            cx.notify();
-                                        })
-                                    }),
-                                )
-                                .child(
-                                    div()
-                                        .text_style(&TEXT_SMALL, cx)
-                                        .text_color(hsla(p.ink_muted))
-                                        .child("Delete even if it is not merged"),
-                                ),
+                            Checkbox::new(
+                                "form-force",
+                                if force {
+                                    CheckState::Checked
+                                } else {
+                                    CheckState::Unchecked
+                                },
+                            )
+                            .label("Delete even if it is not merged")
+                            .on_click(move |_, _, cx| {
+                                toggle.update(cx, |this, cx| {
+                                    if let Form::Delete { force, .. } = &mut this.form {
+                                        *force = !*force;
+                                    }
+                                    cx.notify();
+                                })
+                            }),
                         )
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap(px(SPACE_2))
                                 .child(Button::new("form-delete", "Delete branch").danger().on_click(
                                     move |_, _, cx| ok.update(cx, |this, cx| this.submit(false, cx)),
@@ -957,38 +1116,23 @@ impl Render for BranchPanel {
                         .child(self.wt_path.clone())
                         .child(self.wt_branch.clone())
                         .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(SPACE_2))
-                                .child(
-                                    Checkbox::new(
-                                        "wt-create-branch",
-                                        if create_branch {
-                                            CheckState::Checked
-                                        } else {
-                                            CheckState::Unchecked
-                                        },
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            toggle.update(cx, |this, cx| {
-                                                if let Form::AddWorktree { create_branch } =
-                                                    &mut this.form
-                                                {
-                                                    *create_branch = !*create_branch;
-                                                }
-                                                cx.notify();
-                                            })
-                                        },
-                                    ),
-                                )
-                                .child(
-                                    div()
-                                        .text_style(&TEXT_SMALL, cx)
-                                        .text_color(hsla(p.ink_muted))
-                                        .child("Create new branch at HEAD"),
-                                ),
+                            Checkbox::new(
+                                "wt-create-branch",
+                                if create_branch {
+                                    CheckState::Checked
+                                } else {
+                                    CheckState::Unchecked
+                                },
+                            )
+                            .label("Create new branch at HEAD")
+                            .on_click(move |_, _, cx| {
+                                toggle.update(cx, |this, cx| {
+                                    if let Form::AddWorktree { create_branch } = &mut this.form {
+                                        *create_branch = !*create_branch;
+                                    }
+                                    cx.notify();
+                                })
+                            }),
                         )
                         .children(branch_problem.filter(|_| !branch_text.is_empty()).map(
                             |problem| {
@@ -1001,6 +1145,7 @@ impl Render for BranchPanel {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap(px(SPACE_2))
                                 .child(
                                     Button::new("form-wt-add", "Add worktree")
@@ -1037,40 +1182,28 @@ impl Render for BranchPanel {
                                 }),
                         )
                         .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(SPACE_2))
-                                .child(
-                                    Checkbox::new(
-                                        "wt-force-remove",
-                                        if force {
-                                            CheckState::Checked
-                                        } else {
-                                            CheckState::Unchecked
-                                        },
-                                    )
-                                    .on_click(move |_, _, cx| {
-                                        toggle.update(cx, |this, cx| {
-                                            if let Form::RemoveWorktree { force, .. } =
-                                                &mut this.form
-                                            {
-                                                *force = !*force;
-                                            }
-                                            cx.notify();
-                                        })
-                                    }),
-                                )
-                                .child(
-                                    div()
-                                        .text_style(&TEXT_SMALL, cx)
-                                        .text_color(hsla(p.ink_muted))
-                                        .child("Force remove (modified or locked)"),
-                                ),
+                            Checkbox::new(
+                                "wt-force-remove",
+                                if force {
+                                    CheckState::Checked
+                                } else {
+                                    CheckState::Unchecked
+                                },
+                            )
+                            .label("Force remove (modified or locked)")
+                            .on_click(move |_, _, cx| {
+                                toggle.update(cx, |this, cx| {
+                                    if let Form::RemoveWorktree { force, .. } = &mut this.form {
+                                        *force = !*force;
+                                    }
+                                    cx.notify();
+                                })
+                            }),
                         )
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap(px(SPACE_2))
                                 .child(
                                     Button::new("form-wt-remove", "Remove worktree")
@@ -1084,18 +1217,131 @@ impl Render for BranchPanel {
                 )
             }
         };
-        if let Some(form) = form {
-            panel = panel.child(
+        let form_title = match &self.form {
+            Form::None => "",
+            Form::Create => "New branch",
+            Form::Rename(_) => "Rename branch",
+            Form::Delete { .. } => "Delete branch",
+            Form::CreateTag { .. } => "New tag",
+            Form::ManageTag => "Manage tag",
+            Form::DeleteRemoteTag { .. } => "Delete remote tag",
+            Form::Stash { .. } => "Stash changes",
+            Form::DropStash { .. } => "Drop stash",
+            Form::AddWorktree { .. } => "Add worktree",
+            Form::RemoveWorktree { .. } => "Remove worktree",
+        };
+        let modal = form.map(|form| {
+            let backdrop_close = cx.entity();
+            let header_close = cx.entity();
+            let key_close = cx.entity();
+            deferred(
                 div()
-                    .flex_none()
-                    .px(px(SPACE_3))
-                    .pb(px(SPACE_3))
-                    .child(form),
-            );
-        }
-        panel.child(Sidebar::new(rows, move |action, _, cx| {
-            this.update(cx, |this, cx| this.action(action, cx))
-        }))
+                    .id("sidebar-form-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(px(SPACE_6))
+                    .bg(hsla(Rgba::new(0, 0, 0, 0.45)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        backdrop_close.update(cx, |this, cx| this.close(cx));
+                    })
+                    .child(
+                        div()
+                            .id("sidebar-form-dialog")
+                            .occlude()
+                            .flex()
+                            .flex_col()
+                            .w(px(DIALOG))
+                            .gap(px(SPACE_4))
+                            .p(px(SPACE_6))
+                            .rounded(px(RADIUS_LG))
+                            .bg(hsla(p.bg_panel))
+                            .border_1()
+                            .border_color(hsla(p.line))
+                            .shadow(shadows(p.shadow_overlay))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                                if event.keystroke.key == "escape" {
+                                    cx.stop_propagation();
+                                    key_close.update(cx, |this, cx| this.close(cx));
+                                }
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(SPACE_2))
+                                    .child(
+                                        div()
+                                            .text_style(&TEXT_TITLE, cx)
+                                            .text_color(hsla(p.ink))
+                                            .child(form_title),
+                                    )
+                                    .child(
+                                        Button::new("form-dialog-close", "")
+                                            .tooltip("Close dialog")
+                                            .icon(IconName::Close)
+                                            .ghost()
+                                            .compact()
+                                            .on_click(move |_, _, cx| {
+                                                header_close.update(cx, |this, cx| this.close(cx));
+                                            }),
+                                    ),
+                            )
+                            .child(form),
+                    ),
+            )
+        });
+        panel
+            .child(
+                div().flex().flex_1().min_h(px(0.)).py(px(SPACE_2)).child(
+                    Sidebar::new(rows, move |action, _, cx| {
+                        this.update(cx, |this, cx| this.action(action, cx))
+                    })
+                    .collapsed(self.collapsed.clone())
+                    .counts(counts)
+                    .section_actions(section_actions)
+                    .filtering(filtering),
+                ),
+            )
+            .children((has_lfs && !filtering).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(SPACE_1))
+                    .p(px(SPACE_2))
+                    .border_t_1()
+                    .border_color(hsla(p.line))
+                    .child(
+                        Button::new(
+                            "sidebar-lfs-section",
+                            if lfs_expanded {
+                                "▾ Git LFS"
+                            } else {
+                                "▸ Git LFS"
+                            },
+                        )
+                        .full_width()
+                        .ghost()
+                        .compact()
+                        .on_click(cx.listener(|pane, _, _, cx| {
+                            pane.action(SideAction::ToggleSection("LFS".into()), cx)
+                        })),
+                    )
+                    .children(lfs_expanded.then(|| {
+                        Button::new("sidebar-lfs-pull", "Pull LFS objects")
+                            .full_width()
+                            .ghost()
+                            .compact()
+                            .on_click(cx.listener(|pane, _, _, cx| {
+                                pane.deliver(Event::LfsPullRequested { path: None }, cx)
+                            }))
+                    }))
+            }))
+            .children(modal)
     }
 }
 

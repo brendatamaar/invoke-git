@@ -7,14 +7,16 @@
 //! the forge no longer accepts offers to reconnect.
 
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Subscription, Task, UniformListScrollHandle,
-    Window, div, px, uniform_list,
+    AppContext, Context, ElementId, Entity, EventEmitter, InteractiveElement, IntoElement,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use invoke_core::forge::{ForgeAccount, RemoteRepo, Visibility, filter_repos};
 use shell::forge::{ForgeError, ForgeService};
-use tokens::{NAME_COLUMN, RADIUS_SM, ROW_LIST, SPACE_2, SPACE_3, TEXT_BODY, TEXT_SMALL};
+use tokens::{NAME_COLUMN, RADIUS_MD, ROW_LIST, SPACE_1, SPACE_2, SPACE_3, TEXT_BODY, TEXT_SMALL};
 use ui::convert::hsla;
+use ui::focus;
+use ui::scrollbar::Scrollbar;
 use ui::{Banner, BannerKind, Button, EditorEvent, Segmented, TextEditor, TextStyleExt, ThemeExt};
 
 /// Pages fetched per request (100 repositories each).
@@ -276,24 +278,30 @@ impl Render for RepoPicker {
         if !repos.is_empty() {
             let rows = repos.len();
             let pick = cx.entity();
-            let list = uniform_list("picker-repos", rows, move |range, _, cx| {
+            let list = uniform_list("picker-repos", rows, move |range, window, cx| {
                 let p = cx.palette();
                 let hover = hsla(p.bg_hover);
+                let ring = focus::ring_color(cx);
                 range
                     .map(|ix| {
                         let repo = repos[ix].clone();
                         let pick = pick.clone();
                         let chosen = repo.clone();
+                        let id = ElementId::from(("picker-repo", ix));
+                        let handle = focus::handle(&id, window, cx);
                         div()
-                            .id(("picker-repo", ix))
+                            .id(id)
+                            .track_focus(&handle)
+                            .tab_stop(true)
                             .flex()
                             .items_center()
                             .gap(px(SPACE_3))
                             .h(px(ROW_LIST))
                             .px(px(SPACE_2))
-                            .rounded(px(RADIUS_SM))
+                            .rounded(px(RADIUS_MD))
                             .cursor_pointer()
                             .hover(move |style| style.bg(hover))
+                            .focus_visible(move |style| focus::ring(style, ring))
                             .on_click(move |_, _, cx| {
                                 let repo = chosen.clone();
                                 pick.update(cx, |_, cx| cx.emit(PickerEvent::Picked(repo)))
@@ -326,13 +334,26 @@ impl Render for RepoPicker {
                     })
                     .collect()
             })
-            .size_full()
+            .flex_1()
+            .h_full()
             .track_scroll(&self.scroll);
             body = body.child(
                 div()
+                    .flex()
                     .w_full()
-                    .h(px(rows.min(VISIBLE_ROWS) as f32 * ROW_LIST))
-                    .child(list),
+                    .h(px(rows.min(VISIBLE_ROWS) as f32 * ROW_LIST + SPACE_1 * 2.0))
+                    .p(px(SPACE_1))
+                    .rounded(px(RADIUS_MD))
+                    .border_1()
+                    .border_color(hsla(p.line))
+                    .bg(hsla(p.bg_app))
+                    .child(list)
+                    .child(Scrollbar::new(
+                        "picker-scrollbar",
+                        self.scroll.clone(),
+                        rows,
+                        ROW_LIST,
+                    )),
             );
         }
         if let Listing::Loaded { more: Some(_), .. } = &self.listing {

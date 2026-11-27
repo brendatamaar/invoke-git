@@ -14,20 +14,23 @@ use std::sync::Arc;
 
 use diff::{DiffLine, DiffNote, Eol, LineKind, TextDiff};
 use gpui::{
-    AnyElement, Context, Div, EventEmitter, FontWeight, HighlightStyle, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    StyledText, UniformListScrollHandle, Window, div, point, px, uniform_list,
+    AnyElement, App, Context, Div, ElementId, EventEmitter, FontWeight, HighlightStyle,
+    InteractiveElement, IntoElement, ParentElement, PathBuilder, Render, Role, ScrollStrategy,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, Toggled, UniformListScrollHandle,
+    Window, canvas, deferred, div, point, px, uniform_list,
 };
 use highlight::{Capture, Span};
 use tokens::{
-    ROW_DIFF, SPACE_2, SPACE_3, SPACE_4, TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_CODE, TEXT_CODE_SMALL,
-    TEXT_SMALL, TOOLBAR, Theme,
+    RADIUS_LG, RADIUS_MD, RADIUS_SM, ROW_DIFF, ROW_LIST, SIDEBAR, SPACE_1, SPACE_2, SPACE_3,
+    SPACE_4, SPACE_8, TEXT_BODY, TEXT_BODY_MEDIUM, TEXT_CODE, TEXT_CODE_SMALL, TEXT_SMALL, TOOLBAR,
+    Theme,
 };
 
 use crate::code_text::{expand_tabs, expanded_offset, merge_styles};
-use crate::components::{Banner, BannerKind, Button, Pill, Segmented};
-use crate::convert::hsla;
+use crate::components::{Banner, BannerKind, Button, Divider, Icon, IconName, Pill, Segmented};
+use crate::convert::{hsla, shadows};
 use crate::diff_rows::{Layout, Row, hunk_header, rows};
+use crate::focus;
 use crate::scrollbar::Scrollbar;
 use crate::text::TextStyleExt;
 use crate::theme::ThemeExt;
@@ -96,6 +99,10 @@ pub enum DiffEvent {
     DiscardLines { hunk: usize, lines: Vec<usize> },
     /// P10: request `git lfs pull` for the currently shown LFS pointer file.
     PullLfs,
+    /// Open the Blame view for the currently shown file.
+    Blame,
+    /// Open the File History view for the currently shown file.
+    FileHistory,
 }
 
 /// P10: Git LFS metadata shown as a badge and banner in the diff viewer.
@@ -157,6 +164,12 @@ pub struct DiffView {
     /// Selected changed lines as (hunk, line), for line staging.
     selection: BTreeSet<(usize, usize)>,
     scroll: UniformListScrollHandle,
+    hunk_rows: Vec<usize>,
+    navigated_hunk: usize,
+    /// When true, show Blame and File history buttons in the toolbar when a file is loaded.
+    show_file_insights: bool,
+    context_menu_open: bool,
+    actions_menu_open: bool,
 }
 
 impl EventEmitter<DiffEvent> for DiffView {}
@@ -177,7 +190,18 @@ impl DiffView {
             number_w: NUMBER_W,
             selection: BTreeSet::new(),
             scroll: UniformListScrollHandle::new(),
+            hunk_rows: Vec::new(),
+            navigated_hunk: 0,
+            show_file_insights: false,
+            context_menu_open: false,
+            actions_menu_open: false,
         }
+    }
+
+    /// Shows compact Blame and File history triggers inside the diff toolbar.
+    pub fn with_file_insights(mut self) -> Self {
+        self.show_file_insights = true;
+        self
     }
 
     pub fn layout(&self) -> Layout {
@@ -187,28 +211,53 @@ impl DiffView {
     pub fn set_content(&mut self, content: Content, cx: &mut Context<Self>) {
         self.content = content;
         self.selection.clear();
+        self.context_menu_open = false;
+        self.actions_menu_open = false;
         self.rebuild();
         self.scroll_to_top();
         cx.notify();
     }
 
     pub fn set_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
+        let had_menu = self.context_menu_open || self.actions_menu_open;
+        self.context_menu_open = false;
+        self.actions_menu_open = false;
         if self.layout != layout {
             self.layout = layout;
-            self.selection.clear();
+            let hunk = self.navigated_hunk;
             self.rebuild();
-            self.scroll_to_top();
+            self.show_hunk(hunk, cx);
+            cx.notify();
+        } else if had_menu {
             cx.notify();
         }
     }
 
     pub fn set_around(&mut self, around: Around, cx: &mut Context<Self>) {
+        let had_menu = self.context_menu_open || self.actions_menu_open;
+        self.context_menu_open = false;
+        self.actions_menu_open = false;
         if self.around != around {
             self.around = around;
             self.selection.clear();
             self.rebuild();
+            self.scroll_to_top();
+            cx.notify();
+        } else if had_menu {
             cx.notify();
         }
+    }
+
+    fn toggle_context_menu(&mut self, cx: &mut Context<Self>) {
+        self.context_menu_open = !self.context_menu_open;
+        self.actions_menu_open = false;
+        cx.notify();
+    }
+
+    fn toggle_actions_menu(&mut self, cx: &mut Context<Self>) {
+        self.actions_menu_open = !self.actions_menu_open;
+        self.context_menu_open = false;
+        cx.notify();
     }
 
     fn scroll_to_top(&self) {
@@ -221,6 +270,8 @@ impl DiffView {
 
     /// Recomputes the hunks for the chosen context and the rows for the layout.
     fn rebuild(&mut self) {
+        self.navigated_hunk = 0;
+        self.hunk_rows.clear();
         let Content::Text(data) = &mut self.content else {
             self.rows.clear();
             return;
@@ -230,31 +281,49 @@ impl DiffView {
         }
         self.rows = rows(&data.diff, self.layout);
         self.number_w = number_width(&data.diff);
+        self.hunk_rows.extend(
+            self.rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| matches!(row, Row::HunkHeader { .. }).then_some(index)),
+        );
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn show_hunk(&mut self, hunk: usize, cx: &mut Context<Self>) {
+        if let Some(&row) = self.hunk_rows.get(hunk) {
+            self.navigated_hunk = hunk;
+            self.scroll.scroll_to_item_strict(row, ScrollStrategy::Top);
+            cx.notify();
+        }
+    }
+
+    fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
-        let mut bar = div()
+        let ring = focus::ring_color(cx);
+        let mut left = div()
             .flex()
-            .flex_none()
+            .flex_1()
+            .min_w(px(SIDEBAR / 2.0))
             .items_center()
-            .gap(px(SPACE_3))
-            .h(px(TOOLBAR))
-            .w_full()
-            .px(px(SPACE_4))
-            .border_b_1()
-            .border_color(hsla(p.line));
+            .gap(px(SPACE_2))
+            .overflow_hidden();
+        let mode = match &self.content {
+            Content::Text(data) => data.mode,
+            Content::FileMessage { mode, .. } => *mode,
+            _ => StageMode::ReadOnly,
+        };
         if let Content::Text(data) = &self.content {
             let stats = data.diff.stats;
-            bar = bar
+            left = left
                 .child(
                     div()
+                        .min_w(px(0.))
+                        .truncate()
                         .text_style(&TEXT_BODY_MEDIUM, cx)
                         .text_color(hsla(p.ink))
-                        .truncate()
                         .child(data.path.clone()),
                 )
-                .children(data.lfs.as_ref().map(|_| Pill::new("LFS")))
+                .children(data.lfs.as_ref().map(|_| Pill::new("LFS").compact()))
                 .child(
                     div()
                         .flex_none()
@@ -270,32 +339,225 @@ impl DiffView {
                         .child(format!("−{}", stats.removed)),
                 );
         }
-        let (layout_view, around_view) = (cx.entity(), cx.entity());
-        let discard_view = cx.entity();
+        left = left.children(match mode {
+            StageMode::Stage => Some(Pill::new("Unstaged").compact()),
+            StageMode::Unstage => Some(Pill::new("Staged").compact()),
+            StageMode::ReadOnly => None,
+        });
+        let layout_view = cx.entity();
+        let has_file = matches!(self.content, Content::Text(_) | Content::FileMessage { .. });
         let can_discard = match &self.content {
             Content::Text(data) => data.mode == StageMode::Stage,
             Content::FileMessage { mode, .. } => *mode == StageMode::Stage,
             _ => false,
         };
-        bar.child(div().flex_1())
-            .children(can_discard.then(|| {
-                Button::new("diff-discard-file", "Discard file")
-                    .ghost()
-                    .on_click(move |_, _, cx| {
-                        discard_view.update(cx, |_, cx| cx.emit(DiffEvent::DiscardFile))
-                    })
+        let show_insights = self.show_file_insights && has_file;
+
+        // Compact context dropdown ("3 lines ▾") instead of a wide 3-way segmented control.
+        let toggle_ctx = cx.entity();
+        let close_ctx = cx.entity();
+        let ctx_id = ElementId::from("diff-context-menu");
+        let ctx_handle = focus::handle(&ctx_id, window, cx);
+        let hover_bg = hsla(p.bg_hover);
+        let hover_ink = hsla(p.ink);
+        let mut ctx_trigger = div()
+            .id(ctx_id)
+            .track_focus(&ctx_handle)
+            .tab_stop(true)
+            .flex()
+            .items_center()
+            .gap(px(SPACE_1))
+            .h(px(ROW_DIFF))
+            .px(px(SPACE_2))
+            .rounded(px(RADIUS_SM))
+            .border_1()
+            .border_color(hsla(if self.context_menu_open {
+                p.line_control
+            } else {
+                p.line
             }))
-            .child(Segmented::new(
-                "diff-around",
-                Around::ALL.iter().map(|a| a.label().into()).collect(),
-                Around::ALL
-                    .iter()
-                    .position(|a| *a == self.around)
-                    .unwrap_or(0),
-                move |index, _, cx| {
-                    around_view.update(cx, |view, cx| view.set_around(Around::ALL[index], cx))
-                },
-            ))
+            .bg(hsla(if self.context_menu_open {
+                p.bg_hover
+            } else {
+                p.bg_raised
+            }))
+            .text_style(&TEXT_SMALL, cx)
+            .font_weight(FontWeight(500.0))
+            .text_color(hsla(p.ink))
+            .cursor_pointer()
+            .focus_visible(move |style| focus::inset_ring(style, ring))
+            .on_click(move |_, _, cx| {
+                toggle_ctx.update(cx, |view, cx| view.toggle_context_menu(cx));
+            })
+            .child(self.around.label())
+            .child(Icon::new(IconName::ChevronDown).small().color(p.ink_muted));
+        if !self.context_menu_open {
+            ctx_trigger = ctx_trigger.hover(move |s| s.bg(hover_bg).text_color(hover_ink));
+        }
+
+        let ctx_popover = self.context_menu_open.then(|| {
+            let mut menu = div()
+                .id("diff-context-popover")
+                .occlude()
+                .absolute()
+                .top(px(ROW_DIFF + SPACE_1))
+                .right(px(0.))
+                .flex()
+                .flex_col()
+                .min_w(px(SIDEBAR - SPACE_8 * 3.0))
+                .gap(px(SPACE_1 / 2.0))
+                .p(px(SPACE_1))
+                .rounded(px(RADIUS_LG))
+                .border_1()
+                .border_color(hsla(p.line))
+                .bg(hsla(p.bg_raised))
+                .shadow(shadows(p.shadow_overlay))
+                .on_mouse_down_out(move |_, _, cx| {
+                    cx.stop_propagation();
+                    close_ctx.update(cx, |view, cx| {
+                        view.context_menu_open = false;
+                        cx.notify();
+                    });
+                });
+            for (index, around) in Around::ALL.into_iter().enumerate() {
+                let active = around == self.around;
+                let pick = cx.entity();
+                let item_hover = hsla(p.bg_hover);
+                let mut row = div()
+                    .id(ElementId::from(("diff-around-opt", index)))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(ROW_LIST))
+                    .px(px(SPACE_2))
+                    .rounded(px(RADIUS_MD))
+                    .text_style(&TEXT_SMALL, cx)
+                    .text_color(hsla(if active { p.accent } else { p.ink }))
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        pick.update(cx, |view, cx| view.set_around(around, cx));
+                    })
+                    .child(around.label())
+                    .children(active.then_some("✓"));
+                row = if active {
+                    row.bg(hsla(p.accent_soft))
+                } else {
+                    row.hover(move |s| s.bg(item_hover))
+                };
+                menu = menu.child(row);
+            }
+            deferred(menu)
+        });
+
+        // Secondary file actions menu ("⋯": Blame, File history, Discard file).
+        let actions_menu = (show_insights || can_discard).then(|| {
+            let toggle_actions = cx.entity();
+            let close_actions = cx.entity();
+            let blame_view = cx.entity();
+            let history_view = cx.entity();
+            let discard_view = cx.entity();
+            let popover = self.actions_menu_open.then(|| {
+                let mut menu = div()
+                    .id("diff-actions-popover")
+                    .occlude()
+                    .absolute()
+                    .top(px(ROW_DIFF + SPACE_1))
+                    .right(px(0.))
+                    .flex()
+                    .flex_col()
+                    .min_w(px(SIDEBAR - SPACE_8 * 2.0))
+                    .gap(px(SPACE_1 / 2.0))
+                    .p(px(SPACE_1))
+                    .rounded(px(RADIUS_LG))
+                    .border_1()
+                    .border_color(hsla(p.line))
+                    .bg(hsla(p.bg_raised))
+                    .shadow(shadows(p.shadow_overlay))
+                    .on_mouse_down_out(move |_, _, cx| {
+                        cx.stop_propagation();
+                        close_actions.update(cx, |view, cx| {
+                            view.actions_menu_open = false;
+                            cx.notify();
+                        });
+                    });
+                if show_insights {
+                    menu = menu
+                        .child(
+                            Button::new("diff-file-blame", "Blame")
+                                .icon(IconName::FileText)
+                                .ghost()
+                                .full_width()
+                                .on_click(move |_, _, cx| {
+                                    blame_view.update(cx, |view, cx| {
+                                        view.actions_menu_open = false;
+                                        cx.emit(DiffEvent::Blame);
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("diff-file-history", "File history")
+                                .icon(IconName::History)
+                                .ghost()
+                                .full_width()
+                                .on_click(move |_, _, cx| {
+                                    history_view.update(cx, |view, cx| {
+                                        view.actions_menu_open = false;
+                                        cx.emit(DiffEvent::FileHistory);
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                }
+                if show_insights && can_discard {
+                    menu = menu.child(div().py(px(SPACE_1 / 2.0)).child(Divider::horizontal()));
+                }
+                if can_discard {
+                    menu = menu.child(
+                        Button::new("diff-discard-file", "Discard file")
+                            .icon(IconName::Trash)
+                            .danger_ghost()
+                            .full_width()
+                            .on_click(move |_, _, cx| {
+                                discard_view.update(cx, |view, cx| {
+                                    view.actions_menu_open = false;
+                                    cx.emit(DiffEvent::DiscardFile);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                deferred(menu)
+            });
+
+            div()
+                .relative()
+                .flex_none()
+                .child(
+                    Button::new("diff-actions-menu", "")
+                        .icon(IconName::More)
+                        .tooltip("File actions")
+                        .ghost()
+                        .compact()
+                        .on_click(move |_, _, cx| {
+                            toggle_actions.update(cx, |view, cx| view.toggle_actions_menu(cx));
+                        }),
+                )
+                .children(popover)
+        });
+
+        let controls = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(SPACE_2))
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .child(ctx_trigger)
+                    .children(ctx_popover),
+            )
             .child(Segmented::new(
                 "diff-layout",
                 vec!["Split".into(), "Unified".into()],
@@ -316,6 +578,48 @@ impl DiffView {
                     })
                 },
             ))
+            .children(actions_menu);
+        let count = self.hunk_rows.len();
+        let hunk = self.navigated_hunk;
+        let previous = cx.entity();
+        let next = cx.entity();
+        file_toolbar(cx)
+            .child(left)
+            .child(controls)
+            .children((count > 1).then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_1))
+                    .child(
+                        Button::new("previous-hunk", "Previous change")
+                            .ghost()
+                            .compact()
+                            .disabled(hunk == 0)
+                            .on_click(move |_, _, cx| {
+                                previous.update(cx, |view, cx| {
+                                    view.show_hunk(hunk.saturating_sub(1), cx);
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_style(&TEXT_SMALL, cx)
+                            .text_color(hsla(p.ink_muted))
+                            .child(format!("{} / {count}", hunk + 1)),
+                    )
+                    .child(
+                        Button::new("next-hunk", "Next change")
+                            .ghost()
+                            .compact()
+                            .disabled(hunk + 1 >= count)
+                            .on_click(move |_, _, cx| {
+                                next.update(cx, |view, cx| {
+                                    view.show_hunk(hunk + 1, cx);
+                                })
+                            }),
+                    )
+            }))
     }
 
     fn message(&self, text: SharedString, cx: &mut Context<Self>) -> AnyElement {
@@ -332,7 +636,12 @@ impl DiffView {
 
     /// The rows `range` of the list. Word-level marks are computed here, for
     /// the hunks that scroll into view only.
-    fn render_rows(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) -> Vec<Div> {
+    fn render_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Div> {
         let Content::Text(data) = &mut self.content else {
             return range.map(|_| div().h(px(ROW_DIFF))).collect();
         };
@@ -346,30 +655,46 @@ impl DiffView {
         }
         let theme = cx.ui_theme().theme();
         let p = cx.palette();
+        let ring = focus::ring_color(cx);
         let view = cx.entity();
-        let (data, cx): (&DiffData, &gpui::App) = (data, cx);
-        let ctx = Ctx {
-            data,
-            view,
-            selection: &self.selection,
-            number_w: self.number_w,
-            theme,
-            p,
-            cx,
-        };
+        let data = &*data;
+        let rows = &self.rows;
+        let selection = &self.selection;
+        let number_w = self.number_w;
         range
-            .map(|index| match self.rows.get(index) {
-                Some(Row::HunkHeader { hunk }) => hunk_row(&ctx, *hunk),
-                Some(Row::Unified { hunk, line }) => unified_row(&ctx, *hunk, *line),
-                Some(Row::Split { hunk, left, right }) => split_row(&ctx, *hunk, *left, *right),
+            .map(|index| match rows.get(index) {
+                Some(Row::HunkHeader { hunk }) => hunk_row(data, &view, selection, p, *hunk, cx),
+                Some(Row::Unified { hunk, line }) => unified_row(
+                    data, &view, selection, number_w, theme, p, ring, *hunk, *line, window, cx,
+                ),
+                Some(Row::Split { hunk, left, right }) => split_row(
+                    data, &view, selection, number_w, theme, p, ring, *hunk, *left, *right, window,
+                    cx,
+                ),
                 None => div().h(px(ROW_DIFF)),
             })
             .collect()
     }
 }
 
+/// The shared header surface for the diff, blame, and file history.
+pub fn file_toolbar(cx: &App) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .flex_none()
+        .items_center()
+        .gap(px(SPACE_2))
+        .min_h(px(TOOLBAR))
+        .w_full()
+        .px(px(SPACE_4))
+        .py(px(SPACE_1))
+        .border_b_1()
+        .border_color(hsla(cx.palette().line))
+}
+
 impl Render for DiffView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
         let body: AnyElement = match &self.content {
             Content::Loading => self.message("Reading the diff…".into(), cx),
@@ -398,10 +723,24 @@ impl Render for DiffView {
                         "This diff was too expensive to compute, so the whole file is shown as replaced.",
                     )
                 });
+                let has_banners = lfs_banner.is_some() || note.is_some();
+                let banner_strip = has_banners.then(|| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_none()
+                        .gap(px(SPACE_2))
+                        .px(px(SPACE_3))
+                        .py(px(SPACE_2))
+                        .border_b_1()
+                        .border_color(hsla(p.line))
+                        .children(lfs_banner)
+                        .children(note)
+                });
                 let list = uniform_list(
                     "diff-rows",
                     self.rows.len(),
-                    cx.processor(|this, range, _window, cx| this.render_rows(range, cx)),
+                    cx.processor(|this, range, window, cx| this.render_rows(range, window, cx)),
                 )
                 .track_scroll(&self.scroll)
                 .flex_1()
@@ -411,8 +750,7 @@ impl Render for DiffView {
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.))
-                    .children(lfs_banner)
-                    .children(note)
+                    .children(banner_strip)
                     .child(
                         div()
                             .flex()
@@ -434,28 +772,23 @@ impl Render for DiffView {
             .flex_col()
             .size_full()
             .bg(hsla(p.bg_panel))
-            .child(self.render_toolbar(cx))
+            .child(self.render_toolbar(window, cx))
             .child(body)
     }
 }
 
-/// What drawing a row needs, gathered once per frame.
-struct Ctx<'a> {
-    data: &'a DiffData,
-    view: gpui::Entity<DiffView>,
-    selection: &'a BTreeSet<(usize, usize)>,
-    number_w: f32,
-    theme: Theme,
-    p: &'a tokens::Palette,
-    cx: &'a gpui::App,
-}
-
-fn hunk_row(ctx: &Ctx, hunk: usize) -> Div {
-    let (data, p, cx) = (ctx.data, ctx.p, ctx.cx);
+fn hunk_row(
+    data: &DiffData,
+    view: &gpui::Entity<DiffView>,
+    selection: &BTreeSet<(usize, usize)>,
+    p: &tokens::Palette,
+    hunk: usize,
+    cx: &mut App,
+) -> Div {
     let mut row = div()
         .flex()
         .items_center()
-        .gap(px(SPACE_3))
+        .gap(px(SPACE_2))
         .h(px(ROW_DIFF))
         .w_full()
         .px(px(SPACE_3))
@@ -474,101 +807,138 @@ fn hunk_row(ctx: &Ctx, hunk: usize) -> Div {
         StageMode::Stage => "Stage",
         StageMode::Unstage => "Unstage",
     };
-    let selected = ctx.selection.range((hunk, 0)..(hunk + 1, 0)).count();
+    let selected = selection.range((hunk, 0)..(hunk + 1, 0)).count();
+    let all_view = view.clone();
+    row = row.child(
+        Button::new(("hunk-all", hunk), format!("{verb} hunk"))
+            .ghost()
+            .compact()
+            .tooltip(format!("{verb} all changes in this hunk"))
+            .on_click(move |_, _, cx| all_view.update(cx, |view, cx| view.request_hunk(hunk, cx))),
+    );
     if selected > 0 {
-        let view = ctx.view.clone();
-        row = row.child(link_button(
-            ("hunk-lines", hunk),
-            format!(
-                "{verb} {selected} {}",
-                if selected == 1 { "line" } else { "lines" }
-            ),
-            p.accent,
-            move |cx| view.update(cx, |view, cx| view.request_lines(hunk, cx)),
-        ));
+        let lines_view = view.clone();
+        row = row.child(
+            Button::new(
+                ("hunk-lines", hunk),
+                format!("{verb} selected ({selected})"),
+            )
+            .compact()
+            .tooltip(format!("{verb} only the selected lines in this hunk"))
+            .on_click(move |_, _, cx| {
+                lines_view.update(cx, |view, cx| view.request_lines(hunk, cx))
+            }),
+        );
     }
-    let view = ctx.view.clone();
-    row = row.child(link_button(
-        ("hunk-all", hunk),
-        format!("{verb} hunk"),
-        p.accent,
-        move |cx| view.update(cx, |view, cx| view.request_hunk(hunk, cx)),
-    ));
-    // Only unstaged changes can be thrown away.
     if data.mode == StageMode::Stage {
         if selected > 0 {
-            let view = ctx.view.clone();
-            row = row.child(link_button(
-                ("hunk-discard-lines", hunk),
-                format!(
-                    "Discard {selected} {}",
-                    if selected == 1 { "line" } else { "lines" }
-                ),
-                p.danger,
-                move |cx| view.update(cx, |view, cx| view.request_discard_lines(hunk, cx)),
-            ));
+            let discard_view = view.clone();
+            row = row.child(
+                Button::new(
+                    ("hunk-discard-lines", hunk),
+                    format!("Discard selected ({selected})"),
+                )
+                .danger_ghost()
+                .compact()
+                .tooltip("Discard only the selected lines in this hunk")
+                .on_click(move |_, _, cx| {
+                    discard_view.update(cx, |view, cx| view.request_discard_lines(hunk, cx))
+                }),
+            );
         }
-        let view = ctx.view.clone();
-        row = row.child(link_button(
-            ("hunk-discard", hunk),
-            "Discard hunk".to_owned(),
-            p.danger,
-            move |cx| view.update(cx, |view, cx| view.request_discard_hunk(hunk, cx)),
-        ));
+        let discard_view = view.clone();
+        row = row.child(
+            Button::new(("hunk-discard", hunk), "Discard hunk")
+                .danger_ghost()
+                .compact()
+                .on_click(move |_, _, cx| {
+                    discard_view.update(cx, |view, cx| view.request_discard_hunk(hunk, cx))
+                }),
+        );
     }
     row
 }
 
-/// A small text button for a hunk header row (20px tall, like the row).
-fn link_button(
-    id: (&'static str, usize),
-    label: String,
-    colour: tokens::Rgba,
-    on_click: impl Fn(&mut gpui::App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex_none()
-        .px(px(SPACE_2))
-        .rounded(px(tokens::RADIUS_SM))
-        .text_color(hsla(colour))
-        .cursor_pointer()
-        .hover(|style| style.opacity(0.75))
-        .on_click(move |_, _, cx| on_click(cx))
-        .child(label)
-}
-
 /// The checkbox slot of a changed line; context lines and read-only diffs
 /// have an empty slot.
-fn select_cell(ctx: &Ctx, hunk: usize, line: usize, kind: LineKind) -> Div {
+#[allow(clippy::too_many_arguments)]
+fn select_cell(
+    data: &DiffData,
+    view: &gpui::Entity<DiffView>,
+    selection: &BTreeSet<(usize, usize)>,
+    p: &tokens::Palette,
+    ring: gpui::Hsla,
+    hunk: usize,
+    line: usize,
+    kind: LineKind,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> Div {
     let slot = div()
         .flex_none()
         .w(px(SELECT_SLOT))
         .flex()
         .items_center()
         .justify_center();
-    if ctx.data.mode == StageMode::ReadOnly || kind == LineKind::Context {
+    if data.mode == StageMode::ReadOnly || kind == LineKind::Context {
         return slot;
     }
-    let p = ctx.p;
-    let on = ctx.selection.contains(&(hunk, line));
-    let view = ctx.view.clone();
-    slot.child(
-        div()
-            .id(("line-check", hunk * 100_000 + line))
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(12.))
-            .rounded(px(2.))
-            .border_1()
-            .border_color(hsla(if on { p.accent } else { p.line_control }))
-            .bg(hsla(if on { p.accent } else { p.bg_panel }))
-            .text_color(hsla(p.on_accent))
-            .cursor_pointer()
-            .on_click(move |_, _, cx| view.update(cx, |view, cx| view.toggle_line(hunk, line, cx)))
-            .child(if on { "✓" } else { "" }),
-    )
+    let on = selection.contains(&(hunk, line));
+    let change = &data.diff.hunks[hunk].lines[line];
+    let label = if let Some(number) = change.new_no {
+        format!("Select added line {number}")
+    } else {
+        format!("Select removed line {}", change.old_no.unwrap_or_default())
+    };
+    let view = view.clone();
+    let id = ElementId::from((SharedString::from(format!("line-check-{hunk}")), line));
+    let handle = focus::handle(&id, window, cx);
+    let mark = hsla(p.on_accent);
+    let accent = hsla(p.accent);
+    let hover_bg = hsla(p.bg_hover);
+    let mut box_el = div()
+        .id(id)
+        .role(Role::CheckBox)
+        .aria_label(label)
+        .aria_toggled(if on { Toggled::True } else { Toggled::False })
+        .track_focus(&handle)
+        .tab_stop(true)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(SPACE_3))
+        .rounded(px(SPACE_1 / 2.0))
+        .border_1()
+        .border_color(hsla(if on { p.accent } else { p.line_control }))
+        .bg(hsla(if on { p.accent } else { p.bg_panel }))
+        .cursor_pointer()
+        .focus_visible(move |style| focus::inset_ring(style, ring))
+        .on_click(move |_, _, cx| view.update(cx, |view, cx| view.toggle_line(hunk, line, cx)))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    if !on {
+                        return;
+                    }
+                    let mut path = PathBuilder::stroke(px(1.5));
+                    let (x, y) = (bounds.origin.x, bounds.origin.y);
+                    path.move_to(point(x + px(2.5), y + px(6.)));
+                    path.line_to(point(x + px(5.), y + px(8.5)));
+                    path.line_to(point(x + px(9.5), y + px(3.5)));
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, mark);
+                    }
+                },
+            )
+            .size_full(),
+        );
+    box_el = if on {
+        box_el.hover(|style| style.opacity(0.9))
+    } else {
+        box_el.hover(move |style| style.bg(hover_bg).border_color(accent))
+    };
+    slot.child(box_el)
 }
 
 /// The width of the line number columns: room for the longest number the
@@ -636,48 +1006,79 @@ fn base_row(cx: &gpui::App) -> Div {
         .text_style(&TEXT_CODE, cx)
 }
 
-fn unified_row(ctx: &Ctx, hunk: usize, line: usize) -> Div {
-    let (data, p, nw) = (ctx.data, ctx.p, ctx.number_w);
+#[allow(clippy::too_many_arguments)]
+fn unified_row(
+    data: &DiffData,
+    view: &gpui::Entity<DiffView>,
+    selection: &BTreeSet<(usize, usize)>,
+    nw: f32,
+    theme: Theme,
+    p: &tokens::Palette,
+    ring: gpui::Hsla,
+    hunk: usize,
+    line: usize,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> Div {
     let l = &data.diff.hunks[hunk].lines[line];
-    base_row(ctx.cx)
+    base_row(cx)
         .bg(hsla(fill(l.kind, p)))
-        .child(select_cell(ctx, hunk, line, l.kind))
+        .child(select_cell(
+            data, view, selection, p, ring, hunk, line, l.kind, window, cx,
+        ))
         .child(number_cell(l.old_no, nw, p))
         .child(number_cell(l.new_no, nw, p))
         .child(sign_cell(l.kind, p))
-        .child(code_cell(ctx, l))
+        .child(code_cell(data, theme, p, l))
 }
 
-fn split_row(ctx: &Ctx, hunk: usize, left: Option<usize>, right: Option<usize>) -> Div {
-    let (data, p, nw) = (ctx.data, ctx.p, ctx.number_w);
+#[allow(clippy::too_many_arguments)]
+fn split_row(
+    data: &DiffData,
+    view: &gpui::Entity<DiffView>,
+    selection: &BTreeSet<(usize, usize)>,
+    nw: f32,
+    theme: Theme,
+    p: &tokens::Palette,
+    ring: gpui::Hsla,
+    hunk: usize,
+    left: Option<usize>,
+    right: Option<usize>,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> Div {
     let lines = &data.diff.hunks[hunk].lines;
-    let half = |index: Option<usize>, left_side: bool| -> Div {
-        let Some(index) = index else {
-            // Nothing on this side: a blank cell.
-            return div().flex_1().min_w(px(0.)).h_full().bg(hsla(p.bg_app));
+    let half =
+        |index: Option<usize>, left_side: bool, window: &mut Window, cx: &mut gpui::App| -> Div {
+            let Some(index) = index else {
+                // Nothing on this side: a blank cell.
+                return div().flex_1().min_w(px(0.)).h_full().bg(hsla(p.bg_app));
+            };
+            let l = &lines[index];
+            let number = if left_side { l.old_no } else { l.new_no };
+            div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.))
+                .h_full()
+                .bg(hsla(fill(l.kind, p)))
+                .child(select_cell(
+                    data, view, selection, p, ring, hunk, index, l.kind, window, cx,
+                ))
+                .child(number_cell(number, nw, p))
+                .child(sign_cell(l.kind, p))
+                .child(code_cell(data, theme, p, l))
         };
-        let l = &lines[index];
-        let number = if left_side { l.old_no } else { l.new_no };
-        div()
-            .flex()
-            .flex_1()
-            .min_w(px(0.))
-            .h_full()
-            .bg(hsla(fill(l.kind, p)))
-            .child(select_cell(ctx, hunk, index, l.kind))
-            .child(number_cell(number, nw, p))
-            .child(sign_cell(l.kind, p))
-            .child(code_cell(ctx, l))
-    };
-    base_row(ctx.cx)
-        .child(half(left, true))
+    let left_half = half(left, true, window, cx);
+    let right_half = half(right, false, window, cx);
+    base_row(cx)
+        .child(left_half)
         .child(div().flex_none().w(px(1.)).h_full().bg(hsla(p.line)))
-        .child(half(right, false))
+        .child(right_half)
 }
 
 /// The text of one line, coloured and with its word-level changes marked.
-fn code_cell(ctx: &Ctx, line: &DiffLine) -> Div {
-    let (data, theme, p) = (ctx.data, ctx.theme, ctx.p);
+fn code_cell(data: &DiffData, theme: Theme, p: &tokens::Palette, line: &DiffLine) -> Div {
     let raw = data.diff.line_text(line);
     let text = expand_tabs(raw);
     let has_tabs = text.len() != raw.len();

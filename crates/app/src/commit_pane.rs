@@ -7,7 +7,7 @@ use gpui::{
     AppContext, ClipboardItem, Context, Entity, EventEmitter, IntoElement, ParentElement, Render,
     Styled, Window, div, px,
 };
-use invoke_core::{Event, FileChange, Oid, RepoPath, Snapshot};
+use invoke_core::{Event, FileChange, Head, Oid, RepoPath, Snapshot};
 use shell::InputsError;
 use shell::commit_detail::{Change, CommitDetail as Detail, read_commit, read_commit_sides};
 use shell::history::CommitId;
@@ -39,7 +39,8 @@ pub(crate) fn rebase_button(
         &session.state.snapshot,
         Snapshot::Read { disk, .. } if rebase_target_allowed(disk, &oid)
     );
-    Button::new("interactive-rebase-onto", "Interactive rebase onto…")
+    let label = format!("Interactive rebase onto {}…", ui::short_hash(oid.as_hex()));
+    Button::new("interactive-rebase-onto", label)
         .ghost()
         .disabled(!allowed)
         .on_click(move |_, _, cx| on_start(oid.clone(), cx))
@@ -54,13 +55,22 @@ pub(crate) fn replay_buttons(
         &session.state.snapshot,
         Snapshot::Read { disk, .. } if disk.phase == invoke_core::Phase::Clean
     );
+    let target = match session.state.snapshot.disk().map(|disk| &disk.head) {
+        Some(Head::Branch { name, .. } | Head::Unborn(name)) => name.0.as_str(),
+        _ => "HEAD",
+    };
+    let commit = ui::short_hash(oid.as_hex());
     [
         (
             "cherry-pick-commit",
-            "Cherry-pick",
+            format!("Cherry-pick {commit} onto {target}"),
             Event::CherryPickRequested(oid.clone()),
         ),
-        ("revert-commit", "Revert", Event::RevertRequested(oid)),
+        (
+            "revert-commit",
+            format!("Revert {commit} on {target}"),
+            Event::RevertRequested(oid),
+        ),
     ]
     .map(|(id, label, event)| {
         let send = send.clone();
@@ -290,7 +300,7 @@ impl Render for CommitPane {
                 .size_full()
                 .items_center()
                 .justify_center()
-                .p(px(16.))
+                .p(px(tokens::SPACE_4))
                 .bg(hsla(p.bg_panel))
                 .text_style(&TEXT_BODY, cx)
                 .text_color(hsla(p.ink_muted))
